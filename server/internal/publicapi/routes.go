@@ -53,6 +53,7 @@ var Routes = []Route{
 	{"POST", "/tasks/{task_id}/restore", "restore_task", "Tasks", "Restore an archived task", 0},
 	{"GET", "/tasks/{task_id}/comments", "list_task_comments", "Tasks", "List task comments", 0},
 	{"POST", "/tasks/{task_id}/comments", "add_task_comment", "Tasks", "Add a task comment", 0},
+	{"DELETE", "/comments/{comment_id}", "delete_task_comment", "Tasks", "Delete a task comment", 0},
 	{"GET", "/tasks/{task_id}/checklist", "list_task_checklist", "Tasks", "List checklist items", 0},
 	{"POST", "/tasks/{task_id}/checklist", "create_task_checklist_item", "Tasks", "Add a checklist item", 0},
 	{"PATCH", "/tasks/{task_id}/checklist/{checklist_item_id}", "update_task_checklist_item", "Tasks", "Update a checklist item", 0},

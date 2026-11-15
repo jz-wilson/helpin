@@ -98,3 +98,86 @@ func TestResolveMCPTaskKeyArgument(t *testing.T) {
 		t.Fatalf("unresolvable key error = %v, want ErrMCPNotFound", err)
 	}
 }
+
+type fakeMCPPMCommentDeleter struct {
+	comments  map[string]*model.PMComment
+	deletedID string
+	isAdmin   bool
+	actorID   string
+	workspace string
+}
+
+func (f *fakeMCPPMCommentDeleter) Get(_ context.Context, id string) (*model.PMComment, error) {
+	return f.comments[id], nil
+}
+
+func (f *fakeMCPPMCommentDeleter) Delete(_ context.Context, id, actorID string, isAdmin bool, workspaceID string) error {
+	f.deletedID, f.actorID, f.isAdmin, f.workspace = id, actorID, isAdmin, workspaceID
+	return nil
+}
+
+func setupDeleteTaskCommentTest() (*MCPService, *model.MCPPrincipal, *authorization.Actor, *fakeMCPPMCommentDeleter, *fakeMCPPMTaskService) {
+	service, principal, actor, tasks, _ := setupMCPPMToolTest()
+	tasks.tasks["task-other"] = &model.TaskDetail{Task: model.PMTask{ID: "task-other", WorkspaceID: "workspace-other"}}
+	comments := &fakeMCPPMCommentDeleter{comments: map[string]*model.PMComment{
+		"c-own":     {ID: "c-own", EntityType: "task", EntityID: "task-1", AuthorID: "user-1"},
+		"c-theirs":  {ID: "c-theirs", EntityType: "task", EntityID: "task-1", AuthorID: "user-2"},
+		"c-foreign": {ID: "c-foreign", EntityType: "task", EntityID: "task-other", AuthorID: "user-1"},
+		"c-epic":    {ID: "c-epic", EntityType: "epic", EntityID: "epic-1", AuthorID: "user-1"},
+	}}
+	service.pmCommentDeleter = comments
+	return service, principal, actor, comments, tasks
+}
+
+func TestDeleteTaskCommentDeletesOwnComment(t *testing.T) {
+	service, principal, actor, comments, _ := setupDeleteTaskCommentTest()
+	result, err := service.executeSpecialMCPTool(context.Background(), principal, actor, "delete_task_comment",
+		json.RawMessage(`{"comment_id":"c-own"}`))
+	if err != nil {
+		t.Fatalf("delete_task_comment error = %v", err)
+	}
+	if comments.deletedID != "c-own" || comments.isAdmin || comments.actorID != "user-1" || comments.workspace != "workspace-1" {
+		t.Fatalf("delete call = %+v", comments)
+	}
+	encoded, _ := json.Marshal(result.Data)
+	if !jsonContains(encoded, `"comment_id":"c-own"`) || !jsonContains(encoded, `"task_id":"task-1"`) {
+		t.Fatalf("result = %s", encoded)
+	}
+}
+
+func TestDeleteTaskCommentRejectsOtherAuthors(t *testing.T) {
+	service, principal, actor, comments, _ := setupDeleteTaskCommentTest()
+	_, err := service.executeSpecialMCPTool(context.Background(), principal, actor, "delete_task_comment",
+		json.RawMessage(`{"comment_id":"c-theirs"}`))
+	if !errors.Is(err, ErrMCPForbidden) || comments.deletedID != "" {
+		t.Fatalf("error = %v, deleted = %q", err, comments.deletedID)
+	}
+}
+
+func TestDeleteTaskCommentHidesMissingAndForeignComments(t *testing.T) {
+	for _, id := range []string{"missing", "c-foreign", "c-epic"} {
+		t.Run(id, func(t *testing.T) {
+			service, principal, actor, comments, _ := setupDeleteTaskCommentTest()
+			_, err := service.executeSpecialMCPTool(context.Background(), principal, actor, "delete_task_comment",
+				json.RawMessage(`{"comment_id":"`+id+`"}`))
+			if !errors.Is(err, ErrMCPNotFound) || comments.deletedID != "" {
+				t.Fatalf("error = %v, deleted = %q", err, comments.deletedID)
+			}
+		})
+	}
+}
+
+func TestDeleteTaskCommentToolDefinition(t *testing.T) {
+	var tool MCPToolDefinition
+	for _, candidate := range pmParityMCPToolDefinitions() {
+		if candidate.Name == "delete_task_comment" {
+			tool = candidate
+		}
+	}
+	if tool.Scope != MCPScopePMWrite || tool.Permission != authorization.PermPMEdit || !tool.Mutating || !tool.Destructive {
+		t.Fatalf("definition = %+v", tool)
+	}
+	if _, ok := tool.InputSchema["properties"].(map[string]any)["idempotency_key"]; !ok {
+		t.Fatalf("schema lacks idempotency_key: %v", tool.InputSchema)
+	}
+}

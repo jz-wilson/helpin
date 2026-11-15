@@ -141,6 +141,7 @@ type MCPService struct {
 	attachments      mcpAttachmentService
 	docsContent      mcpDocsContentReader
 	pmComments       mcpPMCommentLister
+	pmCommentDeleter mcpPMCommentDeleter
 	fetchImage       mcpImageFetcher
 	config           MCPServiceConfig
 	tools            map[string]MCPToolDefinition

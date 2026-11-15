@@ -742,6 +742,85 @@
         "x-helpin-toolset": "docs"
       }
     },
+    "/comments/{comment_id}": {
+      "delete": {
+        "description": "Permanently delete a task comment. Only the comment's author can delete it, and the deletion cannot be undone.\n\n**Required scope:** `helpin.pm.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "deleteTaskComment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Delete a task comment",
+        "tags": [
+          "Tasks"
+        ],
+        "x-helpin-mcp-tool": "delete_task_comment",
+        "x-helpin-scope": "helpin.pm.write",
+        "x-helpin-toolset": "pm"
+      }
+    },
     "/crm/activities": {
       "post": {
         "description": "Log a note, call, meeting, or email against exactly one existing CRM contact, company, or deal.\n\n**Required scope:** `helpin.crm.write`. Write operations are unavailable to read-only tokens.",

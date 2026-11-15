@@ -1841,6 +1841,7 @@ func main() {
 	mcpService.SetAttachments(pmAttachmentService)
 	mcpService.SetDocsContentReader(docsContentRepo)
 	mcpService.SetPMComments(pmCommentService)
+	mcpService.SetPMCommentDeleter(pmCommentService)
 	mcpService.SetCRMRecords(crmCompanyService, crmActivityService, service.NewCRMRecordUpsertService(
 		crmCompanyRepo, crmContactRepo, crmCompanyService, crmContactService, crmActivityService,
 	))

@@ -243,6 +243,7 @@ The [catalog](../server/internal/service/mcp_catalog.go) defines the available t
 | `create_task_batch` | Write | Creates up to 50 implementation-ready tasks in one accessible epic | `PermPMEdit` + PM module |
 | `update_task` | Write | Updates bounded editable task fields without deleting or archiving the task | `PermPMEdit` + PM module |
 | `add_task_comment` | Write | Adds a task comment with normal Helpin activity behavior | `PermPMEdit` + PM module |
+| `delete_task_comment` | Write | Permanently deletes a task comment; only the comment's author can delete it (same rule as the REST comment delete), and comments outside the workspace return `NOT_FOUND` | `PermPMEdit` + PM module |
 | `update_task_state` | Write | Moves a task through an allowed workflow transition | `PermPMEdit` + PM module |
 | `set_task_dependencies` | Write | Creates validated, cycle-free dependency links between accessible tasks | `PermPMEdit` + PM module |
 | `create_task_checklist_item` | Write | Adds a checklist item to an accessible task | `PermPMEdit` + PM module |
@@ -507,7 +508,7 @@ These tools expose existing Helpin commands that in-app agents already use, with
 
 | Area | Read tools | Write tools |
 | --- | --- | --- |
-| Tasks | `list_task_comments` (authors by ID and name only) | `archive_task`, `restore_task` |
+| Tasks | `list_task_comments` (authors by ID and name only) | `archive_task`, `restore_task`, `delete_task_comment` |
 | Epics | `list_epics`, `get_epic` | `update_epic` |
 | Sprints | `list_sprints`, `get_sprint`, `list_sprint_tasks` | `create_sprint`, `update_sprint` |
 | Objectives | `list_objectives`, `get_objective` | `create_objective`, `update_objective`, `update_key_result` |
