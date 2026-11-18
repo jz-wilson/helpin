@@ -15,6 +15,12 @@ func TestLegacyVersionMoves(t *testing.T) {
 	for current, legacy := range legacyNativeVersions {
 		versions[current] = legacy
 	}
+	for current, legacy := range legacyPortalVersions {
+		versions[current] = legacy
+	}
+	for current, legacy := range legacyOIDCVersions {
+		versions[current] = legacy
+	}
 	for current, legacy := range versions {
 		t.Run(current, func(t *testing.T) {
 			native, crm := byVersion[current], byVersion[legacy]

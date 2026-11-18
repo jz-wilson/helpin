@@ -1,7 +1,7 @@
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { CoveragePipelineHealthV2 } from '@/lib/supportCoverageTypes'
-import { coverageAnalysisControl } from './coverageHealth'
+import { coverageAnalysisControl, coverageNextRun } from './coverageHealth'
 
 interface Props {
   health: CoveragePipelineHealthV2 | null
@@ -13,11 +13,16 @@ interface Props {
 
 export function CoverageAnalysisActions({ health, canReanalyze, submitting, loading, onReanalyze }: Props) {
   const state = coverageAnalysisControl(health, submitting)
+  const nextRun = state.pill ? null : coverageNextRun(health)
   const disabled = loading || submitting || state.disabled
   const tooltip = 'Recheck eligible conversations from the last 30 days against current knowledge to identify new or changed coverage gaps.'
   return (
     <div className="flex flex-wrap items-center justify-end gap-3">
-      {!loading && state.pill && (
+      {!loading && state.pill && (state.inline ? (
+        <span role="status" aria-live="polite" className="rounded-full bg-quiet-hover px-2.5 py-1 text-xs font-medium text-quiet-text-secondary">
+          {state.pill}
+        </span>
+      ) : (
         <Tooltip>
           <TooltipTrigger asChild>
             <span tabIndex={0} role="status" aria-live="polite" className="rounded-full bg-quiet-hover px-2.5 py-1 text-xs font-medium text-quiet-text-secondary">
@@ -25,6 +30,16 @@ export function CoverageAnalysisActions({ health, canReanalyze, submitting, load
             </span>
           </TooltipTrigger>
           <TooltipContent>{state.description}</TooltipContent>
+        </Tooltip>
+      ))}
+      {!loading && nextRun && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <time tabIndex={0} dateTime={nextRun.at} className="text-xs text-quiet-text-tertiary">
+              {nextRun.label}
+            </time>
+          </TooltipTrigger>
+          <TooltipContent>Next automatic analysis: {nextRun.detail}.</TooltipContent>
         </Tooltip>
       )}
       {canReanalyze && (

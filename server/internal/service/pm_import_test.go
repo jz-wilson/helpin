@@ -1207,6 +1207,7 @@ func createImportTestSchema(t *testing.T, db *gorm.DB) {
 			company_product_context TEXT,
 			website_url TEXT,
 			logo_url TEXT,
+			link_previews_enabled BOOLEAN NOT NULL DEFAULT true,
 			timezone TEXT NOT NULL,
 			created_at DATETIME,
 			updated_at DATETIME
@@ -1223,6 +1224,7 @@ func createImportTestSchema(t *testing.T, db *gorm.DB) {
 			invited_at DATETIME,
 			accepted_at DATETIME,
 			support_default_team_id TEXT,
+			support_task_team_by_inbox TEXT NOT NULL DEFAULT '{}',
 			support_task_dialog_dismissed BOOLEAN NOT NULL DEFAULT 0,
 			created_at DATETIME,
 			updated_at DATETIME
@@ -1243,6 +1245,7 @@ func createImportTestSchema(t *testing.T, db *gorm.DB) {
 			updated_at DATETIME
 		)`,
 		`CREATE TABLE docs_spaces (
+			helpcenter_audience TEXT NOT NULL DEFAULT 'public',
 			id TEXT PRIMARY KEY,
 			workspace_id TEXT NOT NULL,
 			team_id TEXT,

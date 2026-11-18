@@ -1,3 +1,4 @@
+import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import { useEditor, EditorContent, type JSONContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
@@ -54,6 +55,7 @@ import { SavedViewEmbedExtension } from './SavedViewEmbedExtension'
 import { CommentAnchorExtension, type DocsCommentDecorationAnchor } from './CommentAnchorExtension'
 import { ProposalAnchorExtension } from './ProposalAnchorExtension'
 import { DocsTaskItemExtension } from './DocsTaskItemExtension'
+import { DocsAISelectionMenu } from './DocsAISelectionMenu'
 import { docsToolbarPosition } from './docsToolbarPosition'
 import { TaskItemMetadataToolbar } from './TaskItemMetadataToolbar'
 import { ToggleSectionExtension } from './ToggleSectionExtension'
@@ -81,6 +83,7 @@ import {
   searchDocsEntityItems,
   type DocsEntitySearchItem,
 } from './entitySearch'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { QuickTooltip } from '@/components/ui/quick-tooltip'
 import {
   DropdownMenu,
@@ -329,7 +332,8 @@ function parseCSVRows(text: string): string[][] {
   return rows
 }
 
-function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
+function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor, workspaceId }: {
+  workspaceId?: string
   containerRef: RefObject<HTMLDivElement | null>
   editor: ReturnType<typeof useEditor>
   uploadConfig?: EditorUploadConfig
@@ -337,6 +341,11 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
   onCreateCommentAnchor?: (anchor: DocsCommentAnchor) => void
 }) {
   const toolbarRef = useRef<HTMLDivElement>(null)
+  const formatMenuRef = useRef<HTMLDivElement>(null)
+  const aiMenuRef = useRef<HTMLDivElement>(null)
+  const [showAIMenu, setShowAIMenu] = useState(false)
+  const aiOpenRef = useRef(false)
+  aiOpenRef.current = showAIMenu
   const [pos, setPos] = useState<ReturnType<typeof docsToolbarPosition> | null>(null)
   const anchorRef = useRef<{ rect: () => { left: number; right: number; top: number; bottom: number }; below: boolean } | null>(null)
   const repositionRef = useRef<() => void>(() => {})
@@ -366,6 +375,7 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
     repositionRef.current = reposition
 
     const updatePosition = () => {
+      if (aiOpenRef.current) return
       const { from, to, empty } = editor.state.selection
 
       // Don't show toolbar when an atom node is selected (htmlBlock, videoEmbed, image)
@@ -457,7 +467,7 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
       // Delay blur so clicks on toolbar/popover are processed first
       setTimeout(() => {
         // Don't hide if focus moved to our toolbar (e.g. link input)
-        if (toolbarRef.current?.contains(document.activeElement)) return
+        if (aiOpenRef.current || toolbarRef.current?.contains(document.activeElement) || formatMenuRef.current?.contains(document.activeElement)) return
         anchorRef.current = null
         setPos(null)
         // Clear stale position only if no popover is open
@@ -483,7 +493,7 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
   useEffect(() => {
     if (!showLinkPopover && !showFormatMenu) return
     const handleClick = (e: MouseEvent) => {
-      if (toolbarRef.current?.contains(e.target as Node)) return
+      if (toolbarRef.current?.contains(e.target as Node) || formatMenuRef.current?.contains(e.target as Node) || aiMenuRef.current?.contains(e.target as Node)) return
       setShowLinkPopover(false)
       setShowFormatMenu(false)
       savedSelectionRef.current = null
@@ -496,7 +506,7 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
   const lastPosRef = useRef(pos)
   if (pos) lastPosRef.current = pos
   const activePos = pos ?? lastPosRef.current
-  const toolbarVisible = Boolean(activePos || showLinkPopover || showFormatMenu)
+  const toolbarVisible = Boolean(activePos || showLinkPopover || showFormatMenu || showAIMenu)
 
   useLayoutEffect(() => {
     if (!toolbarVisible) return
@@ -509,7 +519,7 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
   }, [toolbarVisible, showLinkPopover, showFormatMenu, containerRef])
 
   if (!editor) return null
-  if (!activePos && !showLinkPopover && !showFormatMenu) return null
+  if (!activePos && !showLinkPopover && !showFormatMenu && !showAIMenu) return null
 
   const openLinkPopover = () => {
     // Save selection before input steals focus
@@ -520,6 +530,7 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
     setLinkNewTab(true)
     setShowLinkPopover(true)
     setShowFormatMenu(false)
+    setShowAIMenu(false)
     setTimeout(() => linkInputRef.current?.focus(), 50)
   }
 
@@ -654,10 +665,49 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
 
         <div className="mx-0.5 h-4 w-px bg-border" />
 
-        {/* Format dropdown */}
-        <ToolbarButton title="Format" onClick={() => { setShowFormatMenu(!showFormatMenu); setShowLinkPopover(false); }} active={showFormatMenu}>
-          <ArrowDown01Icon className="h-4 w-4" />
-        </ToolbarButton>
+        {/* Portal keeps the dropdown out of the toolbar's measured size. */}
+        <Popover open={showFormatMenu} onOpenChange={(open) => { setShowFormatMenu(open); if (open) { setShowLinkPopover(false); setShowAIMenu(false); } }}>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              className={`flex items-center gap-1 whitespace-nowrap rounded px-2 py-2 text-sm transition-colors ${showFormatMenu ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}
+            >
+              Text format
+              <ArrowDown01Icon className="h-4 w-4" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            ref={formatMenuRef}
+            align="end"
+            side="bottom"
+            sideOffset={6}
+            collisionPadding={8}
+            className="z-[60] w-44 max-w-[min(calc(100vw-1rem),var(--radix-popover-content-available-width))] max-h-[var(--radix-popover-content-available-height)] gap-0 overflow-y-auto rounded-lg p-1 shadow-lg"
+            onOpenAutoFocus={(e) => e.preventDefault()}
+            onCloseAutoFocus={(e) => e.preventDefault()}
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            <FormatMenuItem label="Normal" active={!editor.isActive('blockquote') && !editor.isActive('codeBlock')} onClick={() => { editor.chain().focus().clearNodes().run(); setShowFormatMenu(false); }} />
+            <FormatMenuItem label="Blockquote" icon={<QuoteDownIcon className="h-3.5 w-3.5" />} active={editor.isActive('blockquote')} onClick={() => { editor.chain().focus().toggleBlockquote().run(); setShowFormatMenu(false); }} />
+            <FormatMenuItem label="Code Block" icon={<SourceCodeIcon className="h-3.5 w-3.5" />} active={editor.isActive('codeBlock')} onClick={() => { editor.chain().focus().toggleCodeBlock().run(); setShowFormatMenu(false); }} />
+            <div className="my-1 h-px bg-border" />
+            <FormatMenuItem label="Inline Code" active={editor.isActive('code')} onClick={() => { editor.chain().focus().toggleCode().run(); setShowFormatMenu(false); }} />
+            <FormatMenuItem label="Strikethrough" active={editor.isActive('strike')} onClick={() => { editor.chain().focus().toggleStrike().run(); setShowFormatMenu(false); }} />
+            <FormatMenuItem label="Subscript" active={editor.isActive('subscript')} onClick={() => { editor.chain().focus().toggleSubscript().run(); setShowFormatMenu(false); }} />
+            <FormatMenuItem label="Superscript" active={editor.isActive('superscript')} onClick={() => { editor.chain().focus().toggleSuperscript().run(); setShowFormatMenu(false); }} />
+          </PopoverContent>
+        </Popover>
+        {workspaceId && <DocsAISelectionMenu
+          editor={editor}
+          workspaceId={workspaceId}
+          open={showAIMenu}
+          contentRef={aiMenuRef}
+          onOpenChange={(open) => {
+            setShowAIMenu(open)
+            if (open) { setShowFormatMenu(false); setShowLinkPopover(false) }
+          }}
+        />}
       </div>}
 
       {/* Link popover */}
@@ -710,20 +760,6 @@ function FloatingToolbar({ editor, containerRef, onCreateCommentAnchor }: {
               <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={applyLink} disabled={!urlValid || !linkUrl} className="rounded bg-primary px-3 py-1 text-xs text-primary-foreground hover:bg-primary/90 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">Apply</button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Format dropdown menu */}
-      {showFormatMenu && (
-        <div className="mt-1 w-44 rounded-lg border bg-popover p-1 shadow-lg" onMouseDown={(e) => e.preventDefault()}>
-          <FormatMenuItem label="Normal" active={!editor.isActive('blockquote') && !editor.isActive('codeBlock')} onClick={() => { editor.chain().focus().clearNodes().run(); setShowFormatMenu(false); }} />
-          <FormatMenuItem label="Blockquote" icon={<QuoteDownIcon className="h-3.5 w-3.5" />} active={editor.isActive('blockquote')} onClick={() => { editor.chain().focus().toggleBlockquote().run(); setShowFormatMenu(false); }} />
-          <FormatMenuItem label="Code Block" icon={<SourceCodeIcon className="h-3.5 w-3.5" />} active={editor.isActive('codeBlock')} onClick={() => { editor.chain().focus().toggleCodeBlock().run(); setShowFormatMenu(false); }} />
-          <div className="my-1 h-px bg-border" />
-          <FormatMenuItem label="Inline Code" active={editor.isActive('code')} onClick={() => { editor.chain().focus().toggleCode().run(); setShowFormatMenu(false); }} />
-          <FormatMenuItem label="Strikethrough" active={editor.isActive('strike')} onClick={() => { editor.chain().focus().toggleStrike().run(); setShowFormatMenu(false); }} />
-          <FormatMenuItem label="Subscript" active={editor.isActive('subscript')} onClick={() => { editor.chain().focus().toggleSubscript().run(); setShowFormatMenu(false); }} />
-          <FormatMenuItem label="Superscript" active={editor.isActive('superscript')} onClick={() => { editor.chain().focus().toggleSuperscript().run(); setShowFormatMenu(false); }} />
         </div>
       )}
     </div>
@@ -928,8 +964,10 @@ export function DocsEditor({
   const savedFadeTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const savingRef = useRef(false)
   const pendingContentRef = useRef<JSONContent | null>(null)
+  const hasLocalEditsRef = useRef(false)
   const skipNextSaveRef = useRef(false)
   const pendingImportedImageUploadsRef = useRef(new Set<string>())
+  const pendingFileUploadsRef = useRef(0)
   const importedImagePersistTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const lastSavedSnapshotRef = useRef<string | null>(
     initialContent ? stableJSONSnapshot(initialContent) : null,
@@ -985,6 +1023,13 @@ export function DocsEditor({
   const [showSearch, setShowSearch] = useState(false)
   const [showSearchReplace, setShowSearchReplace] = useState(false)
 
+  useUnsavedChangesGuard(() => (
+    saveStatus === 'unsaved' || savingRef.current || saveTimerRef.current !== undefined || pendingContentRef.current !== null ||
+    pendingFileUploadsRef.current > 0 || pendingImportedImageUploadsRef.current.size > 0 ||
+    (hasLocalEditsRef.current && Boolean(editorRef.current) && stableJSONSnapshot(editorRef.current!.getJSON()) !== lastSavedSnapshotRef.current) ||
+    (sourceView && sourceMarkdown !== (editorRef.current?.storage as Record<string, any>)?.markdown?.getMarkdown())
+  ), 'Save your document and finish any uploads before refreshing.')
+
   const doSave = useCallback(
     async (json: JSONContent) => {
       if (contentErrorRef.current) return
@@ -1010,6 +1055,7 @@ export function DocsEditor({
         savedFadeTimerRef.current = setTimeout(() => setSaveStatus('idle'), 5000)
       } catch {
         submittedSaveSnapshotsRef.current.delete(snapshot)
+        if (savedFadeTimerRef.current) clearTimeout(savedFadeTimerRef.current)
         setSaveStatus('unsaved')
       } finally {
         savingRef.current = false
@@ -1026,9 +1072,14 @@ export function DocsEditor({
   const scheduleSave = useCallback(
     (json: JSONContent) => {
       if (contentErrorRef.current) return
+      hasLocalEditsRef.current = true
       setSaveStatus('unsaved')
+      if (savedFadeTimerRef.current) clearTimeout(savedFadeTimerRef.current)
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
-      saveTimerRef.current = setTimeout(() => doSave(json), autoSaveMs)
+      saveTimerRef.current = setTimeout(() => {
+        saveTimerRef.current = undefined
+        void doSave(json)
+      }, autoSaveMs)
     },
     [doSave, autoSaveMs],
   )
@@ -1036,6 +1087,7 @@ export function DocsEditor({
   // Cleanup timers on unmount
   useEffect(() => () => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = undefined
     if (savedFadeTimerRef.current) clearTimeout(savedFadeTimerRef.current)
     if (importedImagePersistTimerRef.current) clearTimeout(importedImagePersistTimerRef.current)
     if (mentionSearchTimerRef.current) clearTimeout(mentionSearchTimerRef.current)
@@ -1237,6 +1289,7 @@ export function DocsEditor({
 
       const uploadId = `img-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
 
+      pendingFileUploadsRef.current += 1
       // Insert a placeholder with data-uri
       const reader = new FileReader()
       reader.onload = async () => {
@@ -1275,7 +1328,13 @@ export function DocsEditor({
           }
         } catch (err) {
           toast.error(err instanceof Error ? err.message : 'Failed to upload image')
+        } finally {
+          pendingFileUploadsRef.current -= 1
         }
+      }
+      reader.onerror = () => {
+        pendingFileUploadsRef.current -= 1
+        toast.error('Failed to read image')
       }
       reader.readAsDataURL(file)
     },
@@ -1428,10 +1487,12 @@ export function DocsEditor({
       }),
       CodeBlockExtension,
       Placeholder.configure({
+        showOnlyCurrent: true,
+        showOnlyWhenEditable: true,
         placeholder: ({ node }) => {
           if (node.type.name === 'heading') return 'Heading';
           if (node.type.name === 'codeBlock') return '';
-          return "Type '/' for commands, or start writing...";
+          return "Type here or press '/' for options";
         },
       }),
       Markdown.configure({
@@ -1681,6 +1742,7 @@ export function DocsEditor({
       // land would overwrite the content that just arrived (for example an
       // applied change proposal) a couple of seconds later.
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = undefined
       pendingContentRef.current = null
       skipNextSaveRef.current = true
       const { from, to } = editor.state.selection
@@ -1756,6 +1818,7 @@ export function DocsEditor({
     input.onchange = async () => {
       const file = input.files?.[0]
       if (!file || !uploadConfigRef.current) return
+      pendingFileUploadsRef.current += 1
       try {
         const upload = await uploadEditorFile(file, uploadConfigRef.current)
         editor.chain().focus().setFileAttachment({
@@ -1768,6 +1831,8 @@ export function DocsEditor({
         scheduleSave(editor.getJSON())
       } catch (err) {
         toast.error(err instanceof Error ? err.message : 'Failed to upload file')
+      } finally {
+        pendingFileUploadsRef.current -= 1
       }
     }
     input.click()
@@ -1970,6 +2035,7 @@ export function DocsEditor({
         <FloatingToolbar
           editor={editor}
           containerRef={toolbarContainerRef}
+          workspaceId={workspaceId}
           uploadConfig={uploadConfig}
           onInsertImage={insertImage}
           onCreateCommentAnchor={onCreateCommentAnchor}

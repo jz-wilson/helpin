@@ -1,4 +1,4 @@
-import type { SupportConversation } from './pmTypes';
+import type { ConversationPriority, SupportConversation } from './pmTypes';
 import type { NavFilter } from '@/stores/supportInboxStore';
 import {
   isAIActiveConversation,
@@ -8,7 +8,22 @@ import {
 } from '@/components/support/helpers';
 
 export type ConversationAssignmentFilter = 'me' | 'mentioned_me' | 'opened_by_me' | 'unassigned' | 'others';
-export type ConversationSortOrder = 'newest' | 'oldest';
+export type ConversationSortOrder = 'newest' | 'oldest' | 'sla';
+/** "due_soon" matches a target due within SLA_DUE_SOON_MS that is not overdue yet. */
+export type ConversationSLAFilter = 'breached' | 'due_soon';
+
+/** Matches the server's due-soon window (model.SupportSLADueSoonWindow). */
+const SLA_DUE_SOON_MS = 60 * 60_000;
+
+export function parseConversationSLAFilter(value: unknown): ConversationSLAFilter | undefined {
+  return value === 'breached' || value === 'due_soon' ? value : undefined;
+}
+
+function matchesConversationSLAFilter(conversation: SupportConversation, filter: ConversationSLAFilter, now: number): boolean {
+  if (filter === 'breached') return Boolean(conversation.sla?.breached);
+  const due = conversation.sla?.next_due_at;
+  return Boolean(due && !conversation.sla?.breached && new Date(due).getTime() - now < SLA_DUE_SOON_MS);
+}
 export type ConversationStateFilter = 'open' | 'waiting_on_customer' | 'resolved' | 'spam';
 export type ConversationAIStateFilter = 'handling' | 'handoff' | 'resolved';
 
@@ -17,8 +32,13 @@ export interface ConversationListFilters {
   assignment: ConversationAssignmentFilter[];
   mailboxIds: string[];
   tagIds: string[];
+  priorities?: ConversationPriority[];
   aiStates: ConversationAIStateFilter[];
   sort: ConversationSortOrder;
+  /** Only conversations with an overdue SLA target, or one due soon. */
+  sla?: ConversationSLAFilter;
+  /** Request type ids, or "none" for conversations without a type. */
+  requestTypeIds?: string[];
 }
 
 export const DEFAULT_CONVERSATION_LIST_FILTERS: ConversationListFilters = {
@@ -41,7 +61,10 @@ export type ConversationListRequestFilters = {
   sort?: string;
   statuses?: string;
   tag_ids?: string;
+  priority?: string;
   ai?: string;
+  sla?: string;
+  request_type_ids?: string;
 };
 
 export function defaultStatesForNav(navFilter: NavFilter): ConversationStateFilter[] {
@@ -52,6 +75,8 @@ export function defaultStatesForNav(navFilter: NavFilter): ConversationStateFilt
       return ['open', 'waiting_on_customer'];
     case 'waiting':
       return ['waiting_on_customer'];
+    case 'snoozed':
+      return ['open', 'waiting_on_customer'];
     case 'resolved':
     case 'resolved_by_ai':
       return ['resolved'];
@@ -98,6 +123,10 @@ export function defaultConversationListFiltersForNav(navFilter: NavFilter): Conv
   };
 }
 
+export function parseConversationSortOrder(value: unknown): ConversationSortOrder {
+  return value === 'oldest' || value === 'sla' ? value : 'newest';
+}
+
 export function supportInboxCountMailboxScope(selectedMailboxId: string): string {
   return selectedMailboxId === 'all' ? 'shared' : selectedMailboxId;
 }
@@ -118,8 +147,11 @@ export function conversationListFiltersEqual(a: ConversationListFilters, b: Conv
     stringArraysEqual(a.assignment, b.assignment) &&
     stringArraysEqual(a.mailboxIds, b.mailboxIds) &&
     stringArraysEqual(a.tagIds, b.tagIds) &&
+    stringArraysEqual(a.priorities ?? [], b.priorities ?? []) &&
     stringArraysEqual(a.aiStates, b.aiStates) &&
-    a.sort === b.sort
+    a.sort === b.sort &&
+    a.sla === b.sla &&
+    stringArraysEqual(a.requestTypeIds ?? [], b.requestTypeIds ?? [])
   );
 }
 
@@ -179,8 +211,11 @@ export function normalizeConversationListFilters(
     assignment: filters && 'assignment' in filters ? normalizeAssignmentFilters(filters.assignment) : defaults.assignment,
     mailboxIds: filters?.mailboxIds ?? defaults.mailboxIds,
     tagIds: filters?.tagIds ?? defaults.tagIds,
+    ...(filters?.priorities?.length ? { priorities: filters.priorities } : {}),
     aiStates: filters && 'aiStates' in filters ? normalizeAIStateFilters(filters.aiStates) : defaults.aiStates,
     sort: filters?.sort ?? defaults.sort,
+    ...(filters?.sla ? { sla: filters.sla } : {}),
+    ...(filters?.requestTypeIds?.length ? { requestTypeIds: filters.requestTypeIds } : {}),
   };
 }
 
@@ -200,8 +235,11 @@ export function hasConversationListChanges({
     !stringArraysEqual(normalized.assignment, defaultAssignmentForNav(navFilter)) ||
     normalized.mailboxIds.length > 0 ||
     normalized.tagIds.length > 0 ||
+    (normalized.priorities?.length ?? 0) > 0 ||
     !stringArraysEqual(normalized.aiStates, defaultAIStatesForNav(navFilter)) ||
-    normalized.sort !== 'newest'
+    normalized.sort !== 'newest' ||
+    Boolean(normalized.sla) ||
+    (normalized.requestTypeIds?.length ?? 0) > 0
   );
 }
 
@@ -223,13 +261,17 @@ export function filterChangeCountFromBaseline({
   if (!stringArraysEqual(listFilters.mailboxIds, baselineFilters.mailboxIds)) count += 1;
   if (!stringArraysEqual(listFilters.tagIds, baselineFilters.tagIds)) count += 1;
   if (!stringArraysEqual(listFilters.aiStates, baselineFilters.aiStates)) count += 1;
+  if (!stringArraysEqual(listFilters.priorities ?? [], baselineFilters.priorities ?? [])) count += 1;
   if (listFilters.sort !== baselineFilters.sort) count += 1;
+  if (listFilters.sla !== baselineFilters.sla) count += 1;
+  if (!stringArraysEqual(listFilters.requestTypeIds ?? [], baselineFilters.requestTypeIds ?? [])) count += 1;
   return count;
 }
 
 function parseNavFilterValue(value: unknown): NavFilter {
   return value === 'mine' ||
     value === 'waiting' ||
+    value === 'snoozed' ||
     value === 'resolved' ||
     value === 'spam' ||
     value === 'ai_active' ||
@@ -259,9 +301,6 @@ function parseViewStates(value: unknown, navFilter: NavFilter): ConversationStat
   return states.length > 0 ? states : defaultStatesForNav(navFilter);
 }
 
-function parseViewSortOrder(value: unknown): ConversationSortOrder {
-  return value === 'oldest' ? 'oldest' : 'newest';
-}
 
 export function parseSupportInboxViewFilters(
   filters: Record<string, string> | undefined,
@@ -289,8 +328,11 @@ export function parseSupportInboxViewFilters(
       assignment: parseViewAssignmentFilters(rawFilters.assignment, navFilter),
       mailboxIds: parseViewStringList(rawFilters.mailbox_ids),
       tagIds: parseViewStringList(rawFilters.tag_ids),
+      ...(rawFilters.priority ? { priorities: parseConversationPriorities(rawFilters.priority) } : {}),
       aiStates,
-      sort: parseViewSortOrder(rawFilters.sort),
+      sort: parseConversationSortOrder(rawFilters.sort),
+      ...(parseConversationSLAFilter(rawFilters.sla) ? { sla: parseConversationSLAFilter(rawFilters.sla) } : {}),
+      ...(rawFilters.request_type_ids ? { requestTypeIds: parseViewStringList(rawFilters.request_type_ids) } : {}),
     },
   };
 }
@@ -323,7 +365,10 @@ export function buildSupportInboxViewFilters({
   } else if (navFilter !== 'inbox' && normalizedFilters.aiStates.length > 0) {
     filters.ai = normalizedFilters.aiStates.join(',');
   }
+  if (normalizedFilters.priorities?.length) filters.priority = normalizedFilters.priorities.join(',');
   if (normalizedFilters.sort !== 'newest') filters.sort = normalizedFilters.sort;
+  if (normalizedFilters.sla) filters.sla = normalizedFilters.sla;
+  if (normalizedFilters.requestTypeIds?.length) filters.request_type_ids = normalizedFilters.requestTypeIds.join(',');
   return filters;
 }
 
@@ -370,6 +415,9 @@ export function buildConversationListRequestFilters({
         // Preserve the saved Waiting default while deriving membership from public replies.
         f.filter = 'waiting';
         break;
+      case 'snoozed':
+        f.filter = 'snoozed';
+        break;
       case 'resolved':
         f.filter = 'resolved';
         break;
@@ -384,6 +432,9 @@ export function buildConversationListRequestFilters({
     switch (navFilter) {
       case 'mine':
         f.filter = 'mine';
+        break;
+      case 'snoozed':
+        f.filter = 'snoozed';
         break;
       case 'ai_active':
       case 'resolved_by_ai':
@@ -407,7 +458,10 @@ export function buildConversationListRequestFilters({
   } else {
     if (normalizedFilters.aiStates.length > 0) f.ai = normalizedFilters.aiStates.join(',');
   }
+  if (normalizedFilters.priorities?.length) f.priority = normalizedFilters.priorities.join(',');
   if (normalizedFilters.sort !== 'newest') f.sort = normalizedFilters.sort;
+  if (normalizedFilters.sla) f.sla = normalizedFilters.sla;
+  if (normalizedFilters.requestTypeIds?.length) f.request_type_ids = normalizedFilters.requestTypeIds.join(',');
   return Object.keys(f).length > 0 ? f : undefined;
 }
 
@@ -466,12 +520,25 @@ export function filterSupportConversations(
     sortOrder?: ConversationSortOrder;
     skipViewFilter?: boolean;
     aiStates?: ConversationAIStateFilter[];
+    sla?: ConversationSLAFilter;
+    priorities?: ConversationPriority[];
+    requestTypeIds?: string[];
   }
 ): SupportConversation[] {
-  const { navFilter, mailboxScope, mailboxScopes = [], statusFilter = 'all', userId, searchQuery, sortOrder = 'newest', skipViewFilter = false, aiStates } = options;
+  const { navFilter, mailboxScope, mailboxScopes = [], statusFilter = 'all', userId, searchQuery, sortOrder = 'newest', skipViewFilter = false, aiStates, sla } = options;
   let result = conversations.filter((conversation) =>
     mailboxScopes.length > 0 ? matchesMailboxScopes(conversation, mailboxScopes) : matchesMailboxScope(conversation, mailboxScope)
   );
+  // Snoozed conversations live only in the Snoozed view until they wake.
+  result = result.filter((conversation) => (navFilter === 'snoozed') === isSnoozedConversation(conversation));
+  if (sla) {
+    const now = Date.now();
+    result = result.filter((conversation) => matchesConversationSLAFilter(conversation, sla, now));
+  }
+  if (options.requestTypeIds?.length) {
+    const wanted = options.requestTypeIds;
+    result = result.filter((conversation) => wanted.includes(conversation.request_type_id ?? 'none'));
+  }
 
   if (statusFilter !== 'all') {
     result = result.filter((conversation) => conversation.status === statusFilter);
@@ -508,6 +575,11 @@ export function filterSupportConversations(
     });
   }
 
+  const priorities = options.priorities ?? [];
+  if (priorities.length > 0) {
+    result = result.filter((conversation) => priorities.includes(conversation.priority));
+  }
+
   if (searchQuery.trim()) {
     const query = searchQuery.toLowerCase();
     result = result.filter(
@@ -524,10 +596,32 @@ export function filterSupportConversations(
     const aResolved = resolvedStatuses.has(a.status) ? 1 : 0;
     const bResolved = resolvedStatuses.has(b.status) ? 1 : 0;
     if (aResolved !== bResolved) return aResolved - bResolved;
+    if (sortOrder === 'sla') {
+      const aDue = a.sla?.next_due_at ? new Date(a.sla.next_due_at).getTime() : Number.POSITIVE_INFINITY;
+      const bDue = b.sla?.next_due_at ? new Date(b.sla.next_due_at).getTime() : Number.POSITIVE_INFINITY;
+      if (aDue !== bDue) return aDue < bDue ? -1 : 1;
+    }
     const aTime = new Date(a.list_last_activity_at ?? a.list_last_message_at ?? a.created_at).getTime();
     const bTime = new Date(b.list_last_activity_at ?? b.list_last_message_at ?? b.created_at).getTime();
     return sortOrder === 'oldest' ? aTime - bTime : bTime - aTime;
   });
 
   return result;
+}
+
+/** A snoozed conversation is hidden from team queues until it wakes. */
+export function isSnoozedConversation(conversation: Pick<SupportConversation, 'snoozed_until' | 'status'>): boolean {
+  return Boolean(conversation.snoozed_until) && conversation.status !== 'resolved' && conversation.status !== 'spam';
+}
+
+export const CONVERSATION_PRIORITY_OPTIONS: { value: ConversationPriority; label: string }[] = [
+  { value: 'urgent', label: 'Urgent' },
+  { value: 'high', label: 'High' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'low', label: 'Low' },
+];
+
+export function parseConversationPriorities(value: unknown): ConversationPriority[] {
+  return parseViewStringList(value).filter((priority): priority is ConversationPriority =>
+    CONVERSATION_PRIORITY_OPTIONS.some(option => option.value === priority));
 }

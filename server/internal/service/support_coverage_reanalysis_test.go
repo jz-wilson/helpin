@@ -64,22 +64,26 @@ func (c *reanalysisStatusClient) DescribeWorkflowExecution(ctx context.Context, 
 func TestCoverageReanalysisStatusSurvivesReloadAndIsWorkspaceScoped(t *testing.T) {
 	client := &reanalysisStatusClient{status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING}
 	svc := NewSupportCoverageV2Service(nil).SetTemporalClient(client)
-	status, err := svc.reanalysisStatus(context.Background(), "ws-1")
+	state, err := svc.reanalysisState(context.Background(), "ws-1")
+	status := state.Status
 	if err != nil || status != "queued" || client.describedWorkspace != "coverage-reanalysis-ws-1" {
 		t.Fatalf("status %q, err %v", status, err)
 	}
 	client.activityState = enums.PENDING_ACTIVITY_STATE_STARTED
-	status, err = svc.reanalysisStatus(context.Background(), "ws-1")
+	state, err = svc.reanalysisState(context.Background(), "ws-1")
+	status = state.Status
 	if err != nil || status != "running" {
 		t.Fatalf("running status %q, err %v", status, err)
 	}
 	client.status = enums.WORKFLOW_EXECUTION_STATUS_COMPLETED
-	status, err = svc.reanalysisStatus(context.Background(), "ws-1")
+	state, err = svc.reanalysisState(context.Background(), "ws-1")
+	status = state.Status
 	if err != nil || status != "" {
 		t.Fatalf("completed status %q, err %v", status, err)
 	}
 	client.err = &serviceerror.NotFound{}
-	status, err = svc.reanalysisStatus(context.Background(), "ws-2")
+	state, err = svc.reanalysisState(context.Background(), "ws-2")
+	status = state.Status
 	if err != nil || status != "" {
 		t.Fatalf("first run %q, err %v", status, err)
 	}
@@ -89,7 +93,7 @@ func TestCoverageReanalysisIgnoresIncrementalCursor(t *testing.T) {
 	db := setupCoverageFindingUpsertTestDB(t)
 	for _, sql := range []string{
 		`CREATE TABLE support_coverage_analysis_runs (id TEXT PRIMARY KEY,workspace_id TEXT,window_start DATETIME,window_end DATETIME,cursor_started_at DATETIME,cursor_ended_at DATETIME,analyzer_version TEXT,status TEXT,conversation_cnt INTEGER,gap_count INTEGER,error_message TEXT,metadata TEXT,started_at DATETIME,completed_at DATETIME,created_at DATETIME,updated_at DATETIME)`,
-		`CREATE TABLE support_conversations (
+		`CREATE TABLE support_conversations (snoozed_until DATETIME, snoozed_by_user_id TEXT, 
             merged_into_id TEXT, merge_revision INTEGER NOT NULL DEFAULT 0,id TEXT PRIMARY KEY,workspace_id TEXT,subject TEXT,status TEXT,updated_at DATETIME,resolved_at DATETIME)`,
 		`CREATE TABLE sample_data_items (entity_id TEXT)`,
 	} {
@@ -100,7 +104,7 @@ func TestCoverageReanalysisIgnoresIncrementalCursor(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	old := now.Add(-20 * 24 * time.Hour)
-	if err := db.Exec(`INSERT INTO support_conversations VALUES ('c','ws-1','Billing help','open',?,NULL)`, old).Error; err != nil {
+	if err := db.Exec(`INSERT INTO support_conversations (id,workspace_id,subject,status,updated_at,resolved_at) VALUES ('c','ws-1','Billing help','open',?,NULL)`, old).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Exec(`INSERT INTO support_messages (id,workspace_id,conversation_id,sender_type,message_type,content,created_at) VALUES ('m','ws-1','c','customer','reply','How do I update billing details?',?)`, old).Error; err != nil {

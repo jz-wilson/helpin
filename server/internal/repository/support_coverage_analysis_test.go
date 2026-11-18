@@ -235,7 +235,7 @@ func TestSupportCoverageAnalysisRepository_RecordConversationAnalysisIdempotentB
 	}
 }
 
-func TestSupportCoverageAnalysisRepository_ListUnmaterializedGapAnalysesForRun(t *testing.T) {
+func TestSupportCoverageAnalysisRepository_ListUnmaterializedGapAnalyses(t *testing.T) {
 	db := setupSupportCoverageAnalysisTestDB(t)
 	repo := NewSupportCoverageAnalysisRepository(db)
 	ctx := context.Background()
@@ -249,9 +249,23 @@ func TestSupportCoverageAnalysisRepository_ListUnmaterializedGapAnalysesForRun(t
 			ConversationID:  "conversation-1",
 			Status:          model.SupportCoverageConversationAnalysisStatusAnalyzed,
 			HasGap:          true,
+			Confidence:      0.8,
 			TranscriptHash:  "hash-1",
 			AnalyzerVersion: "v1",
 			CustomerNeed:    "Customers need password reset emails.",
+			RawOutput:       json.RawMessage(`{}`),
+		},
+		{
+			ID:              "analysis-low-confidence",
+			WorkspaceID:     "ws-1",
+			RunID:           "run-1",
+			ConversationID:  "conversation-4",
+			Status:          model.SupportCoverageConversationAnalysisStatusAnalyzed,
+			HasGap:          true,
+			Confidence:      0.4,
+			TranscriptHash:  "hash-4",
+			AnalyzerVersion: "v1",
+			CustomerNeed:    "Customers may need export scheduling.",
 			RawOutput:       json.RawMessage(`{}`),
 		},
 		{
@@ -285,9 +299,9 @@ func TestSupportCoverageAnalysisRepository_ListUnmaterializedGapAnalysesForRun(t
 		}
 	}
 
-	items, err := repo.ListUnmaterializedGapAnalysesForRun(ctx, "ws-1", "run-1", 50)
+	items, err := repo.ListUnmaterializedGapAnalyses(ctx, "ws-1", 0.6, 50)
 	if err != nil {
-		t.Fatalf("ListUnmaterializedGapAnalysesForRun: %v", err)
+		t.Fatalf("ListUnmaterializedGapAnalyses: %v", err)
 	}
 	if len(items) != 1 || items[0].ID != "analysis-open" {
 		t.Fatalf("unexpected unmaterialized analyses: %+v", items)

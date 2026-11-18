@@ -38,6 +38,11 @@ vi.mock('@/hooks/queries/useSupport', () => ({
   useUpdateConversationCRMCompany: () => ({ mutate: mockState.mutate, isPending: false }),
 }))
 
+const companySLA = vi.hoisted(() => vi.fn(() => ({ data: undefined as unknown })))
+vi.mock('@/hooks/queries/useSupportSLATiers', () => ({
+  useCompanySLA: (...args: unknown[]) => companySLA(...args),
+}))
+
 vi.mock('@/hooks/queries', () => ({
   useWorkspaceAccess: () => ({ data: {} }),
   usePermissions: () => ({ has: () => mockState.canEdit }),
@@ -52,6 +57,7 @@ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 describe('SidebarCompanyDetails', () => {
   afterEach(() => {
     document.body.innerHTML = ''
+    window.localStorage.clear()
     mockState.canEdit = true
     mockState.isLoading = false
     mockState.context.company_context_status = 'ok'
@@ -69,6 +75,7 @@ describe('SidebarCompanyDetails', () => {
     }
     mockState.context.company_options = [{ id: 'company-1', display_id: 'COM-1', name: 'Acme', domain: 'acme.example' }]
     vi.clearAllMocks()
+    companySLA.mockReturnValue({ data: undefined })
   })
 
   function renderCompanyDetails() {
@@ -82,9 +89,12 @@ describe('SidebarCompanyDetails', () => {
   }
 
   it('shows live subscription details and hides technical SDK attributes', () => {
+    companySLA.mockReturnValue({ data: { company_id: 'company-1', tier_id: 't1', tier_name: 'Gold', has_custom: false, policies: [] } })
     const { container, root } = renderCompanyDetails()
 
-    expect(container.textContent).toContain('Company Details')
+    expect(companySLA).toHaveBeenLastCalledWith('ws-1', 'company-1', true)
+    expect(container.textContent).toContain('SLA tierGold')
+    expect(container.textContent).toContain('Company details')
     expect(container.textContent).toContain('Acme')
     expect(container.textContent).toContain('Enterprise')
     expect(container.textContent).toContain('Active')
@@ -98,13 +108,34 @@ describe('SidebarCompanyDetails', () => {
     act(() => root.unmount())
   })
 
+  it('marks a custom SLA next to the tier', () => {
+    companySLA.mockReturnValue({ data: { company_id: 'company-1', tier_id: 't1', tier_name: 'Gold', has_custom: true, policies: [] } })
+    const { container, root } = renderCompanyDetails()
+    expect(container.textContent).toContain('SLA tierGold, custom SLA')
+    act(() => root.unmount())
+  })
+
   it('hides company editing controls from read-only agents', () => {
     mockState.canEdit = false
     const { container, root } = renderCompanyDetails()
 
     expect(container.textContent).toContain('Acme')
+    expect(container.querySelector('[aria-label="Company options"]')).toBeNull()
     expect(container.textContent).not.toContain('Link another company')
     expect(container.textContent).not.toContain('Clear')
+
+    act(() => root.unmount())
+  })
+
+  it('opens the company in CRM in a new tab and keeps switching in the field itself', () => {
+    const { container, root } = renderCompanyDetails()
+    const link = container.querySelector('a[aria-label="Open Acme in CRM"]') as HTMLAnchorElement | null
+
+    expect(link?.getAttribute('href')).toBe('/w/acme-workspace/crm/companies/company-1')
+    expect(link?.getAttribute('target')).toBe('_blank')
+    expect(container.querySelector('[aria-label="Company options"]')).not.toBeNull()
+    expect(container.querySelector('select')).toBeNull()
+    expect(container.textContent).not.toContain('Link another company')
 
     act(() => root.unmount())
   })
@@ -118,9 +149,8 @@ describe('SidebarCompanyDetails', () => {
     ]
     const { container, root } = renderCompanyDetails()
 
-    expect(container.textContent).toContain('Select the company for this conversation.')
-    expect(container.querySelector('select[aria-label="Select conversation company"]')).not.toBeNull()
-    expect(container.textContent).toContain('Link a company')
+    expect(container.textContent).toContain('Select a company')
+    expect(container.querySelector('select')).toBeNull()
 
     act(() => root.unmount())
   })

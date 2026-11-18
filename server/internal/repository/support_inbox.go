@@ -12,9 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/helpin-ai/helpin/server/internal/authorization"
 	"github.com/helpin-ai/helpin/server/internal/model"
 )
 
@@ -185,6 +187,19 @@ func (r *SupportMessageRepository) GetByIDs(ctx context.Context, ids []string) (
 		return nil, err
 	}
 	return messages, nil
+}
+
+// FillNote replaces a note's content and metadata in place, for cards that
+// are posted while work runs and filled when it finishes. It reports whether
+// the note exists.
+func (r *SupportMessageRepository) FillNote(ctx context.Context, workspaceID, conversationID, id, content, metadata string) (bool, error) {
+	result := r.db.WithContext(ctx).Model(&model.SupportMessage{}).
+		Where("id = ? AND workspace_id = ? AND conversation_id = ? AND message_type = ? AND is_internal = ?", id, workspaceID, conversationID, "note", true).
+		Updates(map[string]any{"content": content, "metadata": metadata, "updated_at": time.Now()})
+	if result.Error != nil {
+		return false, fmt.Errorf("fill note: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // UpdateMetadata updates only the persisted metadata for a support message.
@@ -382,6 +397,22 @@ func (r *SupportInboxInstallationRepository) Update(ctx context.Context, inst *m
 		return fmt.Errorf("update widget installation: %w", err)
 	}
 	return nil
+}
+
+// SetAllowedOriginsIfEmpty saves origins only while the installation still has
+// an empty allowlist, so it never replaces a policy saved concurrently. It
+// reports whether the origins were saved.
+func (r *SupportInboxInstallationRepository) SetAllowedOriginsIfEmpty(ctx context.Context, id string, origins []string) (bool, error) {
+	result := r.db.WithContext(ctx).Model(&model.SupportWidgetInstallation{}).
+		Where("id = ? AND allowed_origins = '{}'", id).
+		Updates(map[string]interface{}{
+			"allowed_origins": model.DocsStringArray(origins),
+			"updated_at":      time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("set widget allowed origins: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // ListAllActive returns all active widget installations across all workspaces.
@@ -934,14 +965,22 @@ func conversationHumanQueueCondition(alias string) string {
 }
 
 func conversationHumanInboxCondition(alias string) string {
-	return fmt.Sprintf("(%s.status IN ('%s', '%s') AND (%s OR %s.ai_state = 'escalated' OR %s.customer_requested_human_at IS NOT NULL))",
+	return fmt.Sprintf("(%s.status IN ('%s', '%s') AND %s.snoozed_until IS NULL AND (%s OR %s.ai_state = 'escalated' OR %s.customer_requested_human_at IS NOT NULL))",
 		alias,
 		model.SupportConversationStatusOpen,
 		model.SupportConversationStatusWaitingOnCustomer,
+		alias,
 		conversationHumanQueueCondition(alias),
 		alias,
 		alias,
 	)
+}
+
+// conversationSnoozedCondition matches conversations hidden from team queues
+// until their snooze ends.
+func conversationSnoozedCondition(alias string) string {
+	return fmt.Sprintf("(%[1]s.snoozed_until IS NOT NULL AND %[1]s.status NOT IN ('%[2]s', '%[3]s'))",
+		alias, model.SupportConversationStatusResolved, model.SupportConversationStatusSpam)
 }
 
 func applyConversationFlowState(query *gorm.DB, alias, flowState string) *gorm.DB {
@@ -983,6 +1022,13 @@ type ConversationListParams struct {
 	TagIDs      []string
 	SystemTags  []string
 	AIFilters   []string
+	// SLA narrows to conversations with an overdue target ("breached"), a
+	// target due within model.SupportSLADueSoonWindow ("due_soon"), or any
+	// running SLA target ("active").
+	SLA string
+	// RequestTypeIDs narrows to these request types; "none" matches
+	// conversations without one.
+	RequestTypeIDs []string
 }
 
 // ConversationRepositoryListParams adds resolved actor access data for repository queries.
@@ -1018,8 +1064,8 @@ func (r *SupportConversationRepository) mentionExistsCondition(alias string, use
 			  AND mention_message.metadata LIKE ?
 			  AND mention_message.metadata LIKE ?
 		)))`, alias, alias, model.SupportRelevanceMention, alias, alias, alias), []any{
-				userID, "%mentioned_user_ids%", "%" + userID + "%",
-			}
+			userID, "%mentioned_user_ids%", "%" + userID + "%",
+		}
 	}
 	filterJSON, _ := json.Marshal(map[string][]string{"mentioned_user_ids": {userID}})
 	return fmt.Sprintf(`(EXISTS (
@@ -1037,9 +1083,9 @@ func (r *SupportConversationRepository) mentionExistsCondition(alias string, use
 		  AND mention_message.deleted_at IS NULL
 		  AND mention_message.metadata::jsonb @> ?::jsonb
 	)))`, alias, alias, model.SupportRelevanceMention, alias, alias, alias), []any{
-			userID,
-			string(filterJSON),
-		}
+		userID,
+		string(filterJSON),
+	}
 }
 
 func (r *SupportConversationRepository) conversationListProjectionSelect() string {
@@ -1131,17 +1177,17 @@ func (r *SupportConversationRepository) applyMineFilter(query *gorm.DB, alias, u
 		userID,
 	}
 	args = append(args, mentionArgs...)
-	return query.Where(fmt.Sprintf(`(%s OR %s.status = ?) AND (
+	return query.Where(fmt.Sprintf(`(%s OR %s.status = ?) AND %s.snoozed_until IS NULL AND (
 		%s.assigned_user_id = ?
 		OR %s.opened_by_user_id = ?
 		OR %s
-	)`, conversationHumanInboxCondition(alias), alias, alias, alias, mentionCondition), args...)
+	)`, conversationHumanInboxCondition(alias), alias, alias, alias, alias, mentionCondition), args...)
 }
 
 // Waiting is a view of public teammate replies, not a status transition.
 // Retain explicitly waiting conversations for compatibility with existing workflows.
 func conversationWaitingOnCustomerCondition(alias string) string {
-	return fmt.Sprintf("(%[1]s.status = 'waiting_on_customer' OR (%[1]s.status = 'open' AND %[1]s.last_public_sender_type = 'user' AND NOT COALESCE(%[1]s.customer_awaiting_response, false)))", alias)
+	return fmt.Sprintf("(%[1]s.snoozed_until IS NULL AND (%[1]s.status = 'waiting_on_customer' OR (%[1]s.status = 'open' AND %[1]s.last_public_sender_type = 'user' AND NOT COALESCE(%[1]s.customer_awaiting_response, false))))", alias)
 }
 
 func (r *SupportConversationRepository) applyConversationListFilter(query *gorm.DB, alias, filter, userID string) *gorm.DB {
@@ -1154,6 +1200,8 @@ func (r *SupportConversationRepository) applyConversationListFilter(query *gorm.
 		return r.applyMineFilter(query, alias, userID)
 	case model.SupportConversationListFilterResolved:
 		return query.Where(fmt.Sprintf("%s.status = ?", alias), model.SupportConversationStatusResolved)
+	case model.SupportConversationListFilterSnoozed:
+		return query.Where(conversationSnoozedCondition(alias))
 	default:
 		return query
 	}
@@ -1328,6 +1376,10 @@ func (r *SupportConversationRepository) applyConversationListParams(query *gorm.
 	query = applyConversationFlowState(query, alias, params.FlowState)
 	query = r.applyConversationSearch(query, strings.TrimSpace(params.Search))
 	query = r.applyConversationListFilter(query, alias, params.Filter, params.UserID)
+	if !strings.EqualFold(strings.TrimSpace(params.Filter), model.SupportConversationListFilterSnoozed) {
+		// Snoozed conversations appear only in the Snoozed view until they wake.
+		query = query.Where("NOT " + conversationSnoozedCondition(alias))
+	}
 	query = r.applyConversationAssignmentFilter(query, alias, params.AssignedTo, params.UserID)
 	query = applyConversationTagFilters(query, alias, params.TagIDs, params.SystemTags)
 	query = applyConversationAIFilters(query, alias, params.AIFilters)
@@ -1337,8 +1389,18 @@ func (r *SupportConversationRepository) applyConversationListParams(query *gorm.
 		query = query.Where(fmt.Sprintf("%s.status = ?", alias), params.Status)
 	}
 	if params.Priority != "" {
-		query = query.Where(fmt.Sprintf("%s.priority = ?", alias), params.Priority)
+		query = query.Where(fmt.Sprintf("%s.priority IN ?", alias), compactStrings(strings.Split(params.Priority, ",")))
 	}
+	switch strings.ToLower(strings.TrimSpace(params.SLA)) {
+	case "breached":
+		query = query.Where(fmt.Sprintf("EXISTS (SELECT 1 FROM support_conversation_slas sla WHERE sla.conversation_id = %s.id AND sla.breached)", alias))
+	case "due_soon":
+		query = query.Where(fmt.Sprintf("EXISTS (SELECT 1 FROM support_conversation_slas sla WHERE sla.conversation_id = %s.id AND NOT sla.breached AND sla.next_due_at < ?)", alias),
+			time.Now().UTC().Add(model.SupportSLADueSoonWindow))
+	case "active":
+		query = query.Where(fmt.Sprintf("EXISTS (SELECT 1 FROM support_conversation_slas sla WHERE sla.conversation_id = %s.id AND sla.next_due_at IS NOT NULL)", alias))
+	}
+	query = applyConversationRequestTypeFilter(query, alias, params.RequestTypeIDs)
 	if len(params.AIState) > 0 && params.AIState[0] != "" {
 		if params.AIState[0] == "any" {
 			query = query.Where(fmt.Sprintf("%s.ai_state IS NOT NULL", alias))
@@ -1360,9 +1422,18 @@ const conversationActivityJoin = `LEFT JOIN support_messages list_activity ON li
     ORDER BY activity.created_at DESC, activity.id DESC LIMIT 1
 )`
 
+// SupportConversationSortSLA orders conversations by their next SLA due
+// time, overdue first; conversations without SLA targets come last.
+const SupportConversationSortSLA = "sla"
+
 func conversationListOrder(sortOrder string) string {
-	if strings.EqualFold(strings.TrimSpace(sortOrder), "oldest") {
+	switch strings.ToLower(strings.TrimSpace(sortOrder)) {
+	case "oldest":
 		return "COALESCE(list_activity.created_at, support_conversations.created_at) ASC"
+	case SupportConversationSortSLA:
+		return `(SELECT sla.next_due_at FROM support_conversation_slas sla
+			WHERE sla.conversation_id = support_conversations.id) ASC NULLS LAST,
+			COALESCE(list_activity.created_at, support_conversations.created_at) DESC`
 	}
 	return "COALESCE(list_activity.created_at, support_conversations.created_at) DESC"
 }
@@ -1786,12 +1857,16 @@ func (r *SupportConversationRepository) List(ctx context.Context, params Convers
 	if err := fetch.
 		Joins("LEFT JOIN support_mailboxes sm ON sm.id = support_conversations.mailbox_id").
 		Joins(conversationActivityJoin).
-		Joins("LEFT JOIN support_conversation_user_states scus ON scus.conversation_id = support_conversations.id AND scus.user_id = ?", strings.TrimSpace(params.UserID)).
+		Joins("LEFT JOIN support_conversation_user_states scus ON scus.conversation_id = support_conversations.id AND scus.user_id = ?", nullableSupportUserID(params.UserID)).
 		Select(r.conversationListProjectionSelect()).
 		Order(conversationListOrder(params.Sort)).Offset(offset).Limit(perPage).Find(&conversations).Error; err != nil {
 		return nil, 0, fmt.Errorf("list conversations: %w", err)
 	}
 	for i := range conversations {
+		if strings.TrimSpace(params.UserID) == "" {
+			conversations[i].UnreadCount = 0
+			conversations[i].PersonalStateVersion = 0
+		}
 		if conversations[i].LastMessage == nil {
 			continue
 		}
@@ -1856,7 +1931,7 @@ func (r *SupportConversationRepository) CountByParamsWithAttention(ctx context.C
 		COUNT(*) AS total_count,
 		COALESCE(SUM(CASE WHEN %s THEN 1 ELSE 0 END), 0) AS unread_count,
 		COALESCE(SUM(CASE WHEN sc.needs_human_reply THEN 1 ELSE 0 END), 0) AS needs_human_reply_count
-	`, unreadCondition), strings.TrimSpace(params.UserID)).Scan(&counts).Error; err != nil {
+	`, unreadCondition), nullableSupportUserID(params.UserID)).Scan(&counts).Error; err != nil {
 		return 0, 0, 0, fmt.Errorf("count conversations: %w", err)
 	}
 
@@ -1870,12 +1945,29 @@ type CoverageAnalysisCandidateCursor struct {
 	ID        string    `json:"id"`
 }
 
-func (r *SupportConversationRepository) ListCoverageAnalysisCandidates(ctx context.Context, workspaceID string, windowStart, windowEnd time.Time, limit int) ([]model.SupportConversation, error) {
-	conversations, _, err := r.ListCoverageAnalysisCandidatesPage(ctx, workspaceID, windowStart, windowEnd, nil, limit)
+func (r *SupportConversationRepository) ListCoverageAnalysisCandidates(ctx context.Context, workspaceID string, windowStart, windowEnd time.Time, openQuietPeriod time.Duration, limit int) ([]model.SupportConversation, error) {
+	conversations, _, err := r.ListCoverageAnalysisCandidatesPage(ctx, workspaceID, windowStart, windowEnd, openQuietPeriod, nil, limit)
 	return conversations, err
 }
 
-func (r *SupportConversationRepository) ListCoverageAnalysisCandidatesPage(ctx context.Context, workspaceID string, windowStart, windowEnd time.Time, cursor *CoverageAnalysisCandidateCursor, limit int) ([]model.SupportConversation, *CoverageAnalysisCandidateCursor, error) {
+// ListCoverageAnalysisCandidatesPage lists conversations that settled inside
+// the window. A resolved conversation qualifies when it changed or was
+// resolved in the window. Any other conversation qualifies when its last
+// change falls in the window shifted back by openQuietPeriod, so one still in
+// progress is read only after it has been quiet that long, and consecutive
+// windows still cover every moment.
+func (r *SupportConversationRepository) ListCoverageAnalysisCandidatesPage(ctx context.Context, workspaceID string, windowStart, windowEnd time.Time, openQuietPeriod time.Duration, cursor *CoverageAnalysisCandidateCursor, limit int) ([]model.SupportConversation, *CoverageAnalysisCandidateCursor, error) {
+	return r.listCoverageAnalysisCandidatesPage(ctx, workspaceID, windowStart, windowEnd, openQuietPeriod, cursor, limit, false)
+}
+
+// ListCoverageReanalysisCandidatesPage includes the entire current failure
+// backlog in addition to the normal window. Dead-lettered/configuration-paused
+// work otherwise cannot recover once its conversation ages out of that window.
+func (r *SupportConversationRepository) ListCoverageReanalysisCandidatesPage(ctx context.Context, workspaceID string, windowStart, windowEnd time.Time, openQuietPeriod time.Duration, cursor *CoverageAnalysisCandidateCursor, limit int) ([]model.SupportConversation, *CoverageAnalysisCandidateCursor, error) {
+	return r.listCoverageAnalysisCandidatesPage(ctx, workspaceID, windowStart, windowEnd, openQuietPeriod, cursor, limit, true)
+}
+
+func (r *SupportConversationRepository) listCoverageAnalysisCandidatesPage(ctx context.Context, workspaceID string, windowStart, windowEnd time.Time, openQuietPeriod time.Duration, cursor *CoverageAnalysisCandidateCursor, limit int, includeFailures bool) ([]model.SupportConversation, *CoverageAnalysisCandidateCursor, error) {
 	if workspaceID == "" {
 		return nil, nil, fmt.Errorf("workspace_id is required")
 	}
@@ -1892,11 +1984,24 @@ func (r *SupportConversationRepository) ListCoverageAnalysisCandidatesPage(ctx c
 		Where("status <> ?", model.SupportConversationStatusSpam).
 		// Sample conversations are not real customer demand; keep them out of
 		// AI coverage analysis.
-		Where(NotSampleDataSQL("support_conversations.id")).
-		Where(`(
-			(updated_at >= ? AND updated_at < ?)
-			OR (resolved_at IS NOT NULL AND resolved_at >= ? AND resolved_at < ?)
-		)`, windowStart, windowEnd, windowStart, windowEnd)
+		Where(NotSampleDataSQL("support_conversations.id"))
+	windowQuery := r.db.Where(`(
+			(status = ? AND (
+				(updated_at >= ? AND updated_at < ?)
+				OR (resolved_at IS NOT NULL AND resolved_at >= ? AND resolved_at < ?)
+			))
+			OR (status <> ? AND updated_at >= ? AND updated_at < ?)
+		)`,
+		model.SupportConversationStatusResolved, windowStart, windowEnd, windowStart, windowEnd,
+		model.SupportConversationStatusResolved, windowStart.Add(-openQuietPeriod), windowEnd.Add(-openQuietPeriod))
+	if includeFailures {
+		failures := r.db.Model(&model.CoverageAnalysisAttempt{}).Select("1").
+			Where("workspace_id = support_conversations.workspace_id AND source_kind = ? AND source_id = CAST(support_conversations.id AS TEXT)", "conversation").
+			Where("status IN ?", []string{model.CoverageAttemptRetryable, model.CoverageAttemptDeadLetter, model.CoverageAttemptPausedConfiguration}).
+			Where(currentCoverageAttemptSQL)
+		windowQuery = windowQuery.Or("EXISTS (?)", failures)
+	}
+	query = query.Where(windowQuery)
 	if cursor != nil {
 		query = query.Where("(updated_at > ?) OR (updated_at = ? AND id > ?)", cursor.UpdatedAt, cursor.UpdatedAt, cursor.ID)
 	}
@@ -2024,6 +2129,9 @@ func (r *SupportConversationRepository) GetByID(ctx context.Context, workspaceID
 		}
 		return nil, fmt.Errorf("get conversation: %w", err)
 	}
+	if err := LoadSupportMailboxAIPolicy(r.db.WithContext(ctx), &conversation); err != nil {
+		return nil, err
+	}
 	return &conversation, nil
 }
 
@@ -2035,7 +2143,7 @@ func (r *SupportConversationRepository) GetByIDForUser(ctx context.Context, work
 		Table("support_conversations").
 		Joins("LEFT JOIN support_mailboxes sm ON sm.id = support_conversations.mailbox_id").
 		Joins(conversationActivityJoin).
-		Joins("LEFT JOIN support_conversation_user_states scus ON scus.conversation_id = support_conversations.id AND scus.user_id = ?", strings.TrimSpace(userID)).
+		Joins("LEFT JOIN support_conversation_user_states scus ON scus.conversation_id = support_conversations.id AND scus.user_id = ?", nullableSupportUserID(userID)).
 		Where("support_conversations.workspace_id = ? AND support_conversations.id = ?", workspaceID, id)
 	query = r.applyMailboxAccess(query, "support_conversations", workspaceMemberID, role)
 	if err := query.Select(r.conversationListProjectionSelect()).First(&conversation).Error; err != nil {
@@ -2043,6 +2151,10 @@ func (r *SupportConversationRepository) GetByIDForUser(ctx context.Context, work
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get conversation for user: %w", err)
+	}
+	if strings.TrimSpace(userID) == "" {
+		conversation.UnreadCount = 0
+		conversation.PersonalStateVersion = 0
 	}
 	return &conversation, nil
 }
@@ -2079,6 +2191,18 @@ func (r *SupportConversationRepository) Update(ctx context.Context, conversation
 		return ErrSupportAIControlConflict
 	}
 	return nil
+}
+
+// ClearLinkedTask clears the conversation's main task when it is taskID, and
+// reports whether it did.
+func (r *SupportConversationRepository) ClearLinkedTask(ctx context.Context, workspaceID, conversationID, taskID string) (bool, error) {
+	result := r.db.WithContext(ctx).Model(&model.SupportConversation{}).
+		Where("id = ? AND workspace_id = ? AND linked_task_id = ?", conversationID, workspaceID, taskID).
+		Update("linked_task_id", nil)
+	if result.Error != nil {
+		return false, fmt.Errorf("clear linked task: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // UpdateFields updates specific fields on a conversation by ID and workspace.
@@ -2508,7 +2632,9 @@ func (r *SupportConversationRepository) GetUnreadStats(ctx context.Context, work
 		 AND personal_state.workspace_id = sc.workspace_id
 		 AND personal_state.user_id = ?
 		WHERE sc.workspace_id = ?
+		  AND sc.merged_into_id IS NULL
 		  AND sc.status NOT IN ('resolved', 'spam')
+		  AND sc.snoozed_until IS NULL
 	`, unreadCondition, humanInboxCondition, unreadCondition, mineCondition, unreadCondition, unreadCondition, aiActiveCondition, unreadCondition, supportUnreadScopeCondition, unreadCondition, mineCondition, unreadCondition, humanInboxCondition, humanInboxCondition, mineCondition, aiActiveCondition, humanInboxCondition, mineCondition, aiActiveCondition)
 
 	args := []any{userID, workspaceID}
@@ -2576,7 +2702,8 @@ func (r *SupportConversationRepository) getLegacyUnreadStats(ctx context.Context
 			COUNT(*) FILTER (WHERE sc.needs_human_reply AND `+conversationWaitingOnCustomerCondition("sc")+`) AS waiting_needs_human_reply,
 			COUNT(*) FILTER (WHERE sc.needs_human_reply AND %s) AS ai_active_needs_human_reply
 		FROM support_conversations sc
-		WHERE sc.workspace_id = ? AND sc.status NOT IN ('resolved', 'spam')
+		WHERE sc.workspace_id = ? AND sc.merged_into_id IS NULL
+		  AND sc.status NOT IN ('resolved', 'spam') AND sc.snoozed_until IS NULL
 	`, unreadCondition, humanInboxCondition, unreadCondition, mineCondition,
 		unreadCondition, unreadCondition, aiActiveCondition, unreadCondition, supportUnreadScopeCondition,
 		unreadCondition, mineCondition, unreadCondition, humanInboxCondition,
@@ -2705,6 +2832,9 @@ func (r *SupportConversationRepository) applyMailboxScope(query *gorm.DB, alias 
 }
 
 func (r *SupportConversationRepository) applyMailboxAccess(query *gorm.DB, alias, workspaceMemberID, role string) *gorm.DB {
+	if scope := authorization.GetSupportAgentScope(query.Statement.Context); scope != nil {
+		return applySupportAgentConversationAccess(query, alias, scope)
+	}
 	if isElevatedSupportRole(role) {
 		return query
 	}
@@ -2980,6 +3110,71 @@ func (r *SupportCannedResponseRepository) Update(ctx context.Context, response *
 func (r *SupportCannedResponseRepository) Delete(ctx context.Context, workspaceID, id string) error {
 	if err := r.db.WithContext(ctx).Where("workspace_id = ? AND id = ?", workspaceID, id).Delete(&model.SupportCannedResponse{}).Error; err != nil {
 		return fmt.Errorf("delete canned response: %w", err)
+	}
+	return nil
+}
+
+// ListDueSnoozes returns conversations whose snooze ended at or before now.
+func (r *SupportConversationRepository) ListDueSnoozes(ctx context.Context, now time.Time, limit int) ([]model.SupportConversation, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	var conversations []model.SupportConversation
+	err := r.db.WithContext(ctx).Model(&model.SupportConversation{}).
+		Where("snoozed_until IS NOT NULL AND snoozed_until <= ?", now).
+		Order("snoozed_until").Limit(limit).Find(&conversations).Error
+	if err != nil {
+		return nil, fmt.Errorf("list due support snoozes: %w", err)
+	}
+	return conversations, nil
+}
+
+// ClearSnooze wakes a conversation if it is still snoozed until the given
+// time, so concurrent wakers clear it once.
+func (r *SupportConversationRepository) ClearSnooze(ctx context.Context, workspaceID, conversationID string, snoozedUntil time.Time) (bool, error) {
+	result := r.db.WithContext(ctx).Model(&model.SupportConversation{}).
+		Where("id = ? AND workspace_id = ? AND snoozed_until = ?", conversationID, workspaceID, snoozedUntil).
+		Updates(map[string]any{"snoozed_until": nil, "snoozed_by_user_id": nil})
+	if result.Error != nil {
+		return false, fmt.Errorf("clear support snooze: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// applyConversationRequestTypeFilter keeps conversations of the given request
+// types; "none" keeps those without one. Values that are not ids are ignored.
+func applyConversationRequestTypeFilter(query *gorm.DB, alias string, requestTypeIDs []string) *gorm.DB {
+	var ids []string
+	none := false
+	for _, value := range requestTypeIDs {
+		if value == "none" {
+			none = true
+		} else if _, err := uuid.Parse(value); err == nil {
+			ids = append(ids, value)
+		}
+	}
+	switch {
+	case len(ids) > 0 && none:
+		return query.Where(fmt.Sprintf("(%s.request_type_id IN ? OR %s.request_type_id IS NULL)", alias, alias), ids)
+	case len(ids) > 0:
+		return query.Where(fmt.Sprintf("%s.request_type_id IN ?", alias), ids)
+	case none:
+		return query.Where(fmt.Sprintf("%s.request_type_id IS NULL", alias))
+	}
+	return query
+}
+
+// SetRequestType sets or clears a conversation's request type. Merged
+// sources are read-only.
+func (r *SupportConversationRepository) SetRequestType(ctx context.Context, workspaceID, conversationID string, requestTypeID *string) error {
+	result := r.db.WithContext(ctx).Table("support_conversations").
+		Where("id = ? AND workspace_id = ? AND merged_into_id IS NULL", conversationID, workspaceID).
+		Updates(map[string]any{"request_type_id": requestTypeID, "updated_at": time.Now().UTC()})
+	if result.Error != nil {
+		return fmt.Errorf("set conversation request type: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrSupportMerged
 	}
 	return nil
 }

@@ -114,6 +114,7 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 		settings = model.DefaultSupportInboxSettings()
 		availability = resolveSupportAvailability(settings, now)
 	}
+	settings = effectiveSupportAISettings(settings, conv)
 
 	handoffMailboxID, mailboxSelectionSource := s.resolveEscalationMailbox(ctx, workspaceID, conversationID, messageID, conv, settings)
 
@@ -128,6 +129,7 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 			nil,
 			s.presence,
 			s.statusOverrideRepo,
+			s.responderDirectory,
 			supportRecipientSelectorInput{
 				WorkspaceID:          workspaceID,
 				MailboxID:            handoffMailboxID,
@@ -144,43 +146,24 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 		}
 	}
 
-	// Resolve the customer-facing handoff state and render the escalation message
-	// for that state. Computed outside the dedupe guard below so handoffState is
-	// persisted even when the customer-facing message is skipped.
-	// handoff_state must reflect real teammate presence (the same source the
-	// widget's pre-chat availability uses), NOT whether an assignee was selected:
-	// with HandoffBehavior "unassigned" (the default) selection is always nil even
-	// when a teammate is online. selection stays purely about routing/assignment.
-	hasAvailableTeammate := anySupportTeammateOnline(ctx, s.workspaceRepo, s.presence, s.statusOverrideRepo, workspaceID, now)
-	handoffState := resolveHandoffState(hasAvailableTeammate, availability.IsWithinOfficeHours)
-
-	// Short phrase for the {reply_time} token. Do NOT use
-	// availability.WidgetAvailability.ReplyTimeText — that is full-sentence copy
-	// (and the offline branch sets it to the outside-hours message).
-	replyTime := shortReplyTimePhrase(
-		availability.WidgetAvailability.ReplyTimePreset,
-		availability.WidgetAvailability.ReplyTimeMinutes,
-	)
-
-	// Next-open text (only meaningful for after_hours).
-	var nextOpenText string
-	if loc, err := time.LoadLocation(settings.BusinessHoursTimezone); err == nil {
-		localNow := now.In(loc)
-		nextOpenText = humanizeNextOpen(nextBusinessHoursStart(settings, localNow), localNow)
+	// Resolve the customer-facing handoff state. Computed outside the dedupe
+	// guard below so handoffState is persisted even when the customer-facing
+	// message is skipped.
+	// handoff_state must reflect whether someone who looks after the handoff
+	// inbox is around, NOT whether an assignee was selected: with
+	// HandoffBehavior "unassigned" (the default) selection is always nil even
+	// when a responder is around. selection stays purely about routing.
+	customerTeammates, err := resolveSupportCustomerTeammates(ctx, s.workspaceRepo, s.presence, s.statusOverrideRepo, s.responderDirectory, workspaceID, settings.BusinessHoursTimezone, now)
+	if err != nil {
+		slog.WarnContext(ctx, "resolve teammates available to customers failed; treating as unavailable", "error", err, "workspace_id", workspaceID, "conversation_id", conversationID)
 	}
-
-	escalationContent := renderEscalationMessage(
-		selectEscalationTemplate(settings, handoffState),
-		replyTime,
-		nextOpenText,
-	)
-	if reply := strings.TrimSpace(transitionReply); reply != "" {
-		escalationContent = stripConversationPII(reply, conv.CustomerEmail, conv.CustomerPhone)
-	}
+	inboxTeamAvailable := s.inboxTeamAvailable(ctx, customerTeammates, workspaceID, derefString(handoffMailboxID), settings.BusinessHoursTimezone, now)
+	handoffState := resolveHandoffState(inboxTeamAvailable, availability.IsWithinOfficeHours)
 
 	var replyMsg *model.SupportMessage
 	var escalationSystemMsg *model.SupportMessage
 	escalationAlreadyMessaged := false
+	codeCheckedThisTurn := false
 	// Load with includeInternal=true so dedupe can see the new internal
 	// handoff system events (and the legacy ai_escalated rows that were
 	// public but are still recognized).
@@ -202,6 +185,7 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 			}
 		}
 		escalationAlreadyMessaged = hasEscalationMessageInHistory(recent)
+		codeCheckedThisTurn = supportCodeCheckedThisTurn(recent)
 	}
 
 	// 1. Create escalation messages — a customer-facing reply plus an
@@ -233,14 +217,18 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 				replyChannel = model.SupportAIReplyChannel(conv, source)
 			}
 		}
+		if len(briefs) > 0 && briefs[0].CustomerNotified {
+			sendPublicHandoff = false
+		}
 		if sendPublicHandoff {
+			content := s.handoffReplyContent(ctx, conv, settings, availability, handoffState, replyChannel, transitionReply, briefs, now)
 			replyMsg = &model.SupportMessage{
 				WorkspaceID:       workspaceID,
 				ConversationID:    conversationID,
 				SenderType:        "ai",
 				MessageType:       "reply",
 				SenderDisplayName: strPtr(helpinAIDisplayName),
-				Content:           escalationContent,
+				Content:           s.translateHandoffReply(ctx, conv, settings, content),
 			}
 			if replyChannel == "email" {
 				replyMsg.Metadata = `{"delivery_mode":"email_only"}`
@@ -303,6 +291,12 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 			brief.Issue = issueSummary
 		}
 	}
+	investigation := newSupportInvestigation(conv, issueKey, brief, now)
+	if codeCheckedThisTurn {
+		// The team already has this message's code-check card.
+		investigation = nil
+	}
+	brief.InvestigationRequested = investigation != nil
 	note := buildSupportHandoffNote(conv, history, reason, brief, now)
 	messages := []*model.SupportMessage{replyMsg, escalationSystemMsg, note}
 	if systemEventForEscalationReason(reason) == model.SystemEventCustomerRequestedHuman {
@@ -315,7 +309,16 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 			message.CreatedAt = now.Truncate(time.Millisecond).Add(time.Duration(index) * time.Millisecond)
 		}
 	}
-	oldRun, changed, err := s.conversationRepo.ChangeAIControl(ctx, workspaceID, conversationID, func(current *model.SupportConversation) (map[string]any, *model.SupportMessage, error) {
+	// The code check shows a running card right after the handoff; its findings
+	// fill the same card later.
+	var codeCheckCard *model.SupportMessage
+	if investigation != nil {
+		codeCheckCard = newSupportCodeCheckNote(investigation, supportCodeCheck{Status: supportCodeCheckRunning, Focus: briefText(brief.InvestigationFocus)}, now.Truncate(time.Millisecond).Add(time.Duration(len(messages))*time.Millisecond))
+	}
+	oldRun, changed, codeCheckPosted, err := s.conversationRepo.ChangeAIControlWithCodeCheck(ctx, workspaceID, conversationID, func(current *model.SupportConversation) (map[string]any, *model.SupportMessage, error) {
+		if brief.ExpectedNoRun && current.AIActiveRunID != nil {
+			return nil, nil, nil
+		}
 		if brief.ExpectedControlVersion != nil && (current.AIControlVersion != *brief.ExpectedControlVersion || derefString(current.LastPublicMessageID) != brief.ExpectedMessageID || model.SupportAIConversationBlocked(current) || supportConversationHumanOwned(current)) {
 			return nil, nil, nil
 		}
@@ -326,7 +329,7 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 			return nil, nil, nil
 		}
 		return fields, nil, nil
-	}, messages...)
+	}, investigation, codeCheckCard, messages...)
 	if err != nil {
 		return fmt.Errorf("update conversation for escalation: %w", err)
 	}
@@ -346,6 +349,10 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 		}
 		s.wsPublisher.Publish(websocket.SupportMessageEvent(workspaceID, message, actor))
 	}
+	if codeCheckPosted {
+		s.wsPublisher.Publish(websocket.SupportMessageEvent(workspaceID, codeCheckCard, "ai:investigation"))
+	}
+	s.recordRequiredEmailWait(ctx, workspaceID, conversationID, "")
 	if selection != nil && strings.TrimSpace(selection.UserID) != "" && s.assignmentSystemMessageEmitter != nil {
 		s.assignmentSystemMessageEmitter(ctx, workspaceID, conversationID, selection.UserID)
 	}
@@ -436,6 +443,17 @@ func (s *SupportAIService) escalateToHuman(ctx context.Context, workspaceID, con
 		"mailbox_selection_source", mailboxSelectionSource,
 	)
 	return nil
+}
+
+// nextOpenForCustomer says when business hours start again, on the customer's
+// clock when it is known.
+func (s *SupportAIService) nextOpenForCustomer(ctx context.Context, conv *model.SupportConversation, settings model.SupportInboxSettings, now time.Time) string {
+	return supportNextOpenForCustomer(ctx, s.sessionRepo, conv, settings, now)
+}
+
+// customerLocation returns the timezone the customer's widget reported, or nil when it is unknown.
+func (s *SupportAIService) customerLocation(ctx context.Context, conv *model.SupportConversation) *time.Location {
+	return supportCustomerLocation(ctx, s.sessionRepo, conv)
 }
 
 func (s *SupportAIService) publishVisitorConversationsRefresh(ctx context.Context, workspaceID, anonymousID string) {

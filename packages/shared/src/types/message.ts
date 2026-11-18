@@ -62,6 +62,7 @@ export interface Message {
 }
 
 export interface AiSource {
+  url?: string;
   docId: string;
   title: string;
   snippet: string;
@@ -89,6 +90,8 @@ export interface LinkPreview {
 
 export interface PendingAttachment {
   error?: string;
+  /** The server refused the file itself, so a retry would fail the same way. */
+  refused?: boolean;
   id: string;
   fileName: string;
   fileType: string;

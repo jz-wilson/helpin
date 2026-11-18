@@ -173,7 +173,7 @@ func (r *WorkspaceRepository) List(ctx context.Context, userID string, organizat
 	var results []model.WorkspaceWithRole
 	q := r.db.WithContext(ctx).
 		Table("workspaces w").
-		Select("w.id, w.name, w.slug, w.owner_id, w.organization_id, w.description, w.website_url, w.logo_url, w.timezone, w.created_at, w.updated_at, wm.role").
+		Select("w.id, w.name, w.slug, w.owner_id, w.organization_id, w.description, w.website_url, w.logo_url, w.timezone, w.link_previews_enabled, w.created_at, w.updated_at, wm.role").
 		Joins("JOIN workspace_members wm ON w.id = wm.workspace_id").
 		Where("wm.user_id = ? AND wm.status = ?", userID, model.WorkspaceMemberStatusActive)
 	if organizationID != "" {
@@ -340,8 +340,11 @@ func (r *WorkspaceRepository) ListTeams(ctx context.Context, workspaceID string)
 }
 
 // Update modifies workspace fields.
-func (r *WorkspaceRepository) Update(ctx context.Context, id string, name, description, companyProductContext, websiteURL, logoURL, timezone *string) (*model.Workspace, error) {
+func (r *WorkspaceRepository) Update(ctx context.Context, id string, name, description, companyProductContext, websiteURL, logoURL, timezone *string, linkPreviewsEnabled *bool) (*model.Workspace, error) {
 	updates := map[string]interface{}{}
+	if linkPreviewsEnabled != nil {
+		updates["link_previews_enabled"] = *linkPreviewsEnabled
+	}
 	if name != nil {
 		updates["name"] = *name
 	}
@@ -436,10 +439,13 @@ func (r *WorkspaceRepository) Delete(ctx context.Context, id string) error {
 			"DELETE FROM pm_team_field_visibility WHERE team_id IN (" + teamQ + ")",
 			"DELETE FROM pm_team_repo_defaults WHERE team_id IN (" + teamQ + ")",
 
-			// Reward profiles (via workspace members)
-			"DELETE FROM reward_profiles WHERE workspace_member_id IN (" + memberQ + ")",
+			// reward_profiles cascade from workspace_members; versioned migrations
+			// never create the table, so it must not be named here.
 
-			// Support messages (via conversations for FK ordering)
+			// Support messages (via conversations for FK ordering). Anonymized
+			// conversations go first, as in SupportConversationRepository.Delete:
+			// message triggers would otherwise update their read-only projections.
+			"DELETE FROM support_conversations WHERE workspace_id = ? AND anonymized_at IS NOT NULL",
 			"DELETE FROM support_messages WHERE conversation_id IN (" + ticketQ + ")",
 
 			// ── Phase 2: Direct workspace_id tables ──
@@ -490,9 +496,6 @@ func (r *WorkspaceRepository) Delete(ctx context.Context, id string) error {
 
 			// Workspace key history
 			"DELETE FROM workspace_key_history WHERE workspace_id = ?",
-
-			// Finally, delete the workspace itself
-			"DELETE FROM workspaces WHERE id = ?",
 		}
 
 		for _, q := range queries {
@@ -504,6 +507,16 @@ func (r *WorkspaceRepository) Delete(ctx context.Context, id string) error {
 			if err := tx.Exec(q, args...).Error; err != nil {
 				return fmt.Errorf("delete workspace %s: %w", id, err)
 			}
+		}
+		// The list above orders known parent/child deletes; the sweep removes
+		// rows from every other workspace-scoped table so none are orphaned.
+		if tx.Dialector.Name() == "postgres" {
+			if err := sweepWorkspaceRows(tx, id); err != nil {
+				return fmt.Errorf("delete workspace %s: %w", id, err)
+			}
+		}
+		if err := tx.Exec("DELETE FROM workspaces WHERE id = ?", id).Error; err != nil {
+			return fmt.Errorf("delete workspace %s: %w", id, err)
 		}
 
 		if orgID != "" {
@@ -746,10 +759,18 @@ func (r *WorkspaceRepository) UpdateMemberRole(ctx context.Context, workspaceID,
 }
 
 // UpdateSupportTaskPreferences updates the support task creation preferences for a workspace member.
-func (r *WorkspaceRepository) UpdateSupportTaskPreferences(ctx context.Context, memberID string, teamID *string, dialogDismissed *bool) error {
+func (r *WorkspaceRepository) UpdateSupportTaskPreferences(ctx context.Context, memberID string, teamID *string, dialogDismissed *bool, inboxID ...*string) error {
 	updates := map[string]interface{}{}
 	if teamID != nil {
 		updates["support_default_team_id"] = teamID
+	}
+	if len(inboxID) > 0 && inboxID[0] != nil && teamID != nil {
+		key := *inboxID[0]
+		if r.db.Dialector.Name() == "postgres" {
+			updates["support_task_team_by_inbox"] = gorm.Expr("jsonb_set(COALESCE(support_task_team_by_inbox, '{}'::jsonb), ARRAY[?]::text[], to_jsonb(CAST(? AS text)), true)", key, *teamID)
+		} else {
+			updates["support_task_team_by_inbox"] = gorm.Expr("json_set(COALESCE(support_task_team_by_inbox, '{}'), ?, ?)", "$."+key, *teamID)
+		}
 	}
 	if dialogDismissed != nil {
 		updates["support_task_dialog_dismissed"] = *dialogDismissed

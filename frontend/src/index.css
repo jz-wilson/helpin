@@ -640,6 +640,7 @@
   --color-quiet-backdrop: var(--quiet-backdrop);
   --color-quiet-hover: var(--quiet-hover);
   --color-quiet-row-hover: var(--quiet-row-hover);
+  --color-quiet-row-selected: var(--quiet-row-selected);
   --color-quiet-icon-well: var(--quiet-icon-well);
   --color-quiet-divider-strong: var(--quiet-divider-strong);
   --color-quiet-divider-light: var(--quiet-divider-light);
@@ -703,6 +704,8 @@
   --quiet-backdrop: #e9e8e5;
   --quiet-hover: #f5f4f2;
   --quiet-row-hover: #faf9f7;
+  /* The open item in a list: clearly darker than hover, cool so it doesn't read as a status colour. */
+  --quiet-row-selected: #ecf0f5;
   --quiet-icon-well: #f0efec;
   --quiet-divider-strong: #ecebe8;
   --quiet-divider-light: #f2f1ee;
@@ -796,7 +799,9 @@
 .pm-rich-text :where(p, ol, ul, li, blockquote, dl) {
   line-height: inherit;
 }
-/* Show placeholder only on the first empty paragraph of an empty editor. */
+/* Docs also shows a hint on the current empty paragraph. Other editors keep
+   their placeholder limited to the first block of an empty document. */
+.docs-editor-prose p.is-empty::before,
 .tiptap.is-editor-empty > p.is-empty:first-child::before,
 .ProseMirror.is-editor-empty > p.is-empty:first-child::before,
 .tiptap > p.is-editor-empty:first-child::before,
@@ -1060,6 +1065,16 @@
 .docs-block-anchor-highlight {
   animation: docs-block-anchor-pulse 1.6s ease-out;
   border-radius: 4px;
+}
+
+/* Brief positive tint on a document row that was just dropped in the
+   space list's saved-order view. */
+@keyframes docs-row-moved-pulse {
+  0% { background-color: color-mix(in oklab, var(--quiet-positive) 14%, transparent); }
+  100% { background-color: transparent; }
+}
+.docs-row-moved {
+  animation: docs-row-moved-pulse 1.6s ease-out;
 }
 
 /* Docs article rhythm: used by the docs editor and shared read-only documents. */
@@ -1502,6 +1517,37 @@
   border-top-color: rgba(15, 23, 42, 0.1);
 }
 
+/* Inbox reading surfaces retain their containing bubble's color family. */
+[data-support-message-list] .prose-chat pre,
+[data-support-message-list] .prose-chat :not(pre) > code {
+  color: inherit;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+}
+[data-support-message-list] .prose-chat pre code {
+  color: inherit;
+  background: transparent;
+  border: 0;
+}
+[data-support-message-list] .prose-chat .chat-markdown-table-wrap {
+  background: color-mix(in srgb, currentColor 3%, transparent);
+  border-color: color-mix(in srgb, currentColor 14%, transparent);
+}
+[data-support-message-list] .prose-chat th,
+[data-support-message-list] .prose-chat td {
+  border-color: color-mix(in srgb, currentColor 14%, transparent);
+}
+[data-support-message-list] .prose-chat th {
+  background: color-mix(in srgb, currentColor 6%, transparent);
+}
+[data-support-message-list] .prose-chat tr:nth-child(even) {
+  background: color-mix(in srgb, currentColor 3%, transparent);
+}
+[data-support-message-list] .prose-chat blockquote {
+  border-left-color: color-mix(in srgb, currentColor 22%, transparent);
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
 .accordion-animate {
   display: grid;
   grid-template-rows: 0fr;
@@ -1560,6 +1606,7 @@
   --quiet-backdrop: oklch(0.11 0 0);
   --quiet-hover: var(--muted);
   --quiet-row-hover: color-mix(in oklab, var(--muted) 72%, transparent);
+  --quiet-row-selected: #222935;
   --quiet-icon-well: var(--muted);
   --quiet-divider-strong: var(--border);
   --quiet-divider-light: color-mix(in oklab, var(--border) 66%, transparent);
@@ -1705,4 +1752,41 @@
     position: fixed !important;
     z-index: 55 !important;
   }
+}
+
+/* ── Inbox cleared celebration ─────────────────────────────────────────────
+   Shown in the thread pane when the viewer's own action empties an inbox.
+   The rarity tints the badge, the tone label and a faint glow; motion is
+   dropped entirely for reduced-motion users. */
+.inbox-cleared { --inbox-cleared-tint: var(--quiet-text-tertiary); }
+.inbox-cleared[data-rarity='rare'] { --inbox-cleared-tint: var(--quiet-positive); }
+.inbox-cleared[data-rarity='epic'] { --inbox-cleared-tint: var(--quiet-lifecycle); }
+.inbox-cleared[data-rarity='legendary'] { --inbox-cleared-tint: var(--quiet-accent); }
+.inbox-cleared::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(60% 50% at 50% 42%, color-mix(in oklab, var(--inbox-cleared-tint) 9%, transparent), transparent 70%);
+}
+.inbox-cleared-seal, .inbox-cleared-tone { color: var(--inbox-cleared-tint); }
+.inbox-cleared-orbit { fill: none; stroke: currentColor; stroke-width: 1; stroke-dasharray: 2 5; opacity: 0; transform-origin: 48px 48px; }
+.inbox-cleared[data-rarity='epic'] .inbox-cleared-orbit,
+.inbox-cleared[data-rarity='legendary'] .inbox-cleared-orbit { opacity: .55; animation: inbox-cleared-orbit 14s linear infinite; }
+.inbox-cleared-tick { stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; transform-origin: 48px 48px; animation: inbox-cleared-pop .5s calc(.42s + var(--i) * 26ms) cubic-bezier(.2, .9, .3, 1.5) both; }
+.inbox-cleared-ring { fill: none; stroke: currentColor; stroke-width: 1.25; opacity: .35; transform-origin: 48px 48px; animation: inbox-cleared-ring .9s .1s cubic-bezier(.2, .8, .2, 1) both; }
+.inbox-cleared-disc { fill: color-mix(in oklab, currentColor 10%, var(--quiet-surface)); stroke: currentColor; stroke-width: 1.5; transform-origin: 48px 48px; animation: inbox-cleared-seal .6s cubic-bezier(.2, .9, .3, 1.35) both; }
+.inbox-cleared-check { fill: none; stroke: currentColor; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 44; animation: inbox-cleared-draw .42s .34s cubic-bezier(.65, 0, .35, 1) both; }
+.inbox-cleared-tone { animation: inbox-cleared-rise .4s .5s ease both; }
+.inbox-cleared-word { animation: inbox-cleared-word .5s calc(.58s + var(--i) * 45ms) cubic-bezier(.2, .8, .2, 1) both; }
+.inbox-cleared-body { animation: inbox-cleared-rise .5s .9s ease both; }
+@keyframes inbox-cleared-seal { from { opacity: 0; transform: scale(.2); } to { opacity: 1; transform: scale(1); } }
+@keyframes inbox-cleared-ring { from { opacity: 0; transform: scale(.6); } 60% { opacity: .5; } to { opacity: .35; transform: scale(1); } }
+@keyframes inbox-cleared-draw { from { stroke-dashoffset: 44; } to { stroke-dashoffset: 0; } }
+@keyframes inbox-cleared-pop { from { opacity: 0; transform: scale(.4); } to { opacity: 1; transform: scale(1); } }
+@keyframes inbox-cleared-orbit { to { transform: rotate(360deg); } }
+@keyframes inbox-cleared-rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes inbox-cleared-word { from { opacity: 0; transform: translateY(.45em); filter: blur(3px); } to { opacity: 1; transform: none; filter: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .inbox-cleared *, .inbox-cleared *::before { animation: none !important; }
 }

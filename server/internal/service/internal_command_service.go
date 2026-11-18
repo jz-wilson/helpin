@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/helpin-ai/helpin/server/internal/agentcontract"
 	"github.com/helpin-ai/helpin/server/internal/authorization"
 	"github.com/helpin-ai/helpin/server/internal/commandtools"
 	"github.com/helpin-ai/helpin/server/internal/model"
@@ -30,7 +31,9 @@ type InternalCommandDefinition struct {
 	SupportedTargetTypes   []string
 	RequiredPermissionsAll []authorization.Permission
 	Tool                   *commandtools.RuntimeToolMetadata
-	Execute                func(ctx context.Context, meta model.InternalCommandContext, input json.RawMessage) (json.RawMessage, error)
+	// Validate performs read-only checks before the host approval guard.
+	Validate func(ctx context.Context, meta model.InternalCommandContext, input json.RawMessage) error
+	Execute  func(ctx context.Context, meta model.InternalCommandContext, input json.RawMessage) (json.RawMessage, error)
 }
 
 func (d InternalCommandDefinition) RiskLevel() string {
@@ -54,6 +57,7 @@ type InternalCommandService struct {
 	crmDealService        *CRMDealService
 	crmActivityService    *CRMActivityService
 	crmCompanyService     *CRMCompanyService
+	crmFieldCatalog       *CRMFieldCatalogService
 	crmAssociationService *CRMAssociationService
 	crmEnrichmentService  *CRMEnrichmentService
 	docsDocumentService   *DocsDocumentService
@@ -80,9 +84,11 @@ type InternalCommandService struct {
 
 	supportMessageRepo        *repository.SupportMessageRepository
 	supportAttachmentRepo     *repository.SupportAttachmentRepository
+	supportMediaProvider      dockChatMediaLLM
 	supportConversationRepo   *repository.SupportConversationRepository
 	supportEventPublisher     websocket.EventPublisher
 	supportInboxService       *SupportInboxService
+	supportSLAService         *SupportSLAService
 	supportTagService         *SupportTagService
 	crmContactService         *CRMContactService
 	crmSignalService          *CRMSignalService
@@ -96,6 +102,7 @@ type InternalCommandService struct {
 	dockActionProposalRepo    *repository.DockActionProposalRepository
 	commandBarService         *CommandBarService
 	supportKnowledgeSearcher  supportKnowledgeSearcher
+	helpAssistant             *HelpAssistantService
 	supportRunEvidenceRepo    *repository.SupportRunEvidenceRepository
 	supportFollowUpService    *SupportFollowUpService
 	supportAIService          *SupportAIService
@@ -106,6 +113,11 @@ type InternalCommandService struct {
 	authz                     *authorization.AuthzService
 
 	definitions map[string]InternalCommandDefinition
+}
+
+// SetSupportMediaAnalyzer shares the metered media reader with Ask.
+func (s *InternalCommandService) SetSupportMediaAnalyzer(provider dockChatMediaLLM) {
+	s.supportMediaProvider = provider
 }
 
 func (s *InternalCommandService) SetSupportAttachmentRepository(repo *repository.SupportAttachmentRepository) {
@@ -418,15 +430,30 @@ func (s *InternalCommandService) Execute(ctx context.Context, meta model.Interna
 			}
 			return s.executeSupportPreviewCommand(ctx, run, meta, def, input)
 		}
-	} else if meta.TargetType == supportPreviewTarget {
-		return nil, fmt.Errorf("preview requires a persisted run")
+		// Help assistant runs answer anonymous visitors: only their own tools,
+		// only for their own turn.
+		if run.TargetType == model.HelpAssistantTurnTarget || meta.TargetType == model.HelpAssistantTurnTarget {
+			if meta.TargetType != run.TargetType || meta.TargetID != run.TargetID || meta.AgentID != run.AgentID || !slices.Contains(agentcontract.HelpAssistantTools, def.toolAlias()) {
+				return nil, fmt.Errorf("help assistant command scope mismatch")
+			}
+		}
+	} else if meta.TargetType == supportPreviewTarget || meta.TargetType == model.HelpAssistantTurnTarget {
+		return nil, fmt.Errorf("%s requires a persisted run", meta.TargetType)
+	} else if def.Tool != nil && slices.Contains(agentcontract.HelpAssistantTools, def.Tool.Alias) {
+		return nil, fmt.Errorf("help assistant tools run only in a help assistant turn")
 	}
 
+	if def.Validate != nil {
+		if err := def.Validate(ctx, meta, input); err != nil {
+			return nil, err
+		}
+	}
 	if def.Mutating {
 		if err := s.authorizeDockMutation(ctx, meta, def, input); err != nil {
 			return nil, err
 		}
 	}
+	ctx = withCommandAgent(ctx, meta.AgentID)
 	output, err := def.Execute(ctx, meta, input)
 	if err != nil {
 		return nil, err
@@ -476,6 +503,7 @@ func taskDependencyGraphHasCycle(graph map[string][]string) bool {
 }
 
 func (s *InternalCommandService) registerDefaults() {
+	s.registerSkillCommands()
 	s.registerDirectGitCommands()
 	s.registerImageToolCommands()
 	s.register(InternalCommandDefinition{
@@ -1527,7 +1555,7 @@ func (s *InternalCommandService) registerDefaults() {
 		Name:                 "git.list_repositories",
 		Module:               "git",
 		Mutating:             false,
-		SupportedTargetTypes: []string{"workspace", "repository", "epic", "task", "document", "crm_deal", "crm_contact", "support_coverage_gap"},
+		SupportedTargetTypes: []string{"workspace", "repository", "epic", "task", "document", "crm_deal", "crm_contact", "support_coverage_gap", supportInvestigationTarget},
 		Tool:                 mustCommandToolMetadata("git.list_repositories"),
 		Execute: func(ctx context.Context, meta model.InternalCommandContext, input json.RawMessage) (json.RawMessage, error) {
 			if s.gitService == nil {
@@ -2003,8 +2031,11 @@ func (s *InternalCommandService) registerDefaults() {
 	})
 	s.registerAgentOrchestrationCommands()
 	s.registerSupportKnowledgeCommands()
+	s.registerHelpAssistantCommands()
 	s.registerSupportReplyCommands()
 	s.registerSupportFollowUpCommand()
+	s.registerSupportSLACommands()
+	s.registerSupportFieldCommands()
 	s.registerSupportCommands()
 	s.registerSupportCoverageCommands()
 	s.registerSupportOperationalCommands()
@@ -2154,6 +2185,11 @@ func commandPermissionsForDefinition(def InternalCommandDefinition) []authorizat
 			return []authorization.Permission{authorization.PermWorkspaceUpdate}
 		}
 		return []authorization.Permission{authorization.PermWorkspaceRead}
+	case "skills":
+		if mutating {
+			return []authorization.Permission{authorization.PermPMEdit, authorization.PermDocsEdit, authorization.PermCRMEdit, authorization.PermSupportEdit}
+		}
+		return []authorization.Permission{authorization.PermPMRead, authorization.PermDocsRead, authorization.PermCRMRead, authorization.PermSupportRead}
 	case "agents":
 		// Agent orchestration mirrors the dock gates: any module read grants
 		// discovery, any module edit grants launching.

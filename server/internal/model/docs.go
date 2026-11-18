@@ -23,6 +23,15 @@ const (
 	SpaceTypeExternalCapable = "external_capable"
 )
 
+// Help center audience values for external-capable spaces.
+const (
+	// HelpcenterAudiencePublic spaces are on the public help center.
+	HelpcenterAudiencePublic = "public"
+	// HelpcenterAudienceCustomers spaces are readable only by customers signed
+	// in to the customer portal.
+	HelpcenterAudienceCustomers = "customers"
+)
+
 // Space visibility values.
 const (
 	SpaceVisibilityWorkspaceWide = "workspace_wide"
@@ -120,21 +129,24 @@ func (a *StringArray) Scan(src interface{}) error {
 
 // DocsSpace is the top-level container owned by a team.
 type DocsSpace struct {
-	ID                string     `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID       string     `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_docs_space_ws_slug,priority:1;index:idx_docs_space_ws_team,priority:1;index:idx_docs_space_ws_pos,priority:1"`
-	TeamID            *string    `json:"team_id" gorm:"type:uuid;index:idx_docs_space_ws_team,priority:2"`
-	Name              string     `json:"name" gorm:"not null"`
-	Slug              string     `json:"slug" gorm:"not null;uniqueIndex:idx_docs_space_ws_slug,priority:2"`
-	Icon              *string    `json:"icon"`
-	Visibility        string     `json:"visibility" gorm:"not null;default:'workspace_wide'"`
-	Type              string     `json:"type" gorm:"not null;default:'internal'"`
-	DefaultReviewDays *int       `json:"default_review_days"`
-	IsSystem          bool       `json:"is_system" gorm:"not null;default:false"`
-	Position          int        `json:"position" gorm:"not null;default:0;index:idx_docs_space_ws_pos,priority:2"`
-	CreatedBy         string     `json:"created_by" gorm:"type:uuid;not null"`
-	CreatedAt         time.Time  `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt         time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
-	DeletedAt         *time.Time `json:"deleted_at" gorm:"index"`
+	ID          string  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID string  `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_docs_space_ws_slug,priority:1;index:idx_docs_space_ws_team,priority:1;index:idx_docs_space_ws_pos,priority:1"`
+	TeamID      *string `json:"team_id" gorm:"type:uuid;index:idx_docs_space_ws_team,priority:2"`
+	Name        string  `json:"name" gorm:"not null"`
+	Slug        string  `json:"slug" gorm:"not null;uniqueIndex:idx_docs_space_ws_slug,priority:2"`
+	Icon        *string `json:"icon"`
+	Visibility  string  `json:"visibility" gorm:"not null;default:'workspace_wide'"`
+	Type        string  `json:"type" gorm:"not null;default:'internal'"`
+	// HelpcenterAudience limits an external-capable space to signed-in portal
+	// customers ("customers") or leaves it public ("public").
+	HelpcenterAudience string     `json:"helpcenter_audience" gorm:"not null;default:'public'"`
+	DefaultReviewDays  *int       `json:"default_review_days"`
+	IsSystem           bool       `json:"is_system" gorm:"not null;default:false"`
+	Position           int        `json:"position" gorm:"not null;default:0;index:idx_docs_space_ws_pos,priority:2"`
+	CreatedBy          string     `json:"created_by" gorm:"type:uuid;not null"`
+	CreatedAt          time.Time  `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt          time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
+	DeletedAt          *time.Time `json:"deleted_at" gorm:"index"`
 }
 
 func (DocsSpace) TableName() string { return "docs_spaces" }
@@ -220,6 +232,7 @@ type DocsDocument struct {
 	HCOGImageAlt               *string    `json:"hc_og_image_alt,omitempty" gorm:"-"`
 	HasUnpublishedChanges      bool       `json:"has_unpublished_changes" gorm:"-"`
 	LivePublishedAt            *time.Time `json:"live_published_at,omitempty" gorm:"-"`
+	HCPublicID                 string     `json:"hc_public_id,omitempty" gorm:"-"`
 	LiveSlug                   *string    `json:"live_slug,omitempty" gorm:"-"`
 	PendingChangeProposalCount int        `json:"pending_change_proposal_count" gorm:"->;-:migration"`
 }
@@ -550,6 +563,47 @@ type HelpcenterHomepageConfig struct {
 	FeaturedCards []HomepageFeaturedCard `json:"featured_cards"`
 }
 
+// Sources a brand proposal can be read from.
+const (
+	HelpcenterBrandPlatformIntercom = "intercom"
+	HelpcenterBrandPlatformWebsite  = "website"
+)
+
+// HelpcenterBrandImportRequest asks for the branding found at a public
+// help center or website address.
+type HelpcenterBrandImportRequest struct {
+	URL string `json:"url"`
+}
+
+// HelpcenterBrandProposal is the branding read from a public help center or
+// website. It is a suggestion to review: nothing in it has been saved, and
+// its image addresses still point at the source site.
+type HelpcenterBrandProposal struct {
+	Platform  string `json:"platform"`
+	SourceURL string `json:"source_url"`
+	// HelpCenterName is the source help center's full name, such as "Acme
+	// Help Center"; BrandName is the company name taken from it.
+	HelpCenterName string `json:"help_center_name,omitempty"`
+	BrandName      string `json:"brand_name"`
+	// BrandColor is "#rrggbb", or "" when none was found.
+	BrandColor   string `json:"brand_color"`
+	HeroTitle    string `json:"hero_title,omitempty"`
+	HeroSubtitle string `json:"hero_subtitle,omitempty"`
+	// LogoURL is the logo for light backgrounds and LogoDarkURL the one for
+	// dark backgrounds. Either may be "".
+	LogoURL     string `json:"logo_url"`
+	LogoDarkURL string `json:"logo_dark_url"`
+	FaviconURL  string `json:"favicon_url"`
+	// ThemeMode is set only when the logos found suit one theme.
+	ThemeMode       string                 `json:"theme_mode,omitempty"`
+	HeaderLinks     []HelpcenterHeaderLink `json:"header_links"`
+	SocialLinks     []HelpcenterSocialLink `json:"social_links"`
+	OfficialDocsURL string                 `json:"official_docs_url,omitempty"`
+	WebsiteURL      string                 `json:"website_url,omitempty"`
+	// Notes say, in plain words, what could not be found.
+	Notes []string `json:"notes"`
+}
+
 // HelpcenterSpaceNavConfig stores client-side space ordering and hiding.
 type HelpcenterSpaceNavConfig struct {
 	Order  []string `json:"order"`
@@ -558,44 +612,76 @@ type HelpcenterSpaceNavConfig struct {
 
 // DocsHelpcenterConfig stores workspace-level help center configuration.
 type DocsHelpcenterConfig struct {
-	ID                      string          `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID             string          `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex"`
-	Subdomain               string          `json:"subdomain" gorm:"not null"`
-	CustomDomain            *string         `json:"custom_domain"`
-	PublicURLMode           string          `json:"public_url_mode" gorm:"not null;default:'hosted_subdomain'"`
-	ReverseProxyHost        *string         `json:"reverse_proxy_host"`
-	ReverseProxyBasePath    *string         `json:"reverse_proxy_base_path"`
-	BrandName               string          `json:"brand_name" gorm:"not null"`
-	BrandLogoURL            *string         `json:"brand_logo_url"`
-	BrandLogoDarkURL        *string         `json:"brand_logo_dark_url"`
-	BrandColor              string          `json:"brand_color" gorm:"not null;default:'#000000'"`
-	FaviconURL              *string         `json:"favicon_url"`
-	ThemeMode               string          `json:"theme_mode" gorm:"not null;default:'system'"`
-	HeaderLinks             json.RawMessage `json:"header_links" gorm:"type:jsonb;default:'[]'"`
-	FooterConfig            json.RawMessage `json:"footer_config" gorm:"type:jsonb;default:'{}'"`
-	HomepageConfig          json.RawMessage `json:"homepage_config" gorm:"type:jsonb;default:'{}'"`
-	SpaceNavConfig          json.RawMessage `json:"space_nav_config" gorm:"type:jsonb;default:'{}'"`
-	SearchPlaceholder       *string         `json:"search_placeholder"`
-	DefaultLocale           string          `json:"default_locale" gorm:"not null;default:'en'"`
-	EnabledLocales          DocsStringArray `json:"enabled_locales" gorm:"type:text[]"`
-	ProtectedTerms          DocsStringArray `json:"protected_terms" gorm:"type:text[]"`
-	ShowLanguageSwitcher    bool            `json:"show_language_switcher" gorm:"not null;default:false"`
-	FallbackToDefaultLocale bool            `json:"fallback_to_default_locale" gorm:"not null;default:true"`
-	IsPublished             bool            `json:"is_published" gorm:"not null;default:false"`
-	ChatWidgetEnabled       bool            `json:"chat_widget_enabled" gorm:"not null;default:true"`
-	AIAnswersEnabled        bool            `json:"ai_answers_enabled" gorm:"not null;default:true"`
-	SEOTitle                *string         `json:"seo_title"`
-	SEODescription          *string         `json:"seo_description"`
-	OGTitle                 *string         `json:"og_title"`
-	OGDescription           *string         `json:"og_description"`
-	OGImageURL              *string         `json:"og_image_url"`
-	OGImageAlt              *string         `json:"og_image_alt"`
-	SupportEmail            *string         `json:"support_email"`
-	CreatedAt               time.Time       `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt               time.Time       `json:"updated_at" gorm:"autoUpdateTime"`
+	ID                    string  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID           string  `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex"`
+	DemoMode              bool    `json:"demo_mode" gorm:"not null;default:false"`
+	SearchIndexingEnabled bool    `json:"search_indexing_enabled" gorm:"not null;default:true"`
+	OfficialDocsURL       string  `json:"official_docs_url" gorm:"not null;default:''"`
+	Subdomain             string  `json:"subdomain" gorm:"not null"`
+	CustomDomain          *string `json:"custom_domain"`
+	// Custom domain verification. The domain serves the help center only while
+	// CustomDomainLive; admins see the rest in settings, never the public.
+	CustomDomainStatus        *string         `json:"custom_domain_status,omitempty"`
+	CustomDomainToken         *string         `json:"custom_domain_token,omitempty"`
+	CustomDomainVerifiedAt    *time.Time      `json:"custom_domain_verified_at,omitempty"`
+	CustomDomainCheckedAt     *time.Time      `json:"custom_domain_checked_at,omitempty"`
+	CustomDomainLastError     *string         `json:"custom_domain_last_error,omitempty"`
+	CustomDomainFailingSince  *time.Time      `json:"custom_domain_failing_since,omitempty"`
+	CustomDomainAlertedStatus *string         `json:"-"`
+	PublicURLMode             string          `json:"public_url_mode" gorm:"not null;default:'hosted_subdomain'"`
+	ReverseProxyHost          *string         `json:"reverse_proxy_host"`
+	ReverseProxyBasePath      *string         `json:"reverse_proxy_base_path"`
+	BrandName                 string          `json:"brand_name" gorm:"not null"`
+	BrandLogoURL              *string         `json:"brand_logo_url"`
+	BrandLogoDarkURL          *string         `json:"brand_logo_dark_url"`
+	BrandColor                string          `json:"brand_color" gorm:"not null;default:'#000000'"`
+	FaviconURL                *string         `json:"favicon_url"`
+	ThemeMode                 string          `json:"theme_mode" gorm:"not null;default:'system'"`
+	HeaderLinks               json.RawMessage `json:"header_links" gorm:"type:jsonb;default:'[]'"`
+	FooterConfig              json.RawMessage `json:"footer_config" gorm:"type:jsonb;default:'{}'"`
+	HomepageConfig            json.RawMessage `json:"homepage_config" gorm:"type:jsonb;default:'{}'"`
+	SpaceNavConfig            json.RawMessage `json:"space_nav_config" gorm:"type:jsonb;default:'{}'"`
+	SearchPlaceholder         *string         `json:"search_placeholder"`
+	DefaultLocale             string          `json:"default_locale" gorm:"not null;default:'en'"`
+	EnabledLocales            DocsStringArray `json:"enabled_locales" gorm:"type:text[]"`
+	ProtectedTerms            DocsStringArray `json:"protected_terms" gorm:"type:text[]"`
+	ShowLanguageSwitcher      bool            `json:"show_language_switcher" gorm:"not null;default:false"`
+	FallbackToDefaultLocale   bool            `json:"fallback_to_default_locale" gorm:"not null;default:true"`
+	IsPublished               bool            `json:"is_published" gorm:"not null;default:false"`
+	ChatWidgetEnabled         bool            `json:"chat_widget_enabled" gorm:"not null;default:true"`
+	AIAnswersEnabled          bool            `json:"ai_answers_enabled" gorm:"not null;default:true"`
+	SEOTitle                  *string         `json:"seo_title"`
+	SEODescription            *string         `json:"seo_description"`
+	OGTitle                   *string         `json:"og_title"`
+	OGDescription             *string         `json:"og_description"`
+	OGImageURL                *string         `json:"og_image_url"`
+	OGImageAlt                *string         `json:"og_image_alt"`
+	SupportEmail              *string         `json:"support_email"`
+	CreatedAt                 time.Time       `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt                 time.Time       `json:"updated_at" gorm:"autoUpdateTime"`
 }
 
 func (DocsHelpcenterConfig) TableName() string { return "docs_helpcenter_configs" }
+
+// Help center custom domain states.
+const (
+	// HelpcenterDomainPending waits for the ownership record and DNS.
+	HelpcenterDomainPending = "pending"
+	// HelpcenterDomainVerified is proven and points at Helpin.
+	HelpcenterDomainVerified = "verified"
+	// HelpcenterDomainFailing was verified but no longer points at Helpin. It
+	// keeps serving so a DNS blip doesn't take the help center offline.
+	HelpcenterDomainFailing = "failing"
+)
+
+// CustomDomainLive reports whether the custom domain may serve the help
+// center: it is set and has been verified.
+func (c *DocsHelpcenterConfig) CustomDomainLive() bool {
+	if c == nil || c.CustomDomain == nil || strings.TrimSpace(*c.CustomDomain) == "" || c.CustomDomainStatus == nil {
+		return false
+	}
+	return *c.CustomDomainStatus == HelpcenterDomainVerified || *c.CustomDomainStatus == HelpcenterDomainFailing
+}
 
 // DocsHelpcenterArticle is a 1:1 extension table for help center articles.
 type DocsHelpcenterArticle struct {
@@ -613,11 +699,26 @@ type DocsHelpcenterArticle struct {
 	NotHelpfulCount   int        `json:"not_helpful_count" gorm:"not null;default:0"`
 	ViewCount         int        `json:"view_count" gorm:"not null;default:0"`
 	PublicPublishedAt *time.Time `json:"public_published_at" gorm:"index"`
-	CreatedAt         time.Time  `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt         time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
+	// CustomerPublishedAt marks a live article in a space for signed-in
+	// customers. Such an article never has PublicPublishedAt.
+	CustomerPublishedAt *time.Time `json:"customer_published_at"`
+	CreatedAt           time.Time  `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt           time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
 }
 
 func (DocsHelpcenterArticle) TableName() string { return "docs_helpcenter_articles" }
+
+// LivePublishedAt returns when the article went live for its audience, or
+// nil when it is not live on the help center or in the portal.
+func (a *DocsHelpcenterArticle) LivePublishedAt() *time.Time {
+	if a == nil {
+		return nil
+	}
+	if a.PublicPublishedAt != nil {
+		return a.PublicPublishedAt
+	}
+	return a.CustomerPublishedAt
+}
 
 // DocsSlugAlias stores old public slugs for redirect.
 type DocsSlugAlias struct {
@@ -675,26 +776,28 @@ func (DocsComment) TableName() string { return "docs_comments" }
 
 // CreateDocsSpaceRequest is the payload for creating a space.
 type CreateDocsSpaceRequest struct {
-	TeamID            *string  `json:"team_id"`
-	TeamIDs           []string `json:"team_ids"`
-	Name              string   `json:"name"`
-	Slug              string   `json:"slug"`
-	Icon              *string  `json:"icon"`
-	Visibility        string   `json:"visibility"`
-	Type              string   `json:"type"`
-	DefaultReviewDays *int     `json:"default_review_days"`
+	TeamID             *string  `json:"team_id"`
+	TeamIDs            []string `json:"team_ids"`
+	Name               string   `json:"name"`
+	Slug               string   `json:"slug"`
+	Icon               *string  `json:"icon"`
+	Visibility         string   `json:"visibility"`
+	Type               string   `json:"type"`
+	HelpcenterAudience string   `json:"helpcenter_audience"`
+	DefaultReviewDays  *int     `json:"default_review_days"`
 }
 
 // UpdateDocsSpaceRequest is the payload for updating a space.
 type UpdateDocsSpaceRequest struct {
-	Name              *string  `json:"name"`
-	Slug              *string  `json:"slug"`
-	Icon              *string  `json:"icon"`
-	Type              *string  `json:"type"`
-	Visibility        *string  `json:"visibility"`
-	DefaultReviewDays *int     `json:"default_review_days"`
-	TeamIDs           []string `json:"team_ids"`
-	SetTeamIDs        bool     `json:"set_team_ids"`
+	Name               *string  `json:"name"`
+	Slug               *string  `json:"slug"`
+	Icon               *string  `json:"icon"`
+	Type               *string  `json:"type"`
+	HelpcenterAudience *string  `json:"helpcenter_audience"`
+	Visibility         *string  `json:"visibility"`
+	DefaultReviewDays  *int     `json:"default_review_days"`
+	TeamIDs            []string `json:"team_ids"`
+	SetTeamIDs         bool     `json:"set_team_ids"`
 }
 
 // CreateDocsCollectionRequest is the payload for creating a collection.
@@ -926,6 +1029,9 @@ type CreateDocsLinkRequest struct {
 
 // UpdateDocsHelpcenterConfigRequest is the payload for updating help center config.
 type UpdateDocsHelpcenterConfigRequest struct {
+	DemoMode                *bool           `json:"demo_mode"`
+	SearchIndexingEnabled   *bool           `json:"search_indexing_enabled"`
+	OfficialDocsURL         *string         `json:"official_docs_url"`
 	Subdomain               *string         `json:"subdomain"`
 	CustomDomain            *string         `json:"custom_domain"`
 	PublicURLMode           *string         `json:"public_url_mode"`

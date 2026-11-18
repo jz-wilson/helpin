@@ -26,17 +26,32 @@ var errCoverageNoPublicSegment = errors.New("coverage conversation has no public
 var errCoverageLLMContract = errors.New("coverage analyzer response violates the actionable finding contract")
 
 const (
-	coverageAnalysisMaxMessages             = 80
-	coverageAnalysisMaxMessageChars         = 2000
-	coverageAnalyzerVersion                 = "v4"
-	coverageAnalysisWorkflowID              = "coverage-analysis-v2"
-	coverageAnalysisCronSchedule            = "0 */12 * * *"
-	coverageAnalysisOverlap                 = 2 * time.Hour
-	coverageAnalysisSettleDelay             = 10 * time.Minute
-	coverageAnalysisBootstrapWindow         = 30 * 24 * time.Hour
+	coverageAnalysisMaxMessages     = 80
+	coverageAnalysisMaxMessageChars = 2000
+	coverageAnalyzerVersion         = "v4"
+	coverageAnalysisWorkflowID      = "coverage-analysis-v2"
+	coverageAnalysisCronSchedule    = "0 */12 * * *"
+	coverageAnalysisOverlap         = 2 * time.Hour
+	coverageAnalysisSettleDelay     = 10 * time.Minute
+	coverageAnalysisBootstrapWindow = 30 * 24 * time.Hour
+	// Resolved conversations are analyzed at the next run. One that is never
+	// resolved is analyzed only after it has been quiet this long, a safety net
+	// for abandoned conversations rather than a judgment of a live one.
+	coverageAnalysisOpenQuietPeriod = 7 * 24 * time.Hour
+	// Findings below this confidence stay recorded but do not become gaps, so
+	// people are not handed causes the analyzer itself is unsure of.
+	coverageGapMinConfidence                = 0.6
 	coverageAnalysisWorkspaceLimit          = 1000
 	coverageAnalysisConversationConcurrency = 4
 	coverageAnalysisCandidatePageSize       = 25
+	// Leave room for models that reason before answering; a reply cut short
+	// by the limit is unreadable JSON.
+	coverageAnalyzeMaxTokens = 4000
+	coverageRefineMaxTokens  = 3000
+	// Coverage routes run on OpenRouter, where a schema is only sent in strict
+	// mode. Without it models guessed field names and every retry failed the
+	// contract; require_parameters keeps requests on providers that enforce it.
+	coverageStrictSchemaProviderOptions = `{"require_parameters":true}`
 	// Coverage knowledge matching uses reciprocal-rank fusion scores, not
 	// cosine scores. A top lexical-only hit is ~0.016 and a top lexical+vector
 	// hit is ~0.033, so keep this floor on that scale.
@@ -74,6 +89,10 @@ type CoverageConversationAnalysisInput struct {
 	HasHumanReply         bool                          `json:"has_human_reply"`
 	Messages              []CoverageConversationMessage `json:"messages"`
 	RetrievalTraces       []CoverageRetrievalTraceInput `json:"retrieval_traces"`
+	// AIReportedMissingData is what the support AI said it needed but no tool provides.
+	AIReportedMissingData []string `json:"ai_reported_missing_data,omitempty"`
+	// ConnectedTools lets the analyzer check that claim against what is connected.
+	ConnectedTools []CoverageConnectedTool `json:"connected_tools,omitempty"`
 }
 
 type CoverageRetrievalTraceInput struct {
@@ -166,6 +185,7 @@ type SupportCoverageDailyAnalyzer struct {
 	contentSourceRepo *repository.SupportContentSourceRepository
 	temporalClient    tclient.Client
 	rolloutPolicy     *CoverageRolloutPolicy
+	duplicateChecker  coverageDuplicateChecker
 }
 
 func NewSupportCoverageDailyAnalyzer(llmProvider llm.Provider, providerName, modelName string) *SupportCoverageDailyAnalyzer {
@@ -411,8 +431,13 @@ func (s *SupportCoverageDailyAnalyzer) RunWorkspaceDailyAnalysis(ctx context.Con
 	if s.rolloutPolicy != nil && !s.rolloutPolicy.CaptureEnabled(workspaceID) {
 		return nil
 	}
-	if err := s.reconcileQueuedCoverageAttempts(ctx, workspaceID); err != nil {
-		return err
+	// A manual reassessment selects failed sources itself and gives them a
+	// fresh request identity. Do not first retry the same work under the old
+	// request and budget, then analyze it again in the new batch.
+	if coverageReanalysisRequest(ctx) == "" {
+		if err := s.reconcileQueuedCoverageAttempts(ctx, workspaceID); err != nil {
+			return err
+		}
 	}
 	if err := s.reconcileCoverageAssignments(ctx, workspaceID); err != nil {
 		return err
@@ -475,8 +500,12 @@ func (s *SupportCoverageDailyAnalyzer) RunWorkspaceDailyAnalysis(ctx context.Con
 	var itemErrors []error
 	var itemErrorsMu sync.Mutex
 	var candidateCursor *repository.CoverageAnalysisCandidateCursor
+	listCandidates := s.conversationRepo.ListCoverageAnalysisCandidatesPage
+	if coverageReanalysisRequest(ctx) != "" && s.coverageV2Repo != nil {
+		listCandidates = s.conversationRepo.ListCoverageReanalysisCandidatesPage
+	}
 	for {
-		conversations, nextCursor, pageErr := s.conversationRepo.ListCoverageAnalysisCandidatesPage(ctx, workspaceID, cursorStart, cursorEnd, candidateCursor, coverageAnalysisCandidatePageSize)
+		conversations, nextCursor, pageErr := listCandidates(ctx, workspaceID, cursorStart, cursorEnd, coverageAnalysisOpenQuietPeriod, candidateCursor, coverageAnalysisCandidatePageSize)
 		if pageErr != nil {
 			s.markCoverageAnalysisRunFailed(ctx, run.ID, pageErr)
 			return pageErr
@@ -511,7 +540,9 @@ func (s *SupportCoverageDailyAnalyzer) RunWorkspaceDailyAnalysis(ctx context.Con
 		}
 		candidateCursor = nextCursor
 	}
-	materialized, err := s.materializeRunFindings(ctx, workspaceID, run.ID)
+	// Materialize every pending finding, including those recorded by retried
+	// attempts in earlier runs.
+	materialized, err := s.materializePendingFindings(ctx, workspaceID)
 	if err != nil {
 		s.markCoverageAnalysisRunFailed(ctx, run.ID, err)
 		return err
@@ -519,21 +550,22 @@ func (s *SupportCoverageDailyAnalyzer) RunWorkspaceDailyAnalysis(ctx context.Con
 	if materialized != nil && gapCount == 0 {
 		gapCount = materialized.FindingsScanned
 	}
-	if len(itemErrors) > 0 {
-		joined := errors.Join(itemErrors...)
-		s.markCoverageAnalysisRunFailed(ctx, run.ID, joined)
-		if s.coverageV2Repo != nil && v2BatchID != "" {
-			_ = s.coverageV2Repo.CompleteBatch(ctx, v2BatchID, model.CoverageBatchPartialFailed, conversationCount, conversationCount-len(itemErrors), len(itemErrors), 0, model.CoverageFailurePersistence, sanitizeAIActionFailure(joined))
-		}
-		return joined
-	}
+	// The run completes even when some conversations failed: each failure is a
+	// recorded attempt that the next run retries. Failing the run would retry
+	// every conversation and hold the cursor back.
 	if err := s.analysisRepo.CompleteRun(ctx, run.ID, conversationCount, gapCount); err != nil {
 		return err
 	}
-	if s.coverageV2Repo != nil && v2BatchID != "" {
-		return s.coverageV2Repo.CompleteBatch(ctx, v2BatchID, model.CoverageBatchSucceeded, conversationCount, conversationCount, 0, 0, "", "")
+	s.checkDuplicatesAfterRun(ctx, workspaceID, materialized)
+	if s.coverageV2Repo == nil || v2BatchID == "" {
+		return nil
 	}
-	return nil
+	if len(itemErrors) > 0 {
+		joined := errors.Join(itemErrors...)
+		slog.WarnContext(ctx, "coverage analysis finished with failed conversations", "workspace_id", workspaceID, "run_id", run.ID, "failed", len(itemErrors), "conversations", conversationCount)
+		return s.coverageV2Repo.CompleteBatch(ctx, v2BatchID, model.CoverageBatchPartialFailed, conversationCount, conversationCount-len(itemErrors), len(itemErrors), 0, coverageAnalysisFailureClass(itemErrors[0]), sanitizeAIActionFailure(joined))
+	}
+	return s.coverageV2Repo.CompleteBatch(ctx, v2BatchID, model.CoverageBatchSucceeded, conversationCount, conversationCount, 0, 0, "", "")
 }
 
 func (s *SupportCoverageDailyAnalyzer) markCoverageAnalysisRunFailed(ctx context.Context, runID string, runErr error) {
@@ -574,6 +606,9 @@ func (s *SupportCoverageDailyAnalyzer) runConversationCoverageAnalysis(ctx conte
 		}
 		s.markCoverageV2AttemptRetryable(ctx, v2Attempt, attemptOwner, model.CoverageFailureCandidateQuery, err)
 		return false, err
+	}
+	if len(input.AIReportedMissingData) > 0 {
+		input.ConnectedTools = s.coverageConnectedTools(ctx, workspaceID)
 	}
 	if v2Attempt == nil && s.coverageV2Repo != nil && v2BatchID != "" {
 		logicalWorkKey := aiUsageIdempotencyKey(workspaceID, "coverage_work", conversation.ID, input.SegmentID, input.TranscriptHash, coverageAttemptAnalyzerVersion(ctx), "v1")
@@ -689,7 +724,7 @@ func (s *SupportCoverageDailyAnalyzer) runConversationCoverageAnalysis(ctx conte
 			} else if refined != nil {
 				result.RecommendedFixes = refined.RecommendedFixes
 				result.DecisionReason = firstNonEmptyCoverageString(refined.DecisionReason, result.DecisionReason)
-				if refined.Confidence > 0 {
+				if refined.Confidence > 0 && refined.Confidence <= 1 {
 					result.Confidence = refined.Confidence
 				}
 				recommendationDecisionReason = refined.DecisionReason
@@ -771,7 +806,12 @@ func BuildCoverageConversationAnalysisInput(conversation model.SupportConversati
 	if segment == nil {
 		return CoverageConversationAnalysisInput{}, errCoverageNoPublicSegment
 	}
-	return BuildCoverageConversationAnalysisInputForSegment(conversation, *segment, traces)
+	input, err := BuildCoverageConversationAnalysisInputForSegment(conversation, *segment, traces)
+	if err != nil {
+		return input, err
+	}
+	input.AIReportedMissingData = coverageAIReportedMissingData(messages, *segment)
+	return input, nil
 }
 
 // BuildCoverageConversationAnalysisInputForSegment builds analyzer input from
@@ -1080,38 +1120,77 @@ func (s *SupportCoverageDailyAnalyzer) AnalyzeConversation(ctx context.Context, 
 			"conversation_id": input.ConversationID,
 			"action":          "analyze",
 		},
+		// Validate the complete contract inside the completion boundary so an
+		// incomplete recommendation also tries the fallback model.
+		RequireComplete:    true,
+		RetryInvalidOutput: true,
+		ValidateResponse: func(response *llm.ChatResponse) error {
+			_, err := decodeCoverageAnalysisResponse(response, classification)
+			return err
+		},
 		Chat: llm.ChatRequest{
 			SystemPrompt: prompt,
 			Messages: []llm.Message{{
 				Role:    "user",
 				Content: string(inputJSON),
 			}},
-			Temperature: 0.1,
-			MaxTokens:   1800,
-			JSONMode:    true,
-			JSONSchema:  schema,
+			Temperature:      0.1,
+			MaxTokens:        coverageAnalyzeMaxTokens,
+			JSONMode:         true,
+			JSONSchema:       schema,
+			JSONSchemaStrict: true,
+			ProviderOptions:  json.RawMessage(coverageStrictSchemaProviderOptions),
 		},
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("coverage conversation analyzer llm: %w", err)
 	}
 
-	var result CoverageConversationAnalysisResult
-	if err := llm.UnmarshalResponse(resp.Content, &result); err != nil {
-		return nil, nil, fmt.Errorf("parse coverage conversation analyzer response: %w", err)
+	result, err := decodeCoverageAnalysisResponse(resp, classification)
+	if err != nil {
+		return nil, nil, err
 	}
-	normalizeCoverageConversationAnalysisResult(&result)
-	if err := classification.validate(result); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", errCoverageLLMContract, err)
-	}
-	if err := validateActionableCoverageResult(result); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", errCoverageLLMContract, err)
-	}
+
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal normalized analyzer result: %w", err)
 	}
-	return &result, raw, nil
+	return result, raw, nil
+}
+
+// validateCoverageJSONResponse validates decisions with no actionable-fix contract.
+func validateCoverageJSONResponse[T any](response *llm.ChatResponse) error {
+	var decoded T
+	if err := llm.UnmarshalResponse(response.Content, &decoded); err != nil {
+		return fmt.Errorf("unreadable model output: %w", err)
+	}
+	return nil
+}
+
+// Decode and normalize identically during provider validation and persistence.
+func decodeCoverageAnalysisResponse(response *llm.ChatResponse, classification *jevCoverageClassification) (*CoverageConversationAnalysisResult, error) {
+	// A missing/null decision must not silently decode as has_gap=false.
+	var decoded struct {
+		CoverageConversationAnalysisResult
+		HasGap *bool `json:"has_gap"`
+	}
+	if err := llm.UnmarshalResponse(response.Content, &decoded); err != nil {
+		return nil, fmt.Errorf("%w: unreadable model output: %v", errCoverageLLMContract, err)
+	}
+	result := decoded.CoverageConversationAnalysisResult
+	if decoded.HasGap == nil || !validConversationTypes[strings.TrimSpace(result.ConversationType)] {
+		return nil, fmt.Errorf("%w: has_gap and a recognized conversation_type are required", errCoverageLLMContract)
+	}
+	result.HasGap = *decoded.HasGap
+
+	normalizeCoverageConversationAnalysisResult(&result)
+	if err := classification.validate(result); err != nil {
+		return nil, fmt.Errorf("%w: %v", errCoverageLLMContract, err)
+	}
+	if err := validateActionableCoverageResult(result); err != nil {
+		return nil, fmt.Errorf("%w: %v", errCoverageLLMContract, err)
+	}
+	return &result, nil
 }
 
 func validateActionableCoverageResult(result CoverageConversationAnalysisResult) error {
@@ -1124,13 +1203,19 @@ func validateActionableCoverageResult(result CoverageConversationAnalysisResult)
 	if result.AIFailure == "" {
 		return fmt.Errorf("ai_failure is required")
 	}
-	if result.Confidence <= 0 || result.Confidence > 1 {
+	// A gap reported without a confidence is kept as unsure: it is recorded
+	// below the gap threshold instead of failing the conversation on every retry.
+	if result.Confidence < 0 || result.Confidence > 1 {
 		return fmt.Errorf("confidence must be between zero and one")
 	}
-	if len(result.RecommendedFixes) == 0 {
+	return validateCoverageRecommendedFixes(result.RecommendedFixes)
+}
+
+func validateCoverageRecommendedFixes(fixes []CoverageRecommendedFix) error {
+	if len(fixes) == 0 {
 		return fmt.Errorf("at least one recommended fix is required")
 	}
-	for index, fix := range result.RecommendedFixes {
+	for index, fix := range fixes {
 		if fix.Type == "" || firstNonEmptyCoverageString(fix.TargetTitle, fix.TargetID, fix.TargetURL, fix.TargetType) == "" || fix.Rationale == "" || fix.SuggestedChange == "" {
 			return fmt.Errorf("recommended_fixes[%d] requires type, target, rationale, and suggested_change", index)
 		}
@@ -1241,27 +1326,42 @@ func (s *SupportCoverageDailyAnalyzer) RefineFixBundleWithKnowledge(ctx context.
 		WorkspaceID: metering.WorkspaceID, ActionKey: aipolicy.ActionSupportCoverageRefine,
 		FeatureKey:     BillingFeatureCoverageGapAnalysis,
 		IdempotencyKey: metering.IdempotencyKey, Metadata: metering.Metadata,
+		RequireComplete:    true,
+		RetryInvalidOutput: true,
+		ValidateResponse: func(response *llm.ChatResponse) error {
+			_, err := decodeCoverageFixBundleResponse(response)
+			return err
+		},
 		Chat: llm.ChatRequest{
 			SystemPrompt: coverageFixBundleRefinementSystemPrompt(),
 			Messages: []llm.Message{{
 				Role:    "user",
 				Content: string(payloadJSON),
 			}},
-			Temperature: 0.1,
-			MaxTokens:   1400,
-			JSONMode:    true,
-			JSONSchema:  coverageFixBundleDecisionJSONSchema(),
+			Temperature:      0.1,
+			MaxTokens:        coverageRefineMaxTokens,
+			JSONMode:         true,
+			JSONSchema:       coverageFixBundleDecisionJSONSchema(),
+			JSONSchemaStrict: true,
+			ProviderOptions:  json.RawMessage(coverageStrictSchemaProviderOptions),
 		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("coverage fix bundle refinement llm: %w", err)
 	}
 
+	return decodeCoverageFixBundleResponse(resp)
+}
+
+func decodeCoverageFixBundleResponse(response *llm.ChatResponse) (*CoverageFixBundleDecision, error) {
 	var decision CoverageFixBundleDecision
-	if err := llm.UnmarshalResponse(resp.Content, &decision); err != nil {
-		return nil, fmt.Errorf("parse coverage fix bundle refinement response: %w", err)
+	if err := llm.UnmarshalResponse(response.Content, &decision); err != nil {
+		return nil, fmt.Errorf("%w: unreadable refinement: %v", errCoverageLLMContract, err)
 	}
 	normalizeCoverageFixBundleDecision(&decision)
+	if err := validateCoverageRecommendedFixes(decision.RecommendedFixes); err != nil {
+		return nil, fmt.Errorf("%w: %v", errCoverageLLMContract, err)
+	}
 	return &decision, nil
 }
 
@@ -1390,24 +1490,45 @@ func normalizeCoverageConversationAnalysisResult(result *CoverageConversationAna
 	result.HumanResolution = strings.TrimSpace(result.HumanResolution)
 	result.DecisionReason = strings.TrimSpace(result.DecisionReason)
 	result.SearchQuery = strings.TrimSpace(result.SearchQuery)
+	result.Confidence = normalizeCoverageConfidence(result.Confidence)
 	if len(result.RecommendedFixes) > 3 {
 		result.RecommendedFixes = result.RecommendedFixes[:3]
 	}
 	for i := range result.RecommendedFixes {
-		fix := &result.RecommendedFixes[i]
-		fix.Type = strings.TrimSpace(fix.Type)
-		fix.TargetType = strings.TrimSpace(fix.TargetType)
-		fix.TargetID = strings.TrimSpace(fix.TargetID)
-		fix.TargetTitle = strings.TrimSpace(fix.TargetTitle)
-		fix.TargetURL = strings.TrimSpace(fix.TargetURL)
-		fix.Priority = strings.TrimSpace(fix.Priority)
-		if fix.Priority == "" {
-			fix.Priority = model.SupportCoverageRecommendationPrioritySecondary
-		}
-		fix.Rationale = strings.TrimSpace(fix.Rationale)
-		fix.SuggestedChange = strings.TrimSpace(fix.SuggestedChange)
-		fix.ImplementationNotes = strings.TrimSpace(fix.ImplementationNotes)
+		normalizeCoverageRecommendedFix(&result.RecommendedFixes[i])
 	}
+}
+
+// normalizeCoverageRecommendedFix trims a fix and fills a missing target
+// surface from its type, which names the surface unambiguously.
+func normalizeCoverageRecommendedFix(fix *CoverageRecommendedFix) {
+	fix.Type = strings.TrimSpace(fix.Type)
+	fix.TargetType = strings.TrimSpace(fix.TargetType)
+	if fix.TargetType == "" {
+		fix.TargetType = coverageFixTargetTypes[fix.Type]
+	}
+	fix.TargetID = strings.TrimSpace(fix.TargetID)
+	fix.TargetTitle = strings.TrimSpace(fix.TargetTitle)
+	fix.TargetURL = strings.TrimSpace(fix.TargetURL)
+	fix.Priority = strings.TrimSpace(fix.Priority)
+	if fix.Priority == "" {
+		fix.Priority = model.SupportCoverageRecommendationPrioritySecondary
+	}
+	fix.Rationale = strings.TrimSpace(fix.Rationale)
+	fix.SuggestedChange = strings.TrimSpace(fix.SuggestedChange)
+	fix.ImplementationNotes = strings.TrimSpace(fix.ImplementationNotes)
+}
+
+// coverageFixTargetTypes maps each fix type to the surface it changes.
+var coverageFixTargetTypes = map[string]string{
+	model.SupportCoverageFixCreateArticle:     "docs",
+	model.SupportCoverageFixUpdateArticle:     "docs",
+	model.SupportCoverageFixCreateWebsitePage: "website_page",
+	model.SupportCoverageFixUpdateWebsitePage: "website_page",
+	model.SupportCoverageFixAddData:           "data_source",
+	model.SupportCoverageFixAddAction:         "tool_action",
+	model.SupportCoverageFixDefinePolicy:      "policy",
+	model.SupportCoverageFixImproveWorkflow:   "workflow",
 }
 
 func normalizeCoverageFixBundleDecision(decision *CoverageFixBundleDecision) {
@@ -1415,23 +1536,12 @@ func normalizeCoverageFixBundleDecision(decision *CoverageFixBundleDecision) {
 		return
 	}
 	decision.DecisionReason = strings.TrimSpace(decision.DecisionReason)
+	decision.Confidence = normalizeCoverageConfidence(decision.Confidence)
 	if len(decision.RecommendedFixes) > 3 {
 		decision.RecommendedFixes = decision.RecommendedFixes[:3]
 	}
 	for i := range decision.RecommendedFixes {
-		fix := &decision.RecommendedFixes[i]
-		fix.Type = strings.TrimSpace(fix.Type)
-		fix.TargetType = strings.TrimSpace(fix.TargetType)
-		fix.TargetID = strings.TrimSpace(fix.TargetID)
-		fix.TargetTitle = strings.TrimSpace(fix.TargetTitle)
-		fix.TargetURL = strings.TrimSpace(fix.TargetURL)
-		fix.Priority = strings.TrimSpace(fix.Priority)
-		if fix.Priority == "" {
-			fix.Priority = model.SupportCoverageRecommendationPrioritySecondary
-		}
-		fix.Rationale = strings.TrimSpace(fix.Rationale)
-		fix.SuggestedChange = strings.TrimSpace(fix.SuggestedChange)
-		fix.ImplementationNotes = strings.TrimSpace(fix.ImplementationNotes)
+		normalizeCoverageRecommendedFix(&decision.RecommendedFixes[i])
 	}
 }
 
@@ -1458,9 +1568,13 @@ Do not create a gap if the AI correctly resolved the issue. Set should_run_retri
 
 Prefer knowledge/content gaps only when customer-facing knowledge could reasonably fix the issue. Use data/context when the human used customer, account, order, subscription, or similar data. Use action when the human performed an operation the AI could not perform. Use policy when the human applied judgment, approval, exception, or escalation policy.
 
+` + coverageMissingDataInstruction + `
+
 Recommend multiple fixes when one surface alone will not reduce repeated human intervention. Limit to 3 fixes. Mark exactly one fix as primary unless two fixes are equally necessary.
 
 Recommend website/content changes for prospect, sales, pricing, migration, integration, security, comparison, or pre-purchase questions. Recommend docs changes for setup, usage, troubleshooting, and post-signup workflows.
+
+` + coverageConfidenceInstruction + ` Set confidence=0 when has_gap=false.
 
 Be concise in all text fields. Each field should be one sentence, two at most:
 - customer_need: what the customer needed, not a retelling of the conversation.
@@ -1537,7 +1651,23 @@ Use update_article only when a candidate help article is clearly about the same 
 
 Preserve data, action, policy, workflow, and agent-instruction recommendations from the first-pass analysis if they remain relevant. Mixed cases may produce multiple fixes, capped at 3. Mark exactly one primary fix unless two fixes are equally necessary.
 
+` + coverageConfidenceInstruction + `
+
 Be concise: decision_reason should be one sentence for a UI card. Each fix field (rationale, suggested_change, implementation_notes) should be one actionable sentence. Do not repeat information across fields.`
+}
+
+// coverageConfidenceInstruction defines the confidence scale for both
+// analyzer prompts. Without it models answered 0 for real gaps, which failed
+// every conversation that had one.
+const coverageConfidenceInstruction = `Set confidence to a number from 0 to 1: how sure you are that the conversation shows a real coverage gap and that ai_failure names its cause. Use about 0.9 when a human reply shows exactly what the AI lacked, about 0.7 when the evidence is indirect, and below 0.5 when you are guessing.`
+
+// normalizeCoverageConfidence rescales an answer given on a 0–100 scale. A
+// percentage is still a clear answer, so it is kept instead of failing.
+func normalizeCoverageConfidence(confidence float64) float64 {
+	if confidence > 1 && confidence <= 100 {
+		return confidence / 100
+	}
+	return confidence
 }
 
 func coverageFixBundleDecisionJSONSchema() map[string]any {

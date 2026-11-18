@@ -38,6 +38,15 @@ vi.mock('@/hooks/queries/useSession', () => ({
   useWorkspaceAccess: () => ({ data: { permissions: ['support.edit'] } }),
 }))
 
+vi.mock('@/hooks/queries/useSupportOperations', () => {
+  const mutation = () => ({ mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false });
+  return {
+    useUpdateConversationPriority: mutation,
+    useSnoozeConversation: mutation,
+    useUnsnoozeConversation: mutation,
+  };
+});
+
 vi.mock('@/hooks/queries/useSupport', () => ({
   useDeleteConversation: () => ({ mutate: vi.fn(), isPending: false }),
   useMarkConversationRead: () => ({ mutate: vi.fn(), isPending: false }),
@@ -314,6 +323,22 @@ describe('ConversationRow', () => {
     expect(container.textContent).not.toContain('Z')
 
     cleanup()
+  })
+
+  it('gives the open conversation its own shade, and only other rows a hover shade', () => {
+    useSupportInboxStore.setState({ selectedConversationId: 'conv-1', drafts: {} })
+    const selected = renderRow(conversation())
+    const selectedRow = selected.container.querySelector('[data-conversation-id="conv-1"]')
+    expect(selectedRow?.className).toContain('bg-quiet-row-selected')
+    expect(selectedRow?.className).not.toContain('hover:bg-quiet-row-hover')
+    selected.cleanup()
+
+    useSupportInboxStore.setState({ selectedConversationId: 'conv-2', drafts: {} })
+    const other = renderRow(conversation())
+    const otherRow = other.container.querySelector('[data-conversation-id="conv-1"]')
+    expect(otherRow?.className).not.toContain('bg-quiet-row-selected')
+    expect(otherRow?.className).toContain('hover:bg-quiet-row-hover')
+    other.cleanup()
   })
 
   it('renders the channel icon before the customer name so its tooltip is not hidden by row actions', () => {

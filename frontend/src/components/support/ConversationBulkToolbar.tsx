@@ -7,18 +7,27 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { useConfirm } from '@/components/ui/confirm-dialog';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { useSupportTags } from '@/hooks/queries/useSupport';
+import { useWorkspaceMembers } from '@/hooks/queries/useWorkspaces';
+import { PriorityIcon } from '@/lib/pmConstants';
+import { SnoozeDateTimeDialog, SnoozeSubmenu } from './SnoozeMenu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { ArrowTurnBackwardIcon, Cancel01Icon, CheckmarkCircle02Icon, Delete01Icon, FolderInputIcon, MailOpenIcon, Mail01Icon, MoreHorizontalIcon, OctagonXIcon } from '@/lib/icons';
+import { ArrowTurnBackwardIcon, Cancel01Icon, CheckmarkCircle02Icon, Delete01Icon, FolderInputIcon, MailOpenIcon, Mail01Icon, MinusSignIcon, MoreHorizontalIcon, OctagonXIcon, Tag01Icon, UserAdd01Icon, UserRemove01Icon } from '@/lib/icons';
 import type { SupportConversation } from '@/lib/pmTypes';
 import { queryKeys } from '@/lib/queryKeys';
-import { runConversationBulkAction, type ConversationBulkAction } from '@/lib/supportBulkActions';
+import { bulkActionRemovesFromList, runConversationBulkAction, type ConversationBulkAction } from '@/lib/supportBulkActions';
+import { isSupportConversationListQueryKey, patchConversationDetailStatus, patchConversationStatusInCache, type SupportConversationListCache } from '@/lib/supportQueryCache';
 import { useSupportInboxStore } from '@/stores/supportInboxStore';
+import { useSupportInboxCelebrationStore } from '@/stores/supportInboxCelebrationStore';
 import { QuietDropdown } from '@/components/design-system/quiet';
+import { cn } from '@/lib/utils';
 import type { ConversationActionMoveOption } from './ConversationActionsMenu';
 
 interface Props {
   workspaceId: string;
+  /** The viewer, for "Assign to me". */
+  userId?: string;
   conversations: SupportConversation[];
   loadedCount: number;
   allLoadedSelected: boolean;
@@ -32,9 +41,11 @@ interface Props {
   onCompleted: (ids: string[]) => void;
 }
 
-export function ConversationBulkToolbar({ workspaceId, conversations, loadedCount, allLoadedSelected, hasMore, loadingSelection, canEdit, moveOptions, onSelectLoaded, onClear, onBusyChange, onCompleted }: Props) {
+export function ConversationBulkToolbar({ workspaceId, userId, conversations, loadedCount, allLoadedSelected, hasMore, loadingSelection, canEdit, moveOptions, onSelectLoaded, onClear, onBusyChange, onCompleted }: Props) {
   const queryClient = useQueryClient();
   const [mergeOpen, setMergeOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const [customSnoozeOpen, setCustomSnoozeOpen] = useState(false);
   const { data: access } = useWorkspaceAccess(workspaceId);
   const confirm = useConfirm();
   const running = useRef(false);
@@ -47,6 +58,12 @@ export function ConversationBulkToolbar({ workspaceId, conversations, loadedCoun
   const reopen = conversations.every((conversation) => conversation.status === 'resolved' || conversation.status === 'spam');
   const primaryLabel = reopen ? 'Reopen conversations' : 'Resolve conversations';
   const PrimaryIcon = reopen ? ArrowTurnBackwardIcon : CheckmarkCircle02Icon;
+  const { data: members = [] } = useWorkspaceMembers(workspaceId);
+  const { data: tags = [] } = useSupportTags(workspaceId);
+  const assignees = members.filter((member) => member.user_id && member.role !== 'viewer' && member.user_id !== userId);
+  const selectedTagIds = new Set(conversations.flatMap((conversation) => (conversation.tags ?? []).map((tag) => tag.id)));
+  const removableTags = tags.filter((tag) => selectedTagIds.has(tag.id));
+  const snoozable = conversations.some((conversation) => conversation.status !== 'resolved' && conversation.status !== 'spam' && !conversation.merged_into_id);
 
   async function apply(action: ConversationBulkAction, verb: string) {
     if (running.current || loadingSelection || count === 0 || (!canEdit && action.type !== 'read' && action.type !== 'unread')) return;
@@ -63,16 +80,51 @@ export function ConversationBulkToolbar({ workspaceId, conversations, loadedCoun
         });
         if (!approved || !mounted.current) return;
       }
+      // Resolving or spamming the whole list is the viewer's own clear.
+      const removesFromInbox = action.type === 'status' && (action.status === 'resolved' || action.status === 'spam');
+      const celebrations = useSupportInboxCelebrationStore.getState();
+      if (removesFromInbox) celebrations.noteOwnRemovals(conversations.map((conversation) => conversation.id));
       const result = await runConversationBulkAction(workspaceId, conversations, action, (completed) => {
         if (mounted.current) setProgress(completed);
       });
+      if (removesFromInbox) {
+        celebrations.forgetOwnRemovals(result.failed.map((failure) => failure.id));
+        celebrations.noteOwnRemovals(result.succeeded);
+      }
       const inbox = useSupportInboxStore.getState();
-      if (mounted.current && inbox.selectedConversationId && result.succeeded.includes(inbox.selectedConversationId)
-        && (action.type === 'delete' || action.type === 'move' || (action.type === 'status' && action.status !== 'open'))) {
+      if (mounted.current && inbox.selectedConversationId && result.succeeded.includes(inbox.selectedConversationId) && bulkActionRemovesFromList(action)) {
         inbox.selectConversation(null);
       }
+      if (action.type === 'status') {
+        // Show the new status at once, so the rows leave the list before the refetch.
+        const { status } = action;
+        queryClient.setQueriesData<SupportConversationListCache>(
+          { predicate: (query) => isSupportConversationListQueryKey(query.queryKey, workspaceId) },
+          (current) => result.succeeded.reduce((cache, conversationId) => patchConversationStatusInCache(cache, { conversationId, status }), current),
+        );
+        for (const conversationId of result.succeeded) {
+          queryClient.setQueryData(
+            queryKeys.support.conversation(workspaceId, conversationId),
+            (current: SupportConversation | undefined) => patchConversationDetailStatus(current, { conversationId, status }),
+          );
+        }
+      }
+      // Refetch only what a bulk action changes: the lists, the changed
+      // conversations and the counts.
+      const changed = new Set(result.succeeded);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['support', workspaceId] }),
+        queryClient.invalidateQueries({
+          predicate: (query) => {
+            const key = query.queryKey;
+            if (isSupportConversationListQueryKey(key, workspaceId)) return true;
+            return key[0] === 'support' && key[1] === workspaceId && key[2] === 'conversations' && typeof key[3] === 'string' && changed.has(key[3]);
+          },
+        }),
+        queryClient.invalidateQueries({ queryKey: ['support', workspaceId, 'search'] }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.support.unreadStats(workspaceId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.support.inboxScopes(workspaceId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.support.inboxViewCounts(workspaceId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.support.mailboxes(workspaceId) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.support.workspaceUnread() }),
       ]);
       if (mounted.current) onCompleted(result.succeeded);
@@ -94,9 +146,15 @@ export function ConversationBulkToolbar({ workspaceId, conversations, loadedCoun
     }
   }
 
+  function handleSnooze(until: Date) {
+    const minutes = Math.max(1, Math.round((until.getTime() - Date.now()) / 60_000));
+    void apply({ type: 'operations', actions: { snooze_minutes: minutes } }, 'Snoozed');
+  }
+
   return (
     <>
       {mergeOpen && <ConversationMergeDialog workspaceId={workspaceId} conversations={conversations} open={mergeOpen} onOpenChange={setMergeOpen} onMerged={onCompleted} />}
+      {canEdit && snoozable && customSnoozeOpen && <SnoozeDateTimeDialog onSnooze={handleSnooze} onClose={() => setCustomSnoozeOpen(false)} />}
       <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 pl-1.5">
         <Checkbox
           className="border-neutral-400 bg-white data-[state=checked]:border-neutral-400 data-[state=checked]:bg-white data-[state=checked]:text-neutral-900 dark:data-[state=checked]:bg-white"
@@ -120,21 +178,13 @@ export function ConversationBulkToolbar({ workspaceId, conversations, loadedCoun
       </label>
       {canEdit && <Tooltip>
         <TooltipTrigger asChild>
-          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={primaryLabel} disabled={disabled} onClick={() => void apply({ type: 'status', status: reopen ? 'open' : 'resolved' }, reopen ? 'Reopened' : 'Resolved')}>
+          <Button variant={reopen ? 'ghost' : 'default'} size="icon" className={cn('h-7 w-7 shrink-0', !reopen && 'bg-emerald-600 text-white hover:bg-emerald-700 dark:bg-emerald-600 dark:hover:bg-emerald-700')} aria-label={primaryLabel} disabled={disabled} onClick={() => void apply({ type: 'status', status: reopen ? 'open' : 'resolved' }, reopen ? 'Reopened' : 'Resolved')}>
             <PrimaryIcon className="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{primaryLabel}</TooltipContent>
       </Tooltip>}
-      {canEdit && moveOptions.length > 0 && <QuietDropdown
-        options={moveOptions.map((option) => ({ value: option.id, label: option.name }))}
-        onSelect={(value) => { void apply({ type: 'move', mailboxId: value === 'shared' ? null : value }, 'Moved'); }}
-        label="Move to inbox"
-        disabled={disabled}
-        triggerWrapper={(trigger) => <Tooltip><TooltipTrigger asChild>{trigger}</TooltipTrigger><TooltipContent side="bottom">Move to inbox</TooltipContent></Tooltip>}
-        trigger={<Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label="Move conversations to inbox" disabled={disabled}><FolderInputIcon className="h-3.5 w-3.5" /></Button>}
-      />}
-      <DropdownMenu>
+      <DropdownMenu open={actionsOpen} onOpenChange={setActionsOpen}>
         <Tooltip>
           <TooltipTrigger asChild>
             <DropdownMenuTrigger asChild>
@@ -144,10 +194,72 @@ export function ConversationBulkToolbar({ workspaceId, conversations, loadedCoun
           <TooltipContent side="bottom">More actions</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="end">
+          {canEdit && <>
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger><UserAdd01Icon className="h-3.5 w-3.5" />Assign</DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="max-h-80 w-56 overflow-y-auto">
+                {userId && <DropdownMenuItem onSelect={() => void apply({ type: 'operations', actions: { assign_user_id: userId } }, 'Assigned')}>Assign to me</DropdownMenuItem>}
+                {assignees.length > 0 && <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel className="text-xs text-muted-foreground">Assign to</DropdownMenuLabel>
+                  {assignees.map((member) => (
+                    <DropdownMenuItem key={member.user_id} onSelect={() => void apply({ type: 'operations', actions: { assign_user_id: member.user_id! } }, 'Assigned')}>
+                      <span className="truncate">{member.full_name || member.email || 'Teammate'}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </>}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={() => void apply({ type: 'operations', actions: { assign_user_id: '' } }, 'Unassigned')}><UserRemove01Icon className="h-3.5 w-3.5" />Unassign</DropdownMenuItem>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+            {snoozable && <SnoozeSubmenu disabled={disabled} onSnooze={handleSnooze} onCustomSelect={() => setCustomSnoozeOpen(true)} />}
+            {moveOptions.length > 0 && <QuietDropdown
+              options={moveOptions.map((option) => ({ value: option.id, label: option.name }))}
+              onSelect={(value) => {
+                setActionsOpen(false);
+                void apply({ type: 'move', mailboxId: value === 'shared' ? null : value }, 'Moved');
+              }}
+              label="Move to inbox"
+              disabled={disabled}
+              trigger={<DropdownMenuItem onSelect={(event) => event.preventDefault()}><FolderInputIcon className="h-3.5 w-3.5" />Move to inbox…</DropdownMenuItem>}
+            />}
+            <DropdownMenuSeparator />
+          </>}
           {access?.permissions.includes('support.merge') && <DropdownMenuItem disabled={!canMergeSelection(conversations)} onSelect={() => setMergeOpen(true)}>Merge…</DropdownMenuItem>}
           <DropdownMenuItem onSelect={() => void apply({ type: 'read' }, 'Marked as read:')}><MailOpenIcon className="h-3.5 w-3.5" />Mark as read</DropdownMenuItem>
           <DropdownMenuItem onSelect={() => void apply({ type: 'unread' }, 'Marked as unread:')}><Mail01Icon className="h-3.5 w-3.5" />Mark as unread</DropdownMenuItem>
           {canEdit && <>
+            <DropdownMenuSeparator />
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger><PriorityIcon priority="high" className="h-3.5 w-3.5" />Priority</DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="w-40">
+                {(['urgent', 'high', 'medium', 'low'] as const).map((priority) => (
+                  <DropdownMenuItem key={priority} onSelect={() => void apply({ type: 'operations', actions: { priority } }, `Set ${priority} priority on`)}>
+                    <PriorityIcon priority={priority} className="h-3.5 w-3.5" /><span className="capitalize">{priority}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+            {tags.length > 0 && <DropdownMenuSub>
+              <DropdownMenuSubTrigger><Tag01Icon className="h-3.5 w-3.5" />Add tag</DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="max-h-72 w-48 overflow-y-auto">
+                {tags.map((tag) => (
+                  <DropdownMenuItem key={tag.id} onSelect={() => void apply({ type: 'operations', actions: { add_tag_ids: [tag.id] } }, `Tagged "${tag.name}":`)}>
+                    <span className="truncate">{tag.name}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>}
+            {removableTags.length > 0 && <DropdownMenuSub>
+              <DropdownMenuSubTrigger><MinusSignIcon className="h-3.5 w-3.5" />Remove tag</DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="max-h-72 w-48 overflow-y-auto">
+                {removableTags.map((tag) => (
+                  <DropdownMenuItem key={tag.id} onSelect={() => void apply({ type: 'operations', actions: { remove_tag_ids: [tag.id] } }, `Removed "${tag.name}" from`)}>
+                    <span className="truncate">{tag.name}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>}
             <DropdownMenuSeparator />
             <DropdownMenuItem onSelect={() => void apply({ type: 'status', status: reopen ? 'resolved' : 'open' }, reopen ? 'Resolved' : 'Reopened')}>
               {reopen ? <CheckmarkCircle02Icon className="h-3.5 w-3.5" /> : <ArrowTurnBackwardIcon className="h-3.5 w-3.5" />}{reopen ? 'Resolve' : 'Reopen'}

@@ -47,6 +47,9 @@ export interface FooterConfig {
 }
 
 export interface HelpCenterConfig {
+  demo_mode?: boolean;
+  search_indexing_enabled?: boolean;
+  official_docs_url?: string;
   public_widget_url?: string
   public_sdk_url?: string
   id: string
@@ -70,6 +73,10 @@ export interface HelpCenterConfig {
   is_published: boolean
   chat_widget_enabled?: boolean
   ai_answers_enabled?: boolean
+  /** Whether the help center offers the Ask AI help assistant. */
+  ai_assistant_enabled?: boolean
+  /** The customer portal's new-request form, where Ask AI hands visitors off. */
+  support_request_url?: string
   support_widget_key?: string | null
   seo_title: string | null
   seo_description: string | null
@@ -302,3 +309,12 @@ export interface HelpCenterBootstrap {
   locale: string
   spaces: Space[]
 }
+
+
+export type {
+  AssistantCitation,
+  AssistantMessage,
+  AssistantMessageStatus,
+  AssistantSessionView as AssistantSession,
+  AssistantTurn,
+} from '../../../packages/shared/src/help-assistant'

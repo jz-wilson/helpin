@@ -95,6 +95,7 @@ func (h *SupportInboxHandler) ListConversations(w http.ResponseWriter, r *http.R
 	tagIDs := splitQueryCSV(r.URL.Query().Get("tag_ids"))
 	systemTags := splitQueryCSV(r.URL.Query().Get("system_tags"))
 	aiFilters := splitQueryCSV(r.URL.Query().Get("ai"))
+	slaFilter := strings.TrimSpace(r.URL.Query().Get("sla"))
 	mailboxIDs := splitQueryCSV(r.URL.Query().Get("mailbox_ids"))
 	var mailboxID *string
 	if values, ok := r.URL.Query()["mailbox_id"]; ok {
@@ -126,6 +127,9 @@ func (h *SupportInboxHandler) ListConversations(w http.ResponseWriter, r *http.R
 		TagIDs:      tagIDs,
 		SystemTags:  systemTags,
 		AIFilters:   aiFilters,
+		SLA:         slaFilter,
+		// Request types: ids, or "none" for conversations without one.
+		RequestTypeIDs: splitQueryCSV(r.URL.Query().Get("request_type_ids")),
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -518,7 +522,7 @@ func (h *SupportInboxHandler) CreateTaskFromConversation(w http.ResponseWriter, 
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeBillingAwareError(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, response)
@@ -1378,7 +1382,7 @@ func (h *SupportInboxHandler) GetInstallation(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeJSON(w, http.StatusOK, installationSettingsResponse(inst, settings))
+	writeJSON(w, http.StatusOK, installationSettingsResponse(inst, settings, h.supportService.SuggestedAllowedOrigins(r.Context(), inst)))
 }
 
 // UpdateInstallationSettings handles PATCH /api/support/inbox/installations.
@@ -1401,7 +1405,7 @@ func (h *SupportInboxHandler) UpdateInstallationSettings(w http.ResponseWriter, 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, installationSettingsResponse(inst, settings))
+	writeJSON(w, http.StatusOK, installationSettingsResponse(inst, settings, h.supportService.SuggestedAllowedOrigins(r.Context(), inst)))
 }
 
 // RegenerateWidgetKey handles POST /api/support/inbox/installations/regenerate-key.
@@ -1418,15 +1422,16 @@ func (h *SupportInboxHandler) RegenerateWidgetKey(w http.ResponseWriter, r *http
 		return
 	}
 
-	writeJSON(w, http.StatusOK, installationSettingsResponse(inst, settings))
+	writeJSON(w, http.StatusOK, installationSettingsResponse(inst, settings, h.supportService.SuggestedAllowedOrigins(r.Context(), inst)))
 }
 
-func installationSettingsResponse(inst *model.SupportWidgetInstallation, settings *model.SupportInboxSettings) model.InstallationSettingsResponse {
+func installationSettingsResponse(inst *model.SupportWidgetInstallation, settings *model.SupportInboxSettings, suggestedOrigins []string) model.InstallationSettingsResponse {
 	return model.InstallationSettingsResponse{
 		ID:                       inst.ID,
 		WorkspaceID:              inst.WorkspaceID,
 		WidgetKey:                inst.WidgetKey,
 		AllowedOrigins:           []string(inst.AllowedOrigins),
+		SuggestedAllowedOrigins:  suggestedOrigins,
 		IdentityVerificationMode: inst.IdentityVerificationMode,
 		SigningSecretConfigured:  strings.TrimSpace(inst.SecretKey) != "",
 		Settings:                 *settings,
@@ -1535,7 +1540,7 @@ func (h *SupportInboxHandler) ViewingPresence(w http.ResponseWriter, r *http.Req
 
 // PreviewTaskFromConversation handles a reviewed support task draft without creating a task.
 func (h *SupportInboxHandler) PreviewTaskFromConversation(w http.ResponseWriter, r *http.Request) {
-	result, err := h.supportService.PreviewTaskFromConversation(r.Context(), getWorkspaceID(r), chi.URLParam(r, "id"))
+	result, err := h.supportService.PreviewTaskFromConversation(r.Context(), getWorkspaceID(r), chi.URLParam(r, "id"), r.URL.Query().Get("team_id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "Unable to prepare a task draft from this conversation.")
 		return

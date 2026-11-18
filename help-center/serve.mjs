@@ -10,7 +10,9 @@ import {
   shouldAttemptRedirectResolution,
 } from './serverRedirects.mjs'
 import {
+  isSearchIndexingDisabled,
   collectSitemapEntries,
+  renderLlmsTxt,
   renderRobotsTxt,
   renderSitemapXml,
   resolvePublicUrlParts,
@@ -25,6 +27,7 @@ import {
 } from './serverCompression.mjs'
 
 import { createSharedRenderCache, helpcenterIdentifierTag } from './serverRenderCache.mjs'
+import { createPortalMount, isPortalPagePath, portalApiSlug } from './portalMount.mjs'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CLIENT_DIR = path.join(__dirname, 'dist', 'client')
 
@@ -79,6 +82,11 @@ async function tryServeStatic(request, url, response, basepath = '') {
 }
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10)
+// The customer portal build, mounted at /requests (see portalMount.mjs).
+const portalMount = createPortalMount({
+  apiBase: process.env.INTERNAL_API_URL,
+  portalDir: path.join(__dirname, 'portal'),
+})
 const HTML_CACHE_TTL_MS = Number.parseInt(
   process.env.HTML_CACHE_TTL_MS || '120000',
   10,
@@ -217,6 +225,7 @@ function isHtmlRequest(request, url) {
     url.pathname.startsWith('/assets/') ||
     url.pathname === '/robots.txt' ||
     url.pathname === '/sitemap.xml' ||
+    url.pathname === '/llms.txt' ||
     url.pathname === '/healthz'
   ) {
     return false
@@ -523,8 +532,10 @@ globalThis.__hcGetRequestContext__ = () => requestContextStorage.getStore() ?? n
 
 
 async function fetchHelpCenterConfig(apiBase, subdomain) {
-  if (!apiBase || !subdomain) return null
-  const configRes = await fetch(`${apiBase}/hc/${subdomain}/config`)
+  if (!apiBase) throw new Error('Help Center API unavailable')
+  if (!subdomain) return null
+  const configRes = await fetch(`${apiBase}/hc/${subdomain}/config`, { signal: AbortSignal.timeout(5000) })
+  if (configRes.status === 404) return null
   if (!configRes.ok) throw new Error(`config fetch failed: ${configRes.status}`)
   return configRes.json()
 }
@@ -532,18 +543,24 @@ async function fetchHelpCenterConfig(apiBase, subdomain) {
 async function handleRobotsTxt(_request, response, hcContext) {
   const apiBase = process.env.INTERNAL_API_URL
   let publicUrl = { origin: hcContext.origin, basepath: hcContext.basepath }
+  let config
+  response.setHeader('Content-Type', 'text/plain; charset=utf-8')
+  response.setHeader('Cache-Control', 'public, max-age=0, must-revalidate')
   try {
-    const config = await fetchHelpCenterConfig(apiBase, hcContext.subdomain)
-    if (config) {
-      publicUrl = resolvePublicUrlParts(hcContext, config)
+    config = await fetchHelpCenterConfig(apiBase, hcContext.subdomain)
+    if (!config) {
+      response.statusCode = 404
+      response.setHeader('Cache-Control', 'no-store')
+      response.end('Not found')
+      return
     }
+    publicUrl = resolvePublicUrlParts(hcContext, config)
   } catch (error) {
     console.error('failed to resolve robots public URL', error)
+    response.setHeader('Cache-Control', 'no-store')
   }
-  const body = renderRobotsTxt(publicUrl)
+  const body = renderRobotsTxt(publicUrl, config)
   response.statusCode = 200
-  response.setHeader('Cache-Control', 'public, max-age=3600')
-  response.setHeader('Content-Type', 'text/plain; charset=utf-8')
   response.end(body)
 }
 
@@ -564,6 +581,13 @@ async function handleSitemapXml(_request, response, hcContext) {
       return
     }
     const config = await fetchHelpCenterConfig(apiBase, subdomain)
+    if (!config || isSearchIndexingDisabled(config)) {
+      response.statusCode = 404
+      if (config) response.setHeader('X-Robots-Tag', 'noindex')
+      response.setHeader('Cache-Control', 'no-store')
+      response.end('Not found')
+      return
+    }
     const locales = config.enabled_locales?.length > 1
       ? config.enabled_locales
       : [config.default_locale || 'en']
@@ -598,7 +622,7 @@ async function handleSitemapXml(_request, response, hcContext) {
     const body = renderSitemapXml(entries)
 
     response.statusCode = 200
-    response.setHeader('Cache-Control', 'public, max-age=3600')
+    response.setHeader('Cache-Control', 'public, max-age=0, must-revalidate')
     response.setHeader('Content-Type', 'application/xml; charset=utf-8')
     response.end(body)
   } catch (error) {
@@ -607,6 +631,46 @@ async function handleSitemapXml(_request, response, hcContext) {
     response.setHeader('Cache-Control', 'no-store')
     response.setHeader('Content-Type', 'text/plain; charset=utf-8')
     response.end('Sitemap unavailable')
+  }
+}
+
+async function handleLlmsTxt(_request, response, hcContext) {
+  const unavailable = () => {
+    response.statusCode = 503
+    response.setHeader('Cache-Control', 'no-store')
+    response.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    response.end('llms.txt unavailable')
+  }
+  try {
+    const { subdomain } = hcContext
+    const apiBase = process.env.INTERNAL_API_URL
+    if (!apiBase || !subdomain) return unavailable()
+    const config = await fetchHelpCenterConfig(apiBase, subdomain)
+    if (!config || isSearchIndexingDisabled(config)) {
+      response.statusCode = 404
+      if (config) response.setHeader('X-Robots-Tag', 'noindex')
+      response.setHeader('Cache-Control', 'no-store')
+      response.end('Not found')
+      return
+    }
+    const multilingual = config.enabled_locales?.length > 1
+    const locale = config.default_locale || 'en'
+    const prefix = multilingual ? `/hc/${subdomain}/${locale}` : `/hc/${subdomain}`
+    const spacesRes = await fetch(`${apiBase}${prefix}/spaces`)
+    if (!spacesRes.ok) return unavailable()
+    const spaces = []
+    for (const space of await spacesRes.json()) {
+      const navRes = await fetch(`${apiBase}${prefix}/spaces/${encodeURIComponent(space.slug)}/navigation`)
+      spaces.push({ name: space.name, navigation: navRes.ok ? await navRes.json() : [] })
+    }
+    const body = renderLlmsTxt({ publicUrl: resolvePublicUrlParts(hcContext, config), config, spaces })
+    response.statusCode = 200
+    response.setHeader('Cache-Control', 'public, max-age=0, must-revalidate')
+    response.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    response.end(body)
+  } catch (error) {
+    console.error('failed to generate llms.txt', error)
+    unavailable()
   }
 }
 
@@ -700,6 +764,14 @@ async function handleRequest(request, response) {
   routeUrl.pathname = internalPath
 
   await requestContextStorage.run(hcContext, async () => {
+    if (isPortalPagePath(internalPath)) {
+      await portalMount.handlePage(request, response, internalPath, hcContext, {
+        serveStaticFile: (req, res, filePath) => serveStaticFile(req, res, filePath),
+        writeBody: writeCompressedBody,
+      })
+      return
+    }
+
     if (internalPath === '/robots.txt') {
       await handleRobotsTxt(request, response, hcContext)
       return
@@ -707,6 +779,11 @@ async function handleRequest(request, response) {
 
     if (internalPath === '/sitemap.xml') {
       await handleSitemapXml(request, response, hcContext)
+      return
+    }
+
+    if (internalPath === '/llms.txt') {
+      await handleLlmsTxt(request, response, hcContext)
       return
     }
 
@@ -718,6 +795,19 @@ async function handleRequest(request, response) {
       // The public help-center is not a proxy for staff or internal APIs.
       let decodedPath
       try { decodedPath = decodeURIComponent(routeUrl.pathname) } catch { decodedPath = '' }
+      // The portal API is proxied only for the portal this host serves.
+      if (portalApiSlug(routeUrl.pathname) !== null && !decodedPath.includes('..')) {
+        if (!(await portalMount.allowedApiPath(routeUrl.pathname, hcContext))) {
+          response.statusCode = 404
+          response.end('Not found')
+          return
+        }
+        await portalMount.proxyApi(request, response, routeUrl, hcContext, {
+          buildHeaders: buildProxyHeaders,
+          readBody: (req) => (shouldReadBody(req.method || 'GET') ? Readable.toWeb(req) : undefined),
+        })
+        return
+      }
       if (!decodedPath.startsWith('/api/hc/') || decodedPath.includes('..') || decodedPath.includes('\\')) {
         response.statusCode = 404
         response.end('Not found')
@@ -797,6 +887,9 @@ async function handleRequest(request, response) {
       const headersToCache = Array.from(fetchResponse.headers.entries())
         .filter(([name]) => !['cache-control', 'content-encoding', 'content-length'].includes(name))
       headersToCache.push(['cache-control', 'public, max-age=0, must-revalidate'])
+      if (/<meta\s+[^>]*name=["']robots["'][^>]*content=["'][^"']*noindex/i.test(renderedBody)) {
+        headersToCache.push(['x-robots-tag', 'noindex'])
+      }
       let cacheEntry
       if (isHtmlRequest(request, routeUrl)) {
         cacheEntry = {
@@ -837,6 +930,24 @@ const server = http.createServer((request, response) => {
     response.setHeader('Content-Type', 'text/plain; charset=utf-8')
     response.end('Internal Server Error')
   })
+})
+
+// The portal's live-update socket, proxied like the rest of its API.
+server.on('upgrade', (request, socket, head) => {
+  const { host, rawHost, protocol } = resolveHostInfo(request)
+  const url = new URL(request.url || '/', `${protocol}://${host}`)
+  const resolved = resolveHelpCenterContext(host, url.pathname, url.search, {
+    rawHost,
+    tenant: request.headers['x-helpin-hc-tenant'],
+    basepath: request.headers['x-helpin-hc-basepath'],
+    forwardedPrefix: request.headers['x-forwarded-prefix'],
+  })
+  const internalPath = stripBasepath(url.pathname, resolved.basepath)
+  portalMount.proxyUpgrade(request, socket, head, internalPath, { subdomain: resolved.subdomain, basepath: resolved.basepath })
+    .catch((error) => {
+      console.error('portal socket proxy error', error)
+      socket.destroy()
+    })
 })
 
 server.listen(PORT, '0.0.0.0', () => {

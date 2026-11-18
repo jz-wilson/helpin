@@ -64,6 +64,8 @@ type WidgetConversation = Conversation & {
   activeTeammate?: WidgetActiveTeammate;
   flowState?: string;
   aiState?: string;
+  /** The visitor's saved rating, so another device does not ask again. */
+  csatRating?: number;
 };
 
 type AIResponseStreamState = {
@@ -177,6 +179,7 @@ export class WidgetManager {
   private originalDocumentTitle: string | null = null;
   private pageIsFocused = true;
   private preChatDone = false;
+  private waitingForEmail = false;
   private receivedMessageAudio: HTMLAudioElement | null = null;
   private receivedMessageAudioUnlocked = false;
   private sentMessageAudio: HTMLAudioElement | null = null;
@@ -292,6 +295,7 @@ export class WidgetManager {
       try { sessionStorage.removeItem(`helpin_pending_messages_${this.widgetKey}`); } catch { /* ignore */ }
     }
     this.preChatDone = false;
+    this.waitingForEmail = false;
 
     // 3. Reset in-memory state + unmount widget
     this.cleanup();
@@ -655,7 +659,7 @@ export class WidgetManager {
       openArticleRequest: this.openArticleRequest || undefined,
       onImageClick: (src: string, alt: string) => this.showImageLightbox(src, alt),
       onAnswerFeedback: (messageId: string, helpful: boolean) => this.handleAnswerFeedback(messageId, helpful),
-      queuedMessageCount: this.getVisiblePendingMessageCount(),
+      queuedMessageCount: this.waitingForEmail || this.requiresEmailForChat() ? 0 : this.getVisiblePendingMessageCount(),
       csatSubmitted: this.activeConversationId ? this.hasSubmittedCsat(this.activeConversationId) : false,
       onCsatSubmit: (rating: number, feedback?: string) => this.handleCsatSubmit(rating, feedback),
       onViewChange: (view: WidgetView) => {
@@ -907,6 +911,7 @@ export class WidgetManager {
   // ─── Message Handling ──────────────────────────────────────
 
   private resetActiveConversation(): void {
+    this.waitingForEmail = false;
     this.clearAIResponseStreams();
     this.activeConversationId = null;
     this.activeTeammate = undefined;
@@ -979,6 +984,7 @@ export class WidgetManager {
       lastMessage: raw.last_message,
       lastMessageAt: raw.updated_at || raw.created_at,
       unreadCount: raw.unread_count ?? 0,
+      csatRating: typeof raw.csat_rating === 'number' ? raw.csat_rating : undefined,
       activeTeammate: this.mapActiveTeammate({
         user_id: raw.opened_by_user_id,
         name: raw.opened_by_display_name,
@@ -1364,7 +1370,23 @@ export class WidgetManager {
     } catch { /* storage may be unavailable */ }
   }
 
+  private requiresEmailForChat(): boolean {
+    const features = this.widgetConfig?.features;
+    if (!features?.forceIdentify || this.currentEmail || this.config?.user?.email) return false;
+    const timing = features.emailCaptureTiming ?? (features.preChatForm ? 'before_handoff' : 'never');
+    if (timing === 'before_handoff') {
+      const conversation = this.conversations.find(item => item.id === this.activeConversationId);
+      if (['resolved', 'closed', 'spam'].includes(conversation?.status || '')) return false;
+      return conversation?.flowState
+        ? ['waiting_for_human', 'queued_for_human', 'after_hours_queue', 'assigned_to_human'].includes(conversation.flowState)
+        : conversation?.aiState === 'escalated';
+    }
+    return timing === 'after_ai_reply'
+      && this.messages.some(message => message.role === 'ai' && !message.isInternal && message.aiProgressState !== 'checking' && !message.isStreaming);
+  }
+
   private flushPendingOutgoingMessages(): void {
+    if (this.waitingForEmail || this.requiresEmailForChat()) return;
     if (this.wsConnection?.readyState !== WebSocket.OPEN || this.connectionStatus !== 'connected') return;
 
     let selectedConversationId: string | undefined;
@@ -1572,6 +1594,9 @@ export class WidgetManager {
   }
 
   private hasSubmittedCsat(conversationId: string): boolean {
+    if (this.conversations.some((conversation) => conversation.id === conversationId && conversation.csatRating !== undefined)) {
+      return true;
+    }
     const key = this.csatStorageKey(conversationId);
     if (!key) return false;
     try {
@@ -1581,27 +1606,45 @@ export class WidgetManager {
     }
   }
 
-  private handleCsatSubmit(rating: number, feedback?: string): void {
+  private async handleCsatSubmit(rating: number, feedback?: string): Promise<void> {
     const conversationId = this.activeConversationId;
     if (!conversationId || rating < 1 || rating > 5) return;
+    if (!this.sessionToken) throw new Error('Please reconnect to send feedback.');
+
+    const comment = feedback?.trim() || '';
+    let response: Response;
+    try {
+      response = await fetch(widgetURL(this.host, `/widget/conversations/${encodeURIComponent(conversationId)}/csat`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_token: this.sessionToken, rating, comment }),
+      });
+    } catch {
+      throw new Error('Could not send your feedback. Check your connection and try again.');
+    }
+    if (!response.ok) {
+      throw new Error(response.status === 409 ? 'This conversation can no longer be rated.' : 'Could not send your feedback. Please try again.');
+    }
 
     const key = this.csatStorageKey(conversationId);
     if (key) {
       try { localStorage.setItem(key, '1'); } catch { /* storage may be unavailable */ }
     }
+    this.conversations = this.conversations.map((conversation) =>
+      conversation.id === conversationId ? { ...conversation, csatRating: rating } : conversation);
 
     const track = (globalThis as any).helpin?.track;
     if (typeof track === 'function') {
       track('support_conversation_csat', {
         conversation_id: conversationId,
         rating,
-        feedback: feedback?.trim() || undefined,
+        feedback: comment || undefined,
         handled_by: this.messages.some((message) => message.role === 'agent') ? 'human' : 'ai',
       });
     }
   }
 
-  private async handleCaptureEmail(email: string): Promise<void> {
+  private async handleCaptureEmail(email: string, phone = ''): Promise<void> {
     if (!this.widgetKey || !this.anonymousId || !email) {
       throw new Error('Unable to save email without an active visitor.');
     }
@@ -1614,6 +1657,7 @@ export class WidgetManager {
         api_key: this.widgetKey,
         anonymous_id: this.anonymousId,
         email,
+        ...(phone ? { phone } : {}),
         source: 'widget_prechat',
       }),
     });
@@ -1623,6 +1667,8 @@ export class WidgetManager {
       throw new Error('Visitor session changed while saving email.');
     }
     this.currentEmail = email;
+    this.waitingForEmail = false;
+    this.flushPendingOutgoingMessages();
     persistIdentity(widgetKey, email, '');
     this.preChatDone = true;
     try { localStorage.setItem(`helpin_prechat_${this.widgetKey}`, '1'); } catch { /* storage may be unavailable */ }
@@ -1630,32 +1676,21 @@ export class WidgetManager {
     this.render();
   }
 
-  private handlePreChatSubmit(data: { phone: string; email: string }): void {
+  private async handlePreChatSubmit(data: { phone: string; email: string }): Promise<void> {
     if (data.email) {
-      this.triggerCallback('onUserEmailSupplied', data.email);
-      this.currentEmail = data.email;
-      // Persist identity so it survives page refresh
-      if (this.widgetKey) {
-        persistIdentity(this.widgetKey, data.email, '');
-      }
+      await this.handleCaptureEmail(data.email, data.phone);
+      const track = (globalThis as any).helpin?.track;
+      if (typeof track === 'function') track('lead', { email: data.email });
+      return;
     }
-
-    // Mark pre-chat as done so it doesn't reappear on reload.
+    // Optional capture may be skipped. Phone-only capture retains the existing WS path.
+    if (data.phone && this.wsConnection?.readyState === WebSocket.OPEN) {
+      this.wsSend('session:upgrade', { email: '', phone: data.phone, source: 'widget_prechat' });
+    }
     this.preChatDone = true;
     if (this.widgetKey) {
-      try { localStorage.setItem(`helpin_prechat_${this.widgetKey}`, '1'); } catch { /* ignore */ }
+      try { localStorage.setItem(`helpin_prechat_${this.widgetKey}`, '1'); } catch { /* storage may be unavailable */ }
     }
-
-    // Upgrade session via WS with source=prechat (even if email is empty — server handles skip)
-    if (this.wsConnection?.readyState === WebSocket.OPEN) {
-      this.wsSend('session:upgrade', { email: data.email || '', phone: data.phone || '', source: 'widget_prechat' });
-    }
-
-    // Fire lead tracking event to events pipeline (ClickHouse)
-    if (data.email && (globalThis as any).helpin?.track) {
-      (globalThis as any).helpin.track('lead', { email: data.email });
-    }
-
     this.render();
   }
 
@@ -1753,6 +1788,7 @@ export class WidgetManager {
   // ─── Conversation Switching ─────────────────────────────────
 
   private handleSelectConversation(conversationId: string): void {
+    this.waitingForEmail = false;
     this.clearAIResponseStreams();
     this.activeConversationId = conversationId;
     this.activeTeammate = this.conversations.find((conversation) => conversation.id === conversationId)?.activeTeammate;
@@ -2082,6 +2118,10 @@ export class WidgetManager {
       }
 
       case 'session:upgraded':
+        if (this.currentEmail || this.config?.user?.email) {
+          this.waitingForEmail = false;
+          this.flushPendingOutgoingMessages();
+        }
         this.render();
         break;
 
@@ -2203,8 +2243,15 @@ export class WidgetManager {
       case 'conversations:listed': {
         const convs = data.data?.conversations;
         if (Array.isArray(convs)) {
+          // Some server pushes omit ratings; keep one already known here.
+          const knownRatings = new Map(this.conversations
+            .filter((conversation) => conversation.csatRating !== undefined)
+            .map((conversation) => [conversation.id, conversation.csatRating]));
           this.conversations = convs.map((c: any) => {
-            const conversation = this.mapConversation(c);
+            const mapped = this.mapConversation(c);
+            const conversation = mapped.csatRating === undefined && knownRatings.has(mapped.id)
+              ? { ...mapped, csatRating: knownRatings.get(mapped.id) }
+              : mapped;
             if (conversation.aiState === 'escalated') {
               this.escalationRequestsInFlight.delete(conversation.id);
             }
@@ -2217,6 +2264,9 @@ export class WidgetManager {
           });
           if (this.activeConversationId) {
             this.activeTeammate = this.conversations.find((c) => c.id === this.activeConversationId)?.activeTeammate;
+          }
+          if (this.widgetConfig?.features.emailCaptureTiming === 'before_handoff') {
+            this.waitingForEmail = this.requiresEmailForChat();
           }
           this.syncUnreadCount();
           this.render();
@@ -2323,6 +2373,8 @@ export class WidgetManager {
         const newConfig = data.data;
         if (newConfig && typeof newConfig === 'object') {
           this.widgetConfig = normalizeWidgetConfig(newConfig);
+          this.waitingForEmail = this.requiresEmailForChat();
+          this.flushPendingOutgoingMessages();
           // Update localStorage cache with fresh config
           if (this.widgetKey) {
             cacheConfig(this.widgetKey, this.widgetConfig);
@@ -2333,6 +2385,18 @@ export class WidgetManager {
       }
 
       case 'connection:error':
+        if (data.data?.code === 'email_required') {
+          this.waitingForEmail = true;
+          // Refresh handoff state if the server enforced email before its state update reached us.
+          this.wsSend('conversations:list', {});
+          this.isAIThinking = false;
+          for (const pending of this.pendingOutgoingMessages) {
+            if (pending.conversationId === this.activeConversationId) pending.lastSentConnection = -1;
+          }
+          this.persistPendingOutgoingMessages();
+          this.render();
+          break;
+        }
         console.error('Widget server error:', data.data);
         break;
     }

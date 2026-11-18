@@ -55,7 +55,7 @@ func setupSupportMessageTestDB(t *testing.T) *gorm.DB {
 func setupSupportConversationMessageTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := setupSupportMessageTestDB(t)
-	if err := db.Exec(`CREATE TABLE support_conversations (
+	if err := db.Exec(`CREATE TABLE support_conversations (snoozed_until DATETIME, snoozed_by_user_id TEXT, 
             merged_into_id TEXT, merge_revision INTEGER NOT NULL DEFAULT 0,
             anonymized_at DATETIME,
 		id TEXT PRIMARY KEY,
@@ -131,7 +131,7 @@ func setupSupportConversationMessageTestDB(t *testing.T) *gorm.DB {
 	)`).Error; err != nil {
 		t.Fatalf("create support_conversation_user_states: %v", err)
 	}
-	if err := db.Exec(`CREATE TABLE support_mailboxes (
+	if err := db.Exec(`CREATE TABLE support_mailboxes (ai_replies_disabled BOOLEAN NOT NULL DEFAULT false,
 		id TEXT PRIMARY KEY,
 		workspace_id TEXT NOT NULL,
 		name TEXT,

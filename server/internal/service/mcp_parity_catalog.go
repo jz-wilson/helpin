@@ -16,6 +16,8 @@ func parityMCPCommandRequirements() map[string]MCPToolDefinition {
 	crmWrite := MCPToolDefinition{Toolset: MCPToolsetCRM, Scope: MCPScopeCRMWrite, Permission: authorization.PermCRMEdit, Module: model.ModuleCRM, Mutating: true}
 	supportRead := MCPToolDefinition{Toolset: MCPToolsetSupport, Scope: MCPScopeSupportRead, Permission: authorization.PermSupportRead, Module: model.ModuleSupport}
 	supportWrite := MCPToolDefinition{Toolset: MCPToolsetSupport, Scope: MCPScopeSupportWrite, Permission: authorization.PermSupportEdit, Module: model.ModuleSupport, Mutating: true}
+	supportAdmin := MCPToolDefinition{Toolset: MCPToolsetSupport, Scope: MCPScopeSupportWrite, Permission: authorization.PermSupportAdmin, Module: model.ModuleSupport, Mutating: true}
+	supportReply := MCPToolDefinition{Toolset: MCPToolsetSupport, Scope: MCPScopeSupportReply, Permission: authorization.PermSupportEdit, Module: model.ModuleSupport, Mutating: true}
 	contextRead := MCPToolDefinition{Toolset: MCPToolsetContext, Scope: MCPScopeContextRead, Permission: authorization.PermWorkspaceMembersRead}
 
 	return map[string]MCPToolDefinition{
@@ -41,8 +43,8 @@ func parityMCPCommandRequirements() map[string]MCPToolDefinition {
 		"list_workspace_members": contextRead,
 
 		// CRM.
-		"get_crm_company":             crmRead,
 		"list_crm_companies":          crmRead,
+		"describe_crm_fields":         crmRead,
 		"list_crm_pipelines":          crmRead,
 		"list_crm_associations":       crmRead,
 		"add_crm_activity":            crmWrite,
@@ -53,9 +55,13 @@ func parityMCPCommandRequirements() map[string]MCPToolDefinition {
 		"unlink_crm_association":      crmWrite,
 		"set_primary_contact_company": crmWrite,
 
-		// Support: organize conversations. Replies are never sent through MCP.
+		// Support: organize conversations. Customer-visible sends need the
+		// separate helpin.support.reply scope.
 		"list_support_inboxes":                supportRead,
 		"list_support_tags":                   supportRead,
+		"list_support_sla_tiers":              supportRead,
+		"list_support_request_types":          supportRead,
+		"set_company_sla_tier":                supportAdmin,
 		"list_support_assignees":              supportRead,
 		"assign_support_conversation":         supportWrite,
 		"move_support_conversation":           supportWrite,
@@ -64,5 +70,13 @@ func parityMCPCommandRequirements() map[string]MCPToolDefinition {
 		"link_support_conversation_task":      supportWrite,
 		"link_support_conversation_contact":   supportWrite,
 		"update_support_conversation_subject": supportWrite,
+		"set_support_conversation_status":     supportWrite,
+		"set_support_conversation_priority":   supportWrite,
+		"set_support_conversation_fields":     supportWrite,
+		"snooze_support_conversation":         supportWrite,
+		"unsnooze_support_conversation":       supportWrite,
+		"add_support_conversation_note":       supportWrite,
+		"reply_to_support_conversation":       supportReply,
+		"create_support_conversation":         supportReply,
 	}
 }

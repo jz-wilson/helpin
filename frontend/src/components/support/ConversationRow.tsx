@@ -1,5 +1,7 @@
 import { memo, useState, type KeyboardEvent } from 'react';
-import { ArrowTurnBackwardIcon, BotIcon, CheckmarkCircle02Icon, Mail01Icon, Message01Icon, MoreHorizontalIcon, StickyNote01Icon } from '@/lib/icons';
+import { ConversationPriorityBadge, ConversationRowOperations } from './ConversationRowOperations';
+import { ArrowTurnBackwardIcon, BotIcon, CheckmarkCircle02Icon, MoreHorizontalIcon, StickyNote01Icon } from '@/lib/icons';
+import { supportChannel } from '@/lib/supportChannels';
 import type { TicketSource } from '@/lib/pm-types/support';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useSupportInboxStore } from '@/stores/supportInboxStore';
@@ -33,18 +35,9 @@ export type { ConversationRowVisualState } from './conversationRowVisual';
 
 const EMPTY_ARRAY: string[] = [];
 
-type ChannelMeta = { icon: typeof Message01Icon; label: string };
-
-const CHANNEL_META: Record<TicketSource, ChannelMeta | null> = {
-  widget: { icon: Message01Icon, label: 'Live chat' },
-  email: { icon: Mail01Icon, label: 'Email' },
-  api: null,
-  internal: null,
-};
-
 const ChannelIcon = memo(function ChannelIcon({ source }: { source?: TicketSource | null }) {
   if (!source) return null;
-  const meta = CHANNEL_META[source];
+  const meta = supportChannel(source)?.inbox;
   if (!meta) return null;
   const Icon = meta.icon;
   return (
@@ -187,6 +180,8 @@ interface ConversationRowProps {
   isBulkSelected?: boolean;
   selectionActive?: boolean;
   selectionDisabled?: boolean;
+  /** Name of the conversation's request type, shown muted. */
+  requestTypeName?: string;
 }
 
 const AIHandoffIndicator = memo(function AIHandoffIndicator() {
@@ -316,6 +311,7 @@ export const ConversationRow = memo(function ConversationRow({
   isBulkSelected = false,
   selectionActive = false,
   selectionDisabled = false,
+  requestTypeName,
 }: ConversationRowProps) {
   const isSelected = useSupportInboxStore((s) => s.selectedConversationId === conversation.id);
   const visitorLabel = conversation.anonymous_id ? `Visitor #${conversation.anonymous_id.slice(0, 6)}` : 'Anonymous';
@@ -407,25 +403,16 @@ export const ConversationRow = memo(function ConversationRow({
       data-transitioning-out={isTransitioningOut ? 'true' : undefined}
       data-conversation-id={conversation.id}
       data-bulk-selected={isBulkSelected ? 'true' : undefined}
-      className={`group relative w-full cursor-pointer px-3 py-2.5 text-left transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${isBulkSelected ? 'hover:bg-primary/8 dark:hover:bg-primary/10' : 'hover:bg-muted/75 dark:hover:bg-muted/40'} ${
+      className={`group relative w-full cursor-pointer px-3 py-2.5 text-left transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${isBulkSelected ? 'hover:bg-primary/8 dark:hover:bg-primary/10' : isSelected ? '' : 'hover:bg-quiet-row-hover dark:hover:bg-muted/40'} ${
         isTransitioningOut
           ? 'pointer-events-none bg-emerald-50/70 opacity-60 dark:bg-emerald-950/20'
           : isBulkSelected
           ? 'bg-primary/5 dark:bg-primary/8'
           : isSelected
-          ? 'bg-muted/80 dark:bg-muted/45'
+          ? 'bg-quiet-row-selected'
           : ''
       }`}
     >
-      {/* Active indicator bar (Crisp-style ::before) */}
-      <span
-        className={`absolute left-0 top-1/2 -translate-y-1/2 w-[3px] rounded-r-full transition-all duration-200 ${
-          isSelected
-            ? 'h-11 bg-primary/90'
-            : 'h-0 bg-transparent'
-        }`}
-      />
-
       {/* Inset bottom separator (Crisp-style ::after) */}
       <span className="absolute bottom-0 left-4 right-4 h-px bg-border/60 group-last:hidden" />
 
@@ -459,6 +446,7 @@ export const ConversationRow = memo(function ConversationRow({
               />
             </div>
           )}
+          <ConversationPriorityBadge priority={conversation.priority} />
         </div>
 
         {/* Content */}
@@ -596,6 +584,7 @@ export const ConversationRow = memo(function ConversationRow({
               <HumanQueueBadge waitSince={humanQueueWaitSince} />
             </div>
           ) : null}
+          <ConversationRowOperations conversation={conversation} requestTypeName={requestTypeName} />
           <UserTagStrip tags={userTags} />
         </div>
       </div>

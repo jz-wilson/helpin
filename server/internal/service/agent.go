@@ -80,6 +80,8 @@ func defaultSystemAgentNameForPresetKey(presetKey string) string {
 		return "Sub-agent"
 	case model.AgentPresetAskAgent:
 		return "Ask Agent"
+	case model.AgentPresetHelpAssistant:
+		return "Help assistant"
 	default:
 		return "Agent"
 	}
@@ -278,7 +280,16 @@ func runtimeAgentFromHelpinAgent(agent *model.Agent, appID string) AgentRuntimeA
 	}
 	// Managed support capabilities must also reach existing preset copies.
 	if normalizePresetKey(agent.EffectivePresetKey()) == model.AgentPresetSupportAgent {
-		out.AllowedTools = appendPresetTools(out.AllowedTools, []string{"skip_support_reply", "add_support_conversation_note"})
+		out.AllowedTools = appendPresetTools(out.AllowedTools, []string{"skip_support_reply", "send_support_progress", "add_support_conversation_note"})
+	}
+	// The help assistant's surface is fixed: stale rows get the current tools
+	// and never more.
+	if normalizePresetKey(agent.EffectivePresetKey()) == model.AgentPresetHelpAssistant {
+		out.AllowedTools = slices.Clone(agentcontract.HelpAssistantTools)
+		out.AllowedTargets = []string{model.HelpAssistantTurnTarget}
+	}
+	if normalizePresetKey(agent.EffectivePresetKey()) == model.AgentPresetCommandAgent && !slices.Contains(out.AllowedTargets, supportInvestigationTarget) {
+		out.AllowedTargets = append(out.AllowedTargets, supportInvestigationTarget)
 	}
 	// Preview uses an isolated host target, while retaining the saved agent prompt.
 	if slices.Contains(out.AllowedTargets, "support_conversation") && !slices.Contains(out.AllowedTargets, supportPreviewTarget) {
@@ -562,6 +573,17 @@ func buildRuntimeStartRunRequest(run *model.AgentRun, agent *model.Agent, runtim
 		return AgentRuntimeStartRunRequest{}, err
 	}
 
+	if isSupportInvestigationRun(run) {
+		ceiling := supportInvestigationTools()
+		if len(allowedTools) == 0 {
+			return AgentRuntimeStartRunRequest{}, fmt.Errorf("background investigation requires explicit read-only tools")
+		}
+		for _, name := range allowedTools {
+			if !slices.Contains(ceiling, name) {
+				return AgentRuntimeStartRunRequest{}, fmt.Errorf("unsafe background investigation tool %s", name)
+			}
+		}
+	}
 	instructions := strings.TrimSpace(input.AdditionalContext)
 	if agentRunIsPreview(run) {
 		metadata["delivery_mode"] = "preview"
@@ -594,6 +616,24 @@ func buildRuntimeStartRunRequest(run *model.AgentRun, agent *model.Agent, runtim
 		instructions += "\nThis is an isolated support preview. Use the supplied conversation snapshot as the customer context. Use search_knowledge and finish with send_support_reply, escalate_to_human or skip_support_reply; the host captures the outcome without contacting a customer. Other tools are unavailable in preview. After the outcome, end your turn."
 	}
 
+	executionMode := agentRuntimeExecutionModeDurable
+	if run.TargetType == model.HelpAssistantTurnTarget {
+		if len(allowedTools) == 0 {
+			allowedTools = append([]string(nil), runtimeAgent.AllowedTools...)
+		}
+		for _, name := range allowedTools {
+			if !slices.Contains(agentcontract.HelpAssistantTools, name) {
+				return AgentRuntimeStartRunRequest{}, fmt.Errorf("unsafe help assistant tool %s", name)
+			}
+		}
+		for _, name := range agentcontract.HelpAssistantFinishTools {
+			if !slices.Contains(allowedTools, name) {
+				return AgentRuntimeStartRunRequest{}, fmt.Errorf("help assistant requires tool %s", name)
+			}
+		}
+		executionMode = agentRuntimeExecutionModeLightweight
+	}
+
 	if err := validateScheduledSupportFollowUpTools(run, allowedTools); err != nil {
 		return AgentRuntimeStartRunRequest{}, err
 	}
@@ -605,7 +645,7 @@ func buildRuntimeStartRunRequest(run *model.AgentRun, agent *model.Agent, runtim
 		AllowedTools:    allowedTools,
 		ExternalActorID: strings.TrimSpace(derefString(run.TriggeredByUserID)),
 		Mode:            mode,
-		ExecutionMode:   agentRuntimeExecutionModeDurable,
+		ExecutionMode:   executionMode,
 		Trigger:         trigger,
 		Metadata:        metadata,
 		TurnPolicy:      runtimeTurnPolicy(run, agent, mode, 0),
@@ -796,6 +836,10 @@ type AgentService struct {
 	workspacePresetVersionRepo *repository.WorkspaceAgentPresetVersionRepository
 	runRepo                    *repository.AgentRunRepository
 	commandBarPlanRepo         *repository.CommandBarPlanRepository
+	// commandBarRunGroupRepo and commandBarRunGroupsEnabled put new pipeline
+	// and DAG plans on Agent Runtime run groups (command_bar_run_groups.go).
+	commandBarRunGroupRepo     *repository.CommandBarPlanRunGroupRepository
+	commandBarRunGroupsEnabled bool
 	triggerExecutionRepo       *repository.AgentTriggerExecutionRepository
 	runMessageRepo             *repository.AgentRunMessageRepository
 	artifactRepo               *repository.AgentRunArtifactRepository
@@ -4075,6 +4119,16 @@ func (s *AgentService) ListDockRunsForActor(
 		response.NextCursor = &next
 	}
 	runs = append(runs, settled...)
+	summaries, err := s.summarizeDockRuns(ctx, workspaceID, runs)
+	if err != nil {
+		return nil, err
+	}
+	summaries.NextCursor = response.NextCursor
+	return summaries, nil
+}
+
+func (s *AgentService) summarizeDockRuns(ctx context.Context, workspaceID string, runs []model.AgentRun) (*model.DockRunListResponse, error) {
+	response := &model.DockRunListResponse{}
 	normalized := s.normalizeDockRunCollection(s.reconcileStuckRuns(ctx, runs))
 	s.enrichRunTargets(ctx, workspaceID, normalized)
 
@@ -6673,7 +6727,7 @@ func (s *AgentService) createRun(ctx context.Context, params createRunParams) (*
 	}
 
 	runtimeAgent = runtimeAgentForDockExecution(run, runtimeAgent)
-	if params.targetType != supportPreviewTarget {
+	if params.targetType != supportPreviewTarget && !isSupportInvestigationRun(run) {
 		runtimeAgent, err = s.projectEnabledExternalMCPTools(ctx, params.workspaceID, runtimeAgent)
 		if err != nil {
 			s.failRunStart(ctx, run, params.agent, params.workspaceID, err)
@@ -6707,6 +6761,11 @@ func (s *AgentService) createRun(ctx context.Context, params createRunParams) (*
 		s.failRunStart(ctx, run, params.agent, params.workspaceID, err)
 		return nil, err
 	}
+	// A command-bar plan step joins its plan's run group (top-level field;
+	// metadata.parent_run_id keeps its existing meaning).
+	if groupID := commandBarRunGroupFromContext(ctx); groupID != "" {
+		startReq.GroupID = groupID
+	}
 	startReq.Model = selectedModel
 	startReq.ModelCredential = credential
 	if auditActorID := s.auditActorIDForRun(ctx, run); auditActorID != "" {
@@ -6720,7 +6779,7 @@ func (s *AgentService) createRun(ctx context.Context, params createRunParams) (*
 			selectedExternalTools = append(selectedExternalTools, tool)
 		}
 	}
-	if params.targetType == supportPreviewTarget {
+	if params.targetType == supportPreviewTarget || isSupportInvestigationRun(run) {
 		selectedExternalTools = nil
 	}
 	if len(selectedExternalTools) > 0 {

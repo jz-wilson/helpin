@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useAuthStore } from '@/stores/authStore'
+import { useTaskPanelStore } from '@/stores/taskPanelStore'
 import { api } from '@/lib/api'
 import { supportService } from '@/lib/services/supportService'
 import type { SupportMessage } from '@/lib/pmTypes'
@@ -153,6 +154,25 @@ describe('MessageBubble', () => {
     } finally { rendered.cleanup(); }
   });
 
+  it('closes the AI sources list on an outside click', async () => {
+    const rendered = renderBubble({
+      id: 'sourced', workspace_id: 'ws', conversation_id: 'conv', sender_type: 'ai',
+      message_type: 'reply', is_internal: false, content: 'Here is the answer.',
+      metadata: JSON.stringify({ ai_auto_reply: true, ai_sources: [{ docId: 'doc-1', title: 'Refund policy', url: 'https://help.example.com/refunds' }] }),
+      created_at: '2026-09-24T10:00:00Z', updated_at: '2026-09-24T10:00:00Z',
+    });
+    try {
+      const trigger = [...rendered.container.querySelectorAll('button')].find((button) => button.textContent === '1 source')!;
+      await act(async () => { trigger.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(document.body.textContent).toContain('Refund policy');
+      expect(trigger.getAttribute('aria-expanded')).toBe('true');
+
+      await act(async () => { document.body.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true })); });
+      expect(document.body.textContent).not.toContain('Refund policy');
+      expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    } finally { rendered.cleanup(); }
+  });
+
   it.each(['queued', 'preparing', 'sending', 'translating'] as const)('keeps %s delivery status below the bubble', (pending) => {
     const rendered = renderBubble({ id: 'sending', workspace_id: 'ws', conversation_id: 'conv', sender_type: 'user', message_type: 'reply', is_internal: false, content: 'Hello', pending_send: pending, created_at: '2026-09-24T10:00:00Z', updated_at: '2026-09-24T10:00:00Z' });
     try {
@@ -279,6 +299,172 @@ describe('MessageBubble', () => {
     } finally { rendered.cleanup() }
   })
 
+  function handoffCardMessage(card: Record<string, unknown>): SupportMessage {
+    return {
+      id: 'handoff-card', workspace_id: 'ws', conversation_id: 'conv', sender_type: 'agent',
+      sender_display_name: 'AI control', message_type: 'note', is_internal: true,
+      content: 'AI handoff\n\nReason\nplain-text copy',
+      metadata: JSON.stringify({ ai_handoff_brief: true, agent_authored: true, handoff: card }),
+      created_at: '2026-10-25T10:32:14Z', updated_at: '2026-10-25T10:32:14Z',
+    }
+  }
+
+  it('shows the structured AI handoff open, each fact once', () => {
+    const rendered = renderBubble(handoffCardMessage({
+      issue: 'Wants a refund after paying yearly.',
+      reason: "Refunds need a teammate's decision.",
+      checked: [{ source: 'Help articles', finding: 'Full refund within 14 days.' }, { source: 'Billing' }],
+      unavailable_data: ['Payment history'],
+    }))
+    try {
+      const card = rendered.container.querySelector('[data-support-ai-handoff]')
+      expect(card?.querySelector('details')).toBeNull()
+      expect(card?.textContent).toContain('Wants a refund after paying yearly.')
+      expect(card?.textContent).toContain("Refunds need a teammate's decision.")
+      expect(card?.textContent).toContain('Help articles: Full refund within 14 days.')
+      expect(card?.textContent).toContain("Couldn't checkPayment history")
+      expect(card?.textContent).not.toContain('plain-text copy')
+      expect(card?.textContent).not.toContain('Next steps')
+    } finally { rendered.cleanup() }
+  })
+
+  it('says AI checked nothing only when the server confirmed it', () => {
+    const confirmed = renderBubble(handoffCardMessage({ reason: 'The customer asked to talk to a person.', nothing_checked: true }))
+    const unknown = renderBubble(handoffCardMessage({ reason: 'The AI service was unavailable, so AI didn\'t reply.' }))
+    try {
+      expect(confirmed.container.textContent).toContain('AI checkedNothing.')
+      expect(unknown.container.textContent).not.toContain('AI checked')
+    } finally {
+      confirmed.cleanup()
+      unknown.cleanup()
+    }
+  })
+
+  it('puts the held reply in the composer and asks Ask Agent to update docs', async () => {
+    const { useSupportInboxStore } = await import('@/stores/supportInboxStore')
+    const restored = vi.fn()
+    const listener = (event: Event) => restored((event as CustomEvent).detail)
+    window.addEventListener('support:restore-draft', listener)
+    const rendered = renderBubble(handoffCardMessage({
+      reason: "AI's answer didn't pass its source check, so it wasn't sent.",
+      held_reply: 'Hi Sam,\n\nStarter does not include API access.',
+      help_article_gap: 'Whether Starter includes API access',
+    }))
+    try {
+      act(() => { findButtonByText(rendered.container, 'Use this reply')?.click() })
+      expect(restored).toHaveBeenCalledWith({ conversationId: 'conv', markdown: 'Hi Sam,\n\nStarter does not include API access.' })
+      act(() => { findButtonByText(rendered.container, 'Ask Agent to update docs')?.click() })
+      const state = useSupportInboxStore.getState()
+      expect(state.detailSidebarMode).toBe('agents')
+      expect(state.agentDraft?.conversationId).toBe('conv')
+      expect(state.agentDraft?.text).toContain('Whether Starter includes API access')
+    } finally {
+      window.removeEventListener('support:restore-draft', listener)
+      useSupportInboxStore.setState({ detailSidebarMode: 'details', agentDraft: null })
+      rendered.cleanup()
+    }
+  })
+
+  function codeCheckMessage(check: Record<string, unknown>): SupportMessage {
+    return {
+      id: 'code-check', workspace_id: 'ws', conversation_id: 'conv', sender_type: 'agent',
+      sender_display_name: 'Code check', message_type: 'note', is_internal: true,
+      content: 'Code check\n\nplain-text copy',
+      metadata: JSON.stringify({ investigation_id: 'code-check', code_check: check }),
+      created_at: '2026-10-25T10:33:00Z', updated_at: '2026-10-25T10:43:00Z',
+    }
+  }
+
+  it('shows a running code check card with what it is checking', () => {
+    const rendered = renderBubble(codeCheckMessage({ status: 'running', focus: 'How approving a post sets its publishing time' }))
+    try {
+      const card = rendered.container.querySelector('[data-support-code-check]')
+      expect(card?.textContent).toContain('Checking the code: How approving a post sets its publishing time')
+      expect(card?.textContent).toContain('Details will appear here when done.')
+      expect(card?.querySelector('button')).toBeNull()
+      expect(card?.textContent).not.toContain('plain-text copy')
+    } finally { rendered.cleanup() }
+  })
+
+  it('shows only the reason when a code check fails', () => {
+    const rendered = renderBubble(codeCheckMessage({ status: 'failed', message: "The code check didn't finish, so it has no findings." }))
+    try {
+      const card = rendered.container.querySelector('[data-support-code-check]')
+      expect(card?.textContent).toContain("The code check didn't finish, so it has no findings.")
+      expect(card?.textContent).not.toContain('Next steps')
+    } finally { rendered.cleanup() }
+  })
+
+  it('turns code check findings into next steps', async () => {
+    const { useSupportInboxStore } = await import('@/stores/supportInboxStore')
+    const link = vi.spyOn(supportService, 'linkConversationTask').mockResolvedValue({ data: {}, error: null, status: 200 } as never)
+    const created = vi.fn()
+    const restored = vi.fn()
+    const onCreate = (event: Event) => created((event as CustomEvent).detail)
+    const onRestore = (event: Event) => restored((event as CustomEvent).detail)
+    window.addEventListener('support:create-task', onCreate)
+    window.addEventListener('support:restore-draft', onRestore)
+    const existing = renderBubble(codeCheckMessage({
+      status: 'done',
+      found: 'Most likely: drafts are not scheduled on approval.',
+      reply: 'Hi Jonas,\n\nOpen the post and click Schedule.',
+      task: { kind: 'existing', key: 'APP-4240', id: 'task-4240', text: 'keep the chosen time' },
+      investigate: "Whether last week's release changed approvals.",
+      unavailable_data: ['Server error logs'],
+      engineering: '`ApprovalBuilder.php:233` skips drafts.',
+    }))
+    const proposed = renderBubble(codeCheckMessage({ status: 'done', found: 'No cause found.', task: { kind: 'new', text: 'CSV import stops after 1,000 rows' } }))
+    try {
+      const card = existing.container.querySelector('[data-support-code-check]')
+      expect(card?.textContent).toContain('What AI found')
+      expect(card?.textContent).toContain("Couldn't checkServer error logs")
+      expect(card?.textContent).toContain('Already covered by APP-4240: keep the chosen time')
+      expect(card?.querySelector('details summary')?.textContent).toBe('Engineering details')
+      act(() => { findButtonByText(existing.container, 'Use this reply')?.click() })
+      expect(restored).toHaveBeenCalledWith({ conversationId: 'conv', markdown: 'Hi Jonas,\n\nOpen the post and click Schedule.' })
+      await act(async () => { findButtonByText(existing.container, 'Link APP-4240')?.click() })
+      expect(link).toHaveBeenCalledWith('ws', 'conv', { task_id: 'task-4240' })
+      act(() => { findButtonByText(existing.container, 'Ask Agent')?.click() })
+      expect(useSupportInboxStore.getState().agentDraft?.text).toContain("Whether last week's release changed approvals.")
+      act(() => { findButtonByText(proposed.container, 'Create task')?.click() })
+      expect(created).toHaveBeenCalledWith({ conversationId: 'conv' })
+    } finally {
+      link.mockRestore()
+      window.removeEventListener('support:create-task', onCreate)
+      window.removeEventListener('support:restore-draft', onRestore)
+      useSupportInboxStore.setState({ detailSidebarMode: 'details', agentDraft: null })
+      existing.cleanup()
+      proposed.cleanup()
+    }
+  })
+
+  it('shows a linked task instead of the link action', () => {
+    const rendered = renderBubble(codeCheckMessage({ status: 'done', found: 'x', task: { kind: 'existing', key: 'APP-4240', id: 'task-4240', text: 'y' } }), undefined, { linkedTaskId: 'task-4240' })
+    try {
+      expect(rendered.container.textContent).toContain('Linked to this conversation')
+      expect(findButtonByText(rendered.container, 'Link APP-4240')).toBeNull()
+    } finally { rendered.cleanup() }
+  })
+
+  it('folds an older AI card to one line', () => {
+    const rendered = renderBubble(handoffCardMessage({ issue: 'Wants a refund.', reason: 'Refunds need a teammate.' }), undefined, { folded: true })
+    try {
+      const details = rendered.container.querySelector('[data-support-ai-handoff] details')
+      expect(details).not.toBeNull()
+      expect(details?.open).toBe(false)
+      expect(details?.querySelector('summary')?.textContent).toContain('Wants a refund.')
+    } finally { rendered.cleanup() }
+  })
+
+  it('hides handoff actions in read-only views', () => {
+    const rendered = renderBubble(handoffCardMessage({ reason: 'x', held_reply: 'Hi', help_article_gap: 'Exports' }), undefined, { readOnly: true })
+    try {
+      expect(rendered.container.textContent).toContain('Next steps')
+      expect(findButtonByText(rendered.container, 'Use this reply')).toBeNull()
+      expect(findButtonByText(rendered.container, 'Ask Agent to update docs')).toBeNull()
+    } finally { rendered.cleanup() }
+  })
+
   it.each([true, false])('shows saved visitor feedback below the AI bubble (%s)', async (helpful) => {
     const message: SupportMessage = {
       id: 'feedback-answer', workspace_id: 'ws-1', conversation_id: 'conv-1',
@@ -294,6 +480,7 @@ describe('MessageBubble', () => {
       const badge = row?.querySelector('[role="img"]')
       expect(badge?.getAttribute('aria-label')).toBe(label)
       expect(frame?.contains(row)).toBe(false)
+      expect(rendered.container.querySelector('[data-slot="support-message-bubble"]')?.contains(row)).toBe(true)
       expect(row?.className).toContain('justify-start')
       await act(async () => { badge!.dispatchEvent(new FocusEvent('focusin', { bubbles: true })) })
       expect(document.querySelector('[role="tooltip"]')?.textContent).toBe(label)
@@ -303,6 +490,7 @@ describe('MessageBubble', () => {
   it.each([
     { sender: 'customer', via: 'email', source: 'widget', expected: 'via Email' },
     { sender: 'customer', via: 'widget', source: 'email', expected: 'via Chat' },
+    { sender: 'customer', via: 'portal', source: 'portal', expected: 'via Portal' },
     { sender: 'user', via: 'email', source: 'widget', expected: 'via Email' },
     { sender: 'user', via: 'email', source: 'widget', mode: 'chat_and_email', expected: 'via Chat + email' },
     { sender: 'user', via: 'email', source: 'email', internal: true, expected: null },
@@ -575,6 +763,73 @@ describe('MessageBubble', () => {
     rendered.forEach((entry) => entry.cleanup())
   })
 
+  it('strikes through removed tags and Cc addresses but not added ones', () => {
+    const base = {
+      workspace_id: 'ws-1',
+      conversation_id: 'conv-1',
+      sender_type: 'user',
+      sender_display_name: 'Sarah Khan',
+      message_type: 'system',
+      is_internal: true,
+      created_at: '2026-06-12T09:00:00.000Z',
+      updated_at: '2026-06-12T09:00:00.000Z',
+    } as const
+    const tagAdded = renderBubble({ ...base, id: 'msg-tag-added', content: 'Sarah added tag Billing.', system_event_type: 'tag_added' })
+    const tagRemoved = renderBubble({ ...base, id: 'msg-tag-removed', content: 'Sarah removed tag Billing.', system_event_type: 'tag_removed' })
+    const recipients = renderBubble({
+      ...base,
+      id: 'msg-cc',
+      content: 'Sarah added new@example.com to Cc. Sarah removed old@example.com from Cc.',
+      system_event_type: 'email_recipients_updated',
+    })
+
+    expect(tagAdded.container.querySelector('strong')?.className).not.toContain('line-through')
+    const removedTag = tagRemoved.container.querySelector('strong')
+    expect(removedTag?.textContent).toBe('Billing')
+    expect(removedTag?.className).toContain('line-through')
+    const [added, removed] = recipients.container.querySelectorAll('strong')
+    expect(added?.textContent).toBe('new@example.com')
+    expect(added?.className).not.toContain('line-through')
+    expect(removed?.textContent).toBe('old@example.com')
+    expect(removed?.className).toContain('line-through')
+    ;[tagAdded, tagRemoved, recipients].forEach((entry) => entry.cleanup())
+  })
+
+  it('links linked and unlinked task events to their own task and names the agent', () => {
+    const base = {
+      workspace_id: 'ws-1',
+      conversation_id: 'conv-1',
+      sender_type: 'user',
+      sender_display_name: 'Sarah Khan',
+      message_type: 'system',
+      is_internal: true,
+      created_at: '2026-06-12T09:00:00.000Z',
+      updated_at: '2026-06-12T09:00:00.000Z',
+    } as const
+    const linked = renderBubble({
+      ...base,
+      id: 'msg-task-linked',
+      content: 'Sarah linked task #ENG-124: Retry failed webhooks.',
+      system_event_type: 'task_linked',
+      metadata: JSON.stringify({ task_id: 'task-124', via_agent: 'Ask Agent' }),
+    }, undefined, { workspaceSlug: 'acme', linkedTaskId: 'task-123' })
+    const unlinked = renderBubble({
+      ...base,
+      id: 'msg-task-unlinked',
+      content: 'Sarah unlinked task #ENG-125: Old billing bug.',
+      system_event_type: 'task_unlinked',
+      metadata: JSON.stringify({ task_id: 'task-125' }),
+    }, undefined, { workspaceSlug: 'acme', linkedTaskId: 'task-123' })
+
+    expect(linked.container.querySelector('a')?.getAttribute('href')).toBe('/w/acme/pm/tasks/task-124')
+    expect(linked.container.querySelector('[data-task-created-title]')?.textContent).toBe('Retry failed webhooks')
+    expect(linked.container.querySelector('[data-task-via-agent]')?.textContent).toBe('via Ask Agent')
+    expect(unlinked.container.querySelector('a')?.getAttribute('href')).toBe('/w/acme/pm/tasks/task-125')
+    expect(unlinked.container.querySelector('[data-task-via-agent]')).toBeNull()
+    linked.cleanup()
+    unlinked.cleanup()
+  })
+
   it('uses canonical copy for historical AI escalation system events', () => {
     const message: SupportMessage = {
       id: 'msg-ai-escalated-legacy',
@@ -656,7 +911,7 @@ describe('MessageBubble', () => {
     queryClient.clear()
   })
 
-  it('identifies HTTP links and previews without blocking navigation', () => {
+  it('preserves HTTP destinations without showing a warning for the protocol alone', () => {
     const message: SupportMessage = {
       id: 'msg-http', workspace_id: 'ws-1', conversation_id: 'conv-1', sender_type: 'customer',
       content: 'Open [the page](http://example.com/path)', message_type: 'reply', is_internal: false,
@@ -665,27 +920,40 @@ describe('MessageBubble', () => {
     }
     const rendered = renderBubble(message)
 
-    expect(rendered.container.querySelector('[aria-label="HTTP link"]')).toBeTruthy()
-    expect(rendered.container.textContent).toContain('HTTP link')
-    expect(rendered.container.querySelector('a[href="http://example.com/path"]')?.getAttribute('rel')).toBe('noopener noreferrer')
-    rendered.cleanup()
+    try {
+      expect(rendered.container.querySelector('[aria-label="HTTP link"]')).toBeNull()
+      expect(rendered.container.textContent).not.toContain('HTTP link')
+      expect(rendered.container.querySelector('[aria-label="Potentially harmful"]')).toBeNull()
+      const links = rendered.container.querySelectorAll('a[href="http://example.com/path"]')
+      expect(links).toHaveLength(2)
+      for (const link of links) {
+        expect(link.getAttribute('title')).toBe('http://example.com/path')
+        expect(link.getAttribute('rel')).toBe('noopener noreferrer')
+      }
+    } finally {
+      rendered.cleanup()
+    }
   })
 
-  it('intercepts confirmed malicious links until risk is acknowledged', () => {
+  it.each(['http', 'https'])('intercepts confirmed malicious %s links until risk is acknowledged', (protocol) => {
     const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    const href = `${protocol}://bad.example/invoice`
     const message: SupportMessage = {
       id: 'msg-malicious', workspace_id: 'ws-1', conversation_id: 'conv-1', sender_type: 'customer',
-      content: 'Open [the invoice](https://bad.example/invoice)', message_type: 'reply', is_internal: false,
+      content: `Open [the invoice](${href})`, message_type: 'reply', is_internal: false,
       metadata: JSON.stringify({
+        link_previews: [{ url: href, host: 'bad.example', title: 'Invoice' }],
         link_security: [{
-          url: 'https://bad.example/invoice', status: 'malicious', threat_types: ['SOCIAL_ENGINEERING'],
+          url: href, status: 'malicious', threat_types: ['SOCIAL_ENGINEERING'],
           checked_at: '2026-08-18T12:00:00Z', expires_at: '2099-08-18T12:30:00Z',
         }],
       }),
       created_at: '2026-08-18T12:00:00Z', updated_at: '2026-08-18T12:00:00Z',
     }
     const rendered = renderBubble(message)
-    const link = rendered.container.querySelector('a[href="https://bad.example/invoice"]') as HTMLAnchorElement
+    const link = rendered.container.querySelector(`a[href="${href}"]`) as HTMLAnchorElement
+    expect(link.querySelector('[aria-label="Potentially harmful"]')).not.toBeNull()
+    expect(rendered.container.querySelectorAll(`a[href="${href}"]`)[1].textContent).toContain('Potentially harmful')
 
     act(() => link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })))
     expect(document.body.textContent).toContain('Potentially harmful link')
@@ -697,7 +965,7 @@ describe('MessageBubble', () => {
     act(() => checkbox.click())
     expect(continueButton.disabled).toBe(false)
     act(() => continueButton.click())
-    expect(open).toHaveBeenCalledWith('https://bad.example/invoice', '_blank', 'noopener,noreferrer')
+    expect(open).toHaveBeenCalledWith(href, '_blank', 'noopener,noreferrer')
 
     open.mockRestore()
     rendered.cleanup()
@@ -736,7 +1004,7 @@ describe('MessageBubble', () => {
 
     const bubble = container.querySelector('[data-slot="support-message-bubble"]')
     expect(bubble?.className).toContain('w-[min(92%,64rem)]')
-    expect(bubble?.className).toContain('max-w-[calc(100%-2.25rem)]')
+    expect(bubble?.className).toContain('max-w-[calc(100%-4.5rem)]')
 
     const iframe = container.querySelector('iframe[title="Email body"]') as HTMLIFrameElement | null
     expect(iframe).toBeTruthy()
@@ -1228,7 +1496,7 @@ Can I export my data?`,
       expect(deliveryLabel(rendered.container)).toContain('Email sent')
       expect(rendered.container.textContent).toContain('87% confident')
       act(() => findButtonByText(rendered.container, '1 source')?.click())
-      expect(rendered.container.textContent).toContain('Help article')
+      expect(document.body.textContent).toContain('Help article')
     } finally { rendered.cleanup() }
   })
 
@@ -1251,6 +1519,42 @@ Can I export my data?`,
       await act(async () => findButtonByText(rendered.container, 'Send original')?.click())
       expect(post).toHaveBeenCalledWith(expect.stringContaining('/translation/sends/send'), { action: 'original' })
     } finally { rendered.cleanup(); post.mockRestore() }
+  })
+
+  it('shows a code check note for support with engineering detail folded away', async () => {
+    const restored = vi.fn()
+    window.addEventListener('support:restore-draft', restored)
+    const rendered = renderBubble({
+      id: 'code-check', workspace_id: 'ws-1', conversation_id: 'conv-1', sender_type: 'agent',
+      sender_display_name: 'Code check', message_type: 'note', is_internal: true,
+      content: "## What's happening\n\nThe post was saved as a draft.\n\n## Suggested reply\n\nOpen the post and click Schedule.\n\n## For engineering\n\nApprovalBuilder skips drafts.",
+      metadata: JSON.stringify({ investigation_id: 'job', report_format: 'support_v1', suggested_reply: 'Open the post and click Schedule.' }),
+      created_at: '2026-10-23T22:43:30Z', updated_at: '2026-10-23T22:43:30Z',
+    })
+    try {
+      const details = rendered.container.querySelector('[data-support-code-check-actions] details')
+      expect(details?.open).toBe(false)
+      expect(details?.querySelector('summary')?.textContent).toBe('Engineering details')
+      expect(details?.textContent).toContain('ApprovalBuilder skips drafts.')
+      expect(rendered.container.textContent?.match(/ApprovalBuilder skips drafts/g)).toHaveLength(1)
+      expect(rendered.container.textContent).toContain('The post was saved as a draft.')
+      await act(async () => findButtonByText(rendered.container, 'Use suggested reply')?.click())
+      expect(restored.mock.calls[0][0].detail).toMatchObject({ conversationId: 'conv-1', markdown: 'Open the post and click Schedule.' })
+    } finally {
+      rendered.cleanup(); window.removeEventListener('support:restore-draft', restored)
+    }
+  })
+
+  it('hides the suggested reply action in read-only views', () => {
+    const rendered = renderBubble({
+      id: 'code-check', workspace_id: 'ws-1', conversation_id: 'conv-1', sender_type: 'agent',
+      sender_display_name: 'Code check', message_type: 'note', is_internal: true, content: "## What's happening\n\nSummary.",
+      metadata: JSON.stringify({ report_format: 'support_v1', suggested_reply: 'Reply' }),
+      created_at: '2026-10-23T22:43:30Z', updated_at: '2026-10-23T22:43:30Z',
+    }, undefined, { readOnly: true })
+    try {
+      expect(findButtonByText(rendered.container, 'Use suggested reply')).toBeNull()
+    } finally { rendered.cleanup() }
   })
 
   it('keeps Undo restoring the draft with delivery mode and subject', async () => {
@@ -1445,7 +1749,7 @@ Can I export my data?`,
     expect(preview?.getAttribute('src')).toBe('https://cdn.example.com/screenshot.png')
     expect(document.body.textContent).toContain('screenshot.png')
 
-    const lightboxNext = document.body.querySelector('[data-testid="support-attachment-lightbox"] button[aria-label="Next image attachment"]')
+    const lightboxNext = document.body.querySelector('[data-testid="support-attachment-lightbox"] button[aria-label="Next attachment"]')
     act(() => {
       lightboxNext?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
@@ -1549,4 +1853,58 @@ it.each(['tag_added', 'tag_removed', 'ai_escalated', 'resolved'] as const)('uses
  });
  try { expect(rendered.container.querySelector('[data-support-system-callout] .ask-agent-avatar')).not.toBeNull(); }
  finally { rendered.cleanup(); }
+});
+
+it('shows a priority raised by Helpin AI with the Ask Agent avatar', () => {
+ const rendered = renderBubble({
+  id: 'ai-priority', workspace_id: 'ws-1', conversation_id: 'conv-1',
+  sender_type: 'ai', sender_display_name: 'Helpin AI', message_type: 'system',
+  system_event_type: 'priority_changed', content: 'Helpin AI changed the priority from Medium to Urgent.', is_internal: true,
+  created_at: '2026-10-27T10:00:00Z', updated_at: '2026-10-27T10:00:00Z',
+ });
+ try {
+  const callout = rendered.container.querySelector('[data-support-system-callout]');
+  expect(callout?.textContent).toContain('Helpin AI changed the priority from Medium to Urgent.');
+  expect(callout?.querySelector('.ask-agent-avatar')).not.toBeNull();
+ } finally { rendered.cleanup(); }
+});
+
+it('bolds both priority levels in a priority change', () => {
+ const rendered = renderBubble({
+  id: 'priority-change', workspace_id: 'ws-1', conversation_id: 'conv-1',
+  sender_type: 'user', sender_display_name: 'Alex Morgan', message_type: 'system',
+  system_event_type: 'priority_changed', content: 'Alex changed the priority from Low to High.', is_internal: true,
+  created_at: '2026-10-27T10:00:00Z', updated_at: '2026-10-27T10:00:00Z',
+ });
+ try {
+  const callout = rendered.container.querySelector('[data-support-system-callout]');
+  expect(Array.from(callout?.querySelectorAll('strong') ?? []).map((node) => node.textContent)).toEqual(['Low', 'High']);
+  expect(callout?.textContent).toContain('Alex changed the priority from Low to High.');
+ } finally { rendered.cleanup(); }
+});
+
+it('opens a task from the thread in the task drawer and keeps the link for new tabs', () => {
+ useTaskPanelStore.setState({ taskId: null, lastClosedTaskId: null, lastClosedAt: 0 });
+ const rendered = renderBubble({
+  id: 'task-created', workspace_id: 'ws-1', conversation_id: 'conv-1',
+  sender_type: 'user', sender_display_name: 'Alex Morgan', message_type: 'system',
+  system_event_type: 'task_created', content: 'Alex created task #ENG-123: Fix billing webhook.', is_internal: true,
+  created_at: '2026-10-27T10:00:00Z', updated_at: '2026-10-27T10:00:00Z',
+ }, undefined, { workspaceSlug: 'acme', linkedTaskId: 'task-123' });
+ try {
+  const link = rendered.container.querySelector<HTMLAnchorElement>('[data-task-created-link]')!;
+  const newTabClick = new MouseEvent('click', { bubbles: true, cancelable: true, metaKey: true });
+  act(() => { link.dispatchEvent(newTabClick); });
+  expect(newTabClick.defaultPrevented).toBe(false);
+  expect(useTaskPanelStore.getState().taskId).toBeNull();
+
+  const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+  act(() => { link.dispatchEvent(click); });
+  expect(click.defaultPrevented).toBe(true);
+  expect(useTaskPanelStore.getState().taskId).toBe('task-123');
+  expect(link.getAttribute('href')).toBe('/w/acme/pm/tasks/task-123');
+ } finally {
+  rendered.cleanup();
+  useTaskPanelStore.setState({ taskId: null });
+ }
 });

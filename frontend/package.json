@@ -27,6 +27,7 @@
     "test:e2e:agent-runtime:coding": "node e2e/agent-runtime-live/coding.mjs",
     "dev:ee": "VITE_EDITION=ee vite --host 0.0.0.0",
     "build:ee": "node scripts/build.mjs ee",
+    "build:portal": "vite build --config vite.portal.config.ts",
     "prebuild:ee": "pnpm generate:icons && pnpm --dir .. --filter @helpin-ai/widget-core build",
     "test:ee": "NODE_OPTIONS=--max-old-space-size=4096 VITE_EDITION=ee vitest run",
     "predev:ee": "pnpm generate:icons"
@@ -83,6 +84,7 @@
     "dayjs": "^1.11.20",
     "dompurify": "^3.4.0",
     "emoji-mart": "^5.6.0",
+    "franc-min": "6.2.0",
     "konva": "^10.3.0",
     "lowlight": "^3.3.0",
     "lucide-react": "^0.575.0",

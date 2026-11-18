@@ -10,6 +10,10 @@ package model
 type SupportSystemEventType = string
 
 const (
+	// SystemEventVisitorEmailRequested marks a chat waiting for required contact details.
+	SystemEventVisitorEmailRequested SupportSystemEventType = "visitor_email_requested"
+	// SystemEventVisitorEmailProvided marks successful visitor email capture.
+	SystemEventVisitorEmailProvided SupportSystemEventType = "visitor_email_provided"
 	// Internal teammate actions; never delivered to customers.
 	SystemEventAIPaused   SupportSystemEventType = "ai_paused"
 	SystemEventAIReturned SupportSystemEventType = "ai_returned"
@@ -80,11 +84,45 @@ const (
 	// SystemEventTaskCreated — PM task created from the conversation.
 	// Admin-only.
 	SystemEventTaskCreated SupportSystemEventType = "task_created"
+
+	// SystemEventCSATRated — the customer rated the resolved conversation.
+	// Admin-only; metadata carries the rating and optional comment.
+	SystemEventCSATRated SupportSystemEventType = "csat_rated"
+
+	// SystemEventPriorityChanged — a teammate or Helpin AI changed the priority.
+	// Admin-only.
+	SystemEventPriorityChanged SupportSystemEventType = "priority_changed"
+
+	// SystemEventSnoozed / SystemEventUnsnoozed — a teammate snoozed the
+	// conversation, or the snooze ended. Admin-only.
+	SystemEventSnoozed   SupportSystemEventType = "snoozed"
+	SystemEventUnsnoozed SupportSystemEventType = "unsnoozed"
+
+	// SystemEventSLABreached — an SLA target was missed. Admin-only.
+	SystemEventSLABreached SupportSystemEventType = "sla_breached"
+
+	// SystemEventTaskLinked — existing PM task linked to the conversation.
+	// Admin-only.
+	SystemEventTaskLinked SupportSystemEventType = "task_linked"
+
+	// SystemEventTaskUnlinked — PM task unlinked from the conversation.
+	// Admin-only.
+	SystemEventTaskUnlinked SupportSystemEventType = "task_unlinked"
+
+	// SystemEventRequestTypeChanged — a teammate set, changed or cleared the
+	// request type. Admin-only.
+	SystemEventRequestTypeChanged SupportSystemEventType = "request_type_changed"
+
+	// SystemEventFieldChanged — a teammate set or cleared a conversation
+	// field. Admin-only; metadata carries the key and value.
+	SystemEventFieldChanged SupportSystemEventType = "field_changed"
 )
 
 // allSupportSystemEventTypes is the authoritative set of valid event types.
 // Kept private so callers go through IsValidSupportSystemEventType.
 var allSupportSystemEventTypes = map[SupportSystemEventType]struct{}{
+	SystemEventVisitorEmailRequested:  {},
+	SystemEventVisitorEmailProvided:   {},
 	SystemEventAIPaused:               {},
 	SystemEventAIReturned:             {},
 	SystemEventTeammateJoined:         {},
@@ -105,6 +143,15 @@ var allSupportSystemEventTypes = map[SupportSystemEventType]struct{}{
 	SystemEventTagAdded:               {},
 	SystemEventTagRemoved:             {},
 	SystemEventTaskCreated:            {},
+	SystemEventCSATRated:              {},
+	SystemEventPriorityChanged:        {},
+	SystemEventSnoozed:                {},
+	SystemEventUnsnoozed:              {},
+	SystemEventSLABreached:            {},
+	SystemEventTaskLinked:             {},
+	SystemEventTaskUnlinked:           {},
+	SystemEventRequestTypeChanged:     {},
+	SystemEventFieldChanged:           {},
 }
 
 // IsValidSupportSystemEventType reports whether s is a recognized event type.

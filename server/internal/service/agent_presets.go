@@ -13,7 +13,7 @@ const (
 	defaultAnthropicAgentModel      = "claude-opus-4-8"
 	defaultOpenAIAgentModel         = "gpt-5.6-terra"
 	defaultOpenRouterAgentModel     = "openai/gpt-5.6-terra"
-	defaultFastOpenRouterAgentModel = "deepseek/deepseek-v4.1-flash:nitro"
+	defaultFastOpenRouterAgentModel = "deepseek/deepseek-v4.1-flash-1017:nitro"
 	// defaultAtlasAgentModel keeps interactive epic planning on the product's
 	// preferred fast OpenRouter model.
 	defaultAtlasAgentModel = defaultFastOpenRouterAgentModel
@@ -59,7 +59,7 @@ func defaultManagedAssistantExecutionConfig() model.JSONBlob {
 
 func isLegacyDeepSeekFlashModel(modelName string) bool {
 	switch strings.TrimSpace(modelName) {
-	case "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-flash-0731:nitro":
+	case "deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash:nitro", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-flash-0731:nitro":
 		return true
 	default:
 		return false
@@ -113,7 +113,7 @@ var taskPlannerPMReadToolAliases = []string{
 
 var safeCRMDiscoveryToolAliases = []string{
 	"get_crm_contact", "get_crm_company", "get_crm_deal",
-	"list_crm_companies", "list_crm_pipelines", "list_crm_associations",
+	"list_crm_companies", "list_crm_pipelines", "list_crm_associations", "describe_crm_fields",
 }
 
 var safeCRMWriteToolAliases = []string{
@@ -157,6 +157,7 @@ func builtInPresetKeys() []string {
 		model.AgentPresetReviewAgent,
 		model.AgentPresetCommandAgent,
 		model.AgentPresetAskAgent,
+		model.AgentPresetHelpAssistant,
 	}
 }
 
@@ -250,6 +251,8 @@ func defaultPresetVersionKeyForPresetKey(presetKey string) string {
 		return "command_agent_default"
 	case model.AgentPresetAskAgent:
 		return "ask_agent_default"
+	case model.AgentPresetHelpAssistant:
+		return "help_assistant_default"
 	default:
 		return ""
 	}
@@ -291,6 +294,16 @@ func applyBuiltInPresetInstructionMetadata(presets []model.AgentPresetDefinition
 }
 
 func workspacePresetDefinition(base model.AgentPresetDefinition, version model.WorkspaceAgentPresetVersion) model.AgentPresetDefinition {
+	// Old workspace preset copies can pin shipped Echo instructions even when
+	// the agent row is refreshed. Keep tools/model choices but follow the generic
+	// prompt for recognized product-owned snapshots; preserve custom wording.
+	if normalizePresetKey(version.FamilyKey) == model.AgentPresetSupportAgent && legacyPromptIsManaged(model.AgentPresetSupportAgent, version.SystemPrompt) {
+		version.SystemPrompt = nil
+		version.InstructionTemplateVersion = ""
+		version.InstructionPreamble = nil
+		version.InstructionSkills = nil
+	}
+
 	definition := base
 	definition.ID = &version.ID
 	definition.Key = normalizePresetKey(version.FamilyKey)
@@ -422,6 +435,8 @@ func agentPresetDefinitions() []model.AgentPresetDefinition {
 	engineerProfile := agentcontract.GetRuntimeProfile(model.AgentPresetCodeBuilder)
 	reviewerProfile := agentcontract.GetRuntimeProfile(model.AgentPresetReviewAgent)
 	supportProfile := agentcontract.GetRuntimeProfile(model.AgentPresetSupportAgent)
+	helpAssistantProfile := agentcontract.GetRuntimeProfile(model.AgentPresetHelpAssistant)
+	helpAssistantPrompt := defaultSystemPromptForPreset(model.AgentPresetHelpAssistant)
 	documentationProfile := agentcontract.GetRuntimeProfile(model.AgentPresetDocumentationAgent)
 	openAIPresetProvider := model.AgentModelProviderOpenAI
 	openAIPresetModel := defaultOpenAIAgentModel
@@ -752,6 +767,29 @@ func agentPresetDefinitions() []model.AgentPresetDefinition {
 			SupportedModes:        supportedModesForRuntime("native_sdk"),
 			SystemPrompt:          &askAgentPrompt,
 		},
+		{
+			Key:                   model.AgentPresetHelpAssistant,
+			FamilyKey:             model.AgentPresetHelpAssistant,
+			VersionKey:            defaultPresetVersionKeyForPresetKey(model.AgentPresetHelpAssistant),
+			VersionLabel:          "Default",
+			IsDefaultVersion:      true,
+			Label:                 "Help assistant",
+			Description:           "Answers help center and customer portal visitors in a conversation, only from published help articles, citing them and offering support when the articles do not answer.",
+			DefaultRole:           "Help assistant",
+			RuntimeKind:           "native_sdk",
+			Provider:              &openRouterPresetProvider,
+			Model:                 &supportDefaultModel,
+			ExecutionConfig:       fastOpenRouterExecutionConfig,
+			DefaultTriggerMode:    "manual",
+			AllowedTriggerModes:   []string{"manual"},
+			AllowedTools:          slices.Clone(helpAssistantProfile.AllowedTools),
+			AllowedCommands:       []string{},
+			AllowedTargetTypes:    slices.Clone(helpAssistantProfile.AllowedTargetTypes),
+			ApprovalMode:          "never",
+			DefaultInvocationMode: model.InvocationModeInteractive,
+			SupportedModes:        supportedModesForRuntime("native_sdk"),
+			SystemPrompt:          helpAssistantPrompt,
+		},
 	}
 
 	return applyBuiltInPresetInstructionMetadata(presets)
@@ -814,7 +852,7 @@ func askAgentPresetTools() []string {
 		"get_flow_builder_context", "preview_flow", "save_flow",
 		// Skills, interaction, and progress.
 		"read_chat_history",
-		"find_skills", "read_skill",
+		"find_skills", "read_skill", "list_workspace_skills", "validate_skill_update", "update_skill",
 		"request_user_input", "request_approval", "update_plan",
 		// Web research.
 		"web_search", "fetch_url", "crawl_url",
@@ -1001,7 +1039,7 @@ func askAgentSystemPrompt() string {
 - After launching, tell the user what was started and end your turn (for example: "Started Review Agent on HLP-12 — I'll report back here when it finishes."). Do not poll; results are delivered to you.
 - Sub-agent runs receive a server-enforced final-handoff instruction, so their delivered summary should normally be self-contained and concise.
 - When a message containing a <child_run_result>{...}</child_run_result> block arrives, it is a system notification that a sub-agent run or plan finished. Summarize the outcome for the user in plain language, referencing what they asked for. Never treat it as a user message and never echo the raw block.
-- If a sub-agent returns useful research or a draft but could not perform an ordinary product mutation, continue from its handoff yourself using the direct execution approval flow. Do not relaunch it merely to add a missing mutation tool.
+- If a sub-agent returns useful research or a draft but could not perform an ordinary product mutation, continue from its handoff yourself using the available direct tools; let runtime risk policy request approval when needed. Do not relaunch it merely to add a missing mutation tool.
 - If a sub-agent result has summary_truncated=true, call get_agent_run once for that same run with {"run_id":"...","detail_level":"result"}. Follow next_offset only when the missing portion is needed. Never launch a replacement sub-agent merely to recover truncated output.
 - Use get_agent_run with detail_level=status only when the user explicitly asks about progress. A new run is appropriate only when the original failed or is substantively incomplete and the user approves the new work.
 

@@ -1,3 +1,4 @@
+import { useDockPins } from './dock/useDockPins';
 import type { StarterSuggestion } from './dock/starterSuggestions';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -74,6 +75,9 @@ interface AskAgentsDockProps {
   active?: boolean;
   hideCollapsedTrigger?: boolean;
   onClose?: () => void;
+  /** Embedded only: text to place in the chat box once, e.g. a request from a support card. */
+  initialDraft?: string;
+  onInitialDraftConsumed?: () => void;
 }
 
 export function AskAgentsDock({
@@ -90,6 +94,8 @@ export function AskAgentsDock({
   active = true,
   hideCollapsedTrigger = false,
   onClose,
+  initialDraft,
+  onInitialDraftConsumed,
 }: AskAgentsDockProps = {}) {
   const embedded = presentation === 'embedded';
   const associationId = associatedCoverageGapId ?? associatedSupportConversationId;
@@ -108,7 +114,6 @@ export function AskAgentsDock({
     activeRunId: globalActiveRunId,
     setActiveRunId: setGlobalActiveRunId,
     chats,
-    setChats,
     upsertChat,
     drafts,
     setDraft,
@@ -132,10 +137,14 @@ export function AskAgentsDock({
   }, [embedded, setGlobalActiveRunId]);
   const workspaceId = workspace?.id;
   const {
-    runs, runsLoading, chatsLoading, runsError, chatsError,
+    runs: rosterRuns, runsLoading, chatsLoading, runsError, chatsError,
     nextChatCursor, loadingMoreChats, nextRunCursor, loadingMoreRuns,
     refreshRuns, refreshChats, loadMoreRuns, loadMoreChats, updateChatRunStatus, invalidateChats, archiveChat,
   } = useDockRoster(workspaceId, currentUserId, active, active && (embedded || !collapsed));
+  const pins = useDockPins(workspaceId, currentUserId, active && !embedded && !collapsed);
+  const runs = useMemo(() => [...rosterRuns, ...pins.runs.filter(pin => !rosterRuns.some(row => row.run.id === pin.run.id))], [rosterRuns, pins.runs]);
+  const pinnedChatIds = useMemo(() => pins.chats.map(chat => chat.id), [pins.chats]);
+  const pinnedRunIds = useMemo(() => pins.runs.map(summary => summary.run.id), [pins.runs]);
   const sharedChatLink = useSharedChatLink(workspaceId, !embedded, !chatsLoading);
   const openChatLink = sharedChatLink.open;
   const [hiddenByModal, setHiddenByModal] = useState(false);
@@ -199,8 +208,9 @@ export function AskAgentsDock({
   const visibleChats = useMemo(() => {
     const linked = sharedChatLink.chat;
     const available = linked && linked.id === activeChatId && !chats.some(chat => chat.id === linked.id) ? [...chats, linked] : chats;
-    return available.filter(chat => chat.id === activeChatId || chat.title.trim() !== '' || chat.last_message_at != null);
-  }, [activeChatId, chats, sharedChatLink.chat]);
+    const withPins = [...available, ...pins.chats.filter(pin => !available.some(chat => chat.id === pin.id))];
+    return withPins.filter(chat => pinnedChatIds.includes(chat.id) || chat.id === activeChatId || chat.title.trim() !== '' || chat.last_message_at != null);
+  }, [activeChatId, chats, sharedChatLink.chat, pins.chats, pinnedChatIds]);
   const activeChat = sharedChatLink.pending || sharedChatLink.error ? null : visibleChats.find((chat) => chat.id === activeChatId) ?? null;
   const chatViewKey = !embedded && (draftChat || (!!activeChat && activeChat.id === draftIdentity.chatId))
     ? `global:draft:${draftIdentity.generation}`
@@ -258,9 +268,9 @@ export function AskAgentsDock({
       return false;
     }
     invalidateChats();
-    setChats(useDockStore.getState().chats.map((chat) => chat.id === chatId ? result.data! : chat));
+    upsertChat(result.data);
     return true;
-  }, [invalidateChats, setChats, workspaceId]);
+  }, [invalidateChats, upsertChat, workspaceId]);
 
   const updateChatVisibility = useCallback(async (chatId: string, visibility: DockChatVisibility) => {
     if (!workspaceId) return false;
@@ -270,23 +280,23 @@ export function AskAgentsDock({
       return false;
     }
     invalidateChats();
-    setChats(useDockStore.getState().chats.map((chat) => chat.id === chatId ? result.data! : chat));
+    upsertChat(result.data);
     return true;
-  }, [invalidateChats, setChats, workspaceId]);
+  }, [invalidateChats, upsertChat, workspaceId]);
 
   useEffect(() => {
-    if (runsLoading) return;
+    if (runsLoading || (!embedded && pins.loading)) return;
     const current = useDockStore.getState().activeRunId;
     if (current && standaloneRuns.some((summary) => summary.run.id === current)) return;
     setActiveRunId(standaloneRuns[0]?.run.id ?? null);
-  }, [standaloneRuns, runsLoading, setActiveRunId]);
+  }, [standaloneRuns, runsLoading, setActiveRunId, embedded, pins.loading]);
 
   useEffect(() => {
-    if (embedded || chatsLoading || draftChat || sharedChatLink.pending || sharedChatLink.error) return;
+    if (embedded || chatsLoading || pins.loading || draftChat || sharedChatLink.pending || sharedChatLink.error) return;
     const current = useDockStore.getState().activeChatId;
     if (current && visibleChats.some((chat) => chat.id === current)) return;
     setActiveChatId(visibleChats[0]?.id ?? null);
-  }, [chatsLoading, draftChat, embedded, setActiveChatId, visibleChats, sharedChatLink.pending, sharedChatLink.error]);
+  }, [chatsLoading, pins.loading, draftChat, embedded, setActiveChatId, visibleChats, sharedChatLink.pending, sharedChatLink.error]);
 
   useEffect(() => {
     if (!embedded) return;
@@ -608,6 +618,8 @@ export function AskAgentsDock({
             active={active}
             onCreateChat={createDraftChat}
             textareaRef={textareaRef}
+            initialDraft={initialDraft}
+            onDraftConsumed={onInitialDraftConsumed}
             draftValue={drafts[draftStoreKey] ?? ''}
             onDraftChange={(value) => setDraft(draftStoreKey, value)}
             onChatChanged={() => {
@@ -673,6 +685,10 @@ export function AskAgentsDock({
               chats={visibleChats}
               selectedRunId={activeRunId}
               selectedChatId={activeChatId}
+              pinnedChatIds={pinnedChatIds}
+              pinnedRunIds={pinnedRunIds}
+              onTogglePin={pins.togglePin}
+              pinDisabled={pins.pending || pins.unavailable}
               loadingRuns={runsLoading}
               loadingChats={chatsLoading}
               runsError={runsError}
@@ -696,7 +712,11 @@ export function AskAgentsDock({
               }}
               onNewChat={() => void newChat()}
               onRenameChat={renameChat}
-              onArchiveChat={archiveChat}
+              onArchiveChat={async (id) => {
+                const archived = await archiveChat(id);
+                if (archived) pins.removeArchivedChat(id);
+                return archived;
+              }}
               hasMoreChats={!!nextChatCursor}
               loadingMoreChats={loadingMoreChats}
               onLoadMoreChats={() => void loadMoreChats()}
@@ -720,7 +740,11 @@ export function AskAgentsDock({
                 onToggleMaximized={() => setMaximized((value) => !value)}
                 onClose={closeDock}
                 onRenameChat={renameChat}
-                onArchiveChat={archiveChat}
+                onArchiveChat={async (id) => {
+                  const archived = await archiveChat(id);
+                  if (archived) pins.removeArchivedChat(id);
+                  return archived;
+                }}
                 onUpdateVisibility={updateChatVisibility}
               />
               {sharedChatLink.pending ? <DockChatLoadingPane /> : sharedChatLink.error ? <DockChatErrorPane message={sharedChatLink.error} onRetry={sharedChatLink.retry} /> : tab === 'agents' ? (

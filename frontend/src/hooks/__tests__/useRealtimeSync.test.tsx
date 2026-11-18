@@ -628,6 +628,17 @@ describe('useRealtimeSync task ordering events', () => {
     act(() => root.unmount())
   })
 
+  it('refreshes skills after an agent edits a workspace skill', () => {
+    const client = new QueryClient()
+    const invalidations = vi.spyOn(client, 'invalidateQueries')
+    const root = createRoot(document.createElement('div'))
+    act(() => root.render(<QueryClientProvider client={client}><Harness workspaceId="ws-1" /></QueryClientProvider>))
+    invalidations.mockClear()
+    act(() => captured.onEvent?.({ entity: 'workspace_skill', action: 'updated', entity_id: 'skill-1', workspace_id: 'ws-1' }))
+    expect(invalidations).toHaveBeenCalledWith({ queryKey: queryKeys.automation.skillCatalog('ws-1') })
+    act(() => root.unmount())
+  })
+
   it.each([false, true])('recovers queries on websocket reconnect with hidden=%s', (hidden) => {
     const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue(hidden ? 'hidden' : 'visible')
     const client = new QueryClient()
@@ -796,6 +807,39 @@ describe('useRealtimeSync task ordering events', () => {
     container.remove()
   })
 
+  it('tracks AI thinking without refetching the conversation', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const invalidateQueries = vi.spyOn(client, 'invalidateQueries')
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    useSupportPresenceStore.setState({ aiThinking: {} })
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <Harness workspaceId="ws-1" />
+        </QueryClientProvider>,
+      )
+    })
+    const emit = (action: string) => captured.onEvent?.({ action, entity: 'support_conversation', entity_id: 'conv-1', workspace_id: 'ws-1', actor_id: 'ai' })
+
+    await act(async () => {
+      emit('ai_thinking_started')
+      await Promise.resolve()
+    })
+    expect(useSupportPresenceStore.getState().aiThinking['conv-1']).toBe(true)
+    await act(async () => {
+      emit('ai_thinking_stopped')
+      await Promise.resolve()
+    })
+    expect(useSupportPresenceStore.getState().aiThinking['conv-1']).toBeUndefined()
+    expect(invalidateQueries).not.toHaveBeenCalled()
+
+    act(() => root.unmount())
+    container.remove()
+  })
+
   it('invalidates custom support view counts for conversation and message updates', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const invalidateQueries = vi.spyOn(client, 'invalidateQueries')
@@ -827,6 +871,7 @@ describe('useRealtimeSync task ordering events', () => {
         actor_id: 'widget:visitor',
         parent_id: 'conv-1',
       })
+      vi.advanceTimersByTime(250)
       await Promise.resolve()
     })
 
@@ -1009,6 +1054,7 @@ describe('useRealtimeSync task ordering events', () => {
     act(() => root.render(<QueryClientProvider client={client}><Harness workspaceId="ws-1" /></QueryClientProvider>))
     await act(async () => {
       captured.onEvent?.({ action: 'created', entity: 'support_conversation_message', entity_id: 'reply', workspace_id: 'ws-1', actor_id: 'user-1', parent_id: 'thread', data: { content: 'Team reply', sender_type: 'user', message_type: 'reply', created_at: '2026-09-11T09:00:00Z' } })
+      vi.advanceTimersByTime(300)
       await Promise.resolve()
     })
     expect(client.getQueryState(waitingKey)?.isInvalidated).toBe(true)
@@ -1164,6 +1210,7 @@ describe('useRealtimeSync task ordering events', () => {
 
     await act(async () => {
       captured.onEvent?.({ action: 'updated', entity: 'support_conversation', entity_id: 'conv-company', workspace_id: 'ws-1' })
+      vi.advanceTimersByTime(300)
       await Promise.resolve()
     })
     expect(client.getQueryState(visitorKey)?.isInvalidated).toBe(true)
@@ -1178,5 +1225,96 @@ describe('useRealtimeSync task ordering events', () => {
 
     act(() => root.unmount())
     container.remove()
+  })
+
+  it('refetches conversation lists once for a burst of resolves', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const listKey = ['support', 'ws-1', 'conversations', 'infinite', { filter: 'inbox' }]
+    const openKey = queryKeys.support.messages('ws-1', 'conv-open')
+    client.setQueryData(listKey, { pages: [{ data: [], total: 0 }], pageParams: [1] })
+    client.setQueryData(openKey, seedSupportMessagePages([]))
+    const invalidateQueries = vi.spyOn(client, 'invalidateQueries')
+    const listRefetches = () => invalidateQueries.mock.calls.filter(([filters]) =>
+      filters?.predicate?.({ queryKey: listKey } as never)).length
+    const container = document.createElement('div')
+    const root = createRoot(container)
+    act(() => root.render(<QueryClientProvider client={client}><Harness workspaceId="ws-1" /></QueryClientProvider>))
+
+    await act(async () => {
+      for (let index = 0; index < 20; index++) {
+        const resolved = { action: 'updated', entity: 'support_conversation', entity_id: `conv-${index}`, workspace_id: 'ws-1', data: { old_status: 'open', status: 'resolved' } }
+        captured.onEvent?.(resolved)
+        captured.onEvent?.({ action: 'created', entity: 'support_conversation_message', entity_id: `msg-${index}`, workspace_id: 'ws-1', parent_id: `conv-${index}` })
+        vi.advanceTimersByTime(50)
+      }
+      await Promise.resolve()
+    })
+    expect(listRefetches()).toBe(0)
+    expect(client.getQueryState(listKey)?.isInvalidated).toBe(false)
+
+    await act(async () => {
+      vi.advanceTimersByTime(300)
+      await Promise.resolve()
+    })
+    expect(listRefetches()).toBe(1)
+    expect(client.getQueryState(listKey)?.isInvalidated).toBe(true)
+    // Only the changed conversations refetch, not every open thread.
+    expect(client.getQueryState(openKey)?.isInvalidated).toBe(false)
+
+    act(() => root.unmount())
+    client.clear()
+  })
+
+  it('refetches lists at least every max wait while events keep coming', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const listKey = ['support', 'ws-1', 'conversations', 'infinite', { filter: 'inbox' }]
+    client.setQueryData(listKey, { pages: [{ data: [], total: 0 }], pageParams: [1] })
+    const container = document.createElement('div')
+    const root = createRoot(container)
+    act(() => root.render(<QueryClientProvider client={client}><Harness workspaceId="ws-1" /></QueryClientProvider>))
+
+    await act(async () => {
+      for (let index = 0; index < 8; index++) {
+        captured.onEvent?.({ action: 'updated', entity: 'support_conversation', entity_id: `conv-${index}`, workspace_id: 'ws-1' })
+        vi.advanceTimersByTime(200)
+      }
+      await Promise.resolve()
+    })
+    expect(client.getQueryState(listKey)?.isInvalidated).toBe(true)
+
+    act(() => root.unmount())
+    client.clear()
+  })
+
+  it('lets a running list fetch finish before refetching instead of restarting it', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const listKey = ['support', 'ws-1', 'conversations', 'infinite', { filter: 'inbox' }]
+    let finishFetch: (value: unknown) => void = () => {}
+    void client.prefetchQuery({ queryKey: listKey, queryFn: () => new Promise((resolve) => { finishFetch = resolve }) })
+    const invalidateQueries = vi.spyOn(client, 'invalidateQueries')
+    const container = document.createElement('div')
+    const root = createRoot(container)
+    act(() => root.render(<QueryClientProvider client={client}><Harness workspaceId="ws-1" /></QueryClientProvider>))
+
+    await act(async () => {
+      captured.onEvent?.({ action: 'updated', entity: 'support_conversation', entity_id: 'conv-1', workspace_id: 'ws-1' })
+      vi.advanceTimersByTime(900)
+      await Promise.resolve()
+    })
+    expect(invalidateQueries.mock.calls.some(([filters]) => filters?.predicate)).toBe(false)
+
+    await act(async () => {
+      finishFetch({ pages: [{ data: [], total: 0 }], pageParams: [1] })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(300)
+      await Promise.resolve()
+    })
+    expect(client.getQueryState(listKey)?.isInvalidated).toBe(true)
+
+    act(() => root.unmount())
+    client.clear()
   })
 })

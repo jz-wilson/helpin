@@ -478,12 +478,17 @@ type EmailFallbackService struct {
 	pushSenderService      *PushSenderService
 	replyDomain            string
 	appBaseURL             string
+	portalLinks            portalRequestLinker
+	emailLinkScanner       supportEmailLinkScanner
+	teamReplyLinks         supportTeamReplyLinker
 	logger                 *slog.Logger
 	podID                  string
 	pollInterval           time.Duration
 	leaseTTL               time.Duration
 	processingTTL          time.Duration
 	now                    func() time.Time
+	// runAsync starts background follow-up work; tests run it inline.
+	runAsync func(task func())
 }
 
 type EmailFallbackBackfillOptions struct {
@@ -505,6 +510,28 @@ type EmailFallbackBackfillResult struct {
 }
 
 // SetNotificationService injects the notification service used for support reply alerts.
+// portalRequestLinker links to a request in a workspace's customer portal.
+type portalRequestLinker interface {
+	PortalRequestURL(ctx context.Context, workspaceID, slug, reference string) string
+}
+
+// supportTeamReplyLinker issues the "Ask our team to reply" link that
+// AI-written emails carry.
+type supportTeamReplyLinker interface {
+	TeamReplyURL(workspaceID, conversationID string) string
+}
+
+// SetTeamReplyLinks enables the team-reply link in AI-written emails.
+func (s *EmailFallbackService) SetTeamReplyLinks(links supportTeamReplyLinker) {
+	s.teamReplyLinks = links
+}
+
+// SetPortalLinks links reply emails to each workspace's portal address.
+func (s *EmailFallbackService) SetPortalLinks(links portalRequestLinker) *EmailFallbackService {
+	s.portalLinks = links
+	return s
+}
+
 func (s *EmailFallbackService) SetNotificationService(notificationService *NotificationService) *EmailFallbackService {
 	if s == nil {
 		return nil
@@ -693,6 +720,12 @@ func (s *EmailFallbackService) StartReconciler(ctx context.Context) {
 			run()
 		}
 	}
+}
+
+// ReplyDeliveryAvailable reports whether agent replies can be emailed to
+// customers: the outbox needs Redis and the Postmark reply client.
+func (s *EmailFallbackService) ReplyDeliveryAvailable() bool {
+	return s != nil && s.redis != nil && s.emailClient != nil
 }
 
 // OnAgentReply enqueues an outbound email candidate when the feature is enabled.
@@ -941,12 +974,7 @@ func (s *EmailFallbackService) ProcessInboundEmail(ctx context.Context, payload 
 				return s.processInboundRoute(ctx, route, payload, rawPayload)
 			}
 		}
-		s.logger.WarnContext(ctx, "postmark inbound missing mailbox hash",
-			"message_id", strings.TrimSpace(payload.MessageID),
-			"original_recipient", strings.TrimSpace(payload.OriginalRecipient),
-			"to", strings.TrimSpace(payload.To),
-		)
-		return fmt.Errorf("missing mailbox hash")
+		return s.processUnaddressedInbound(ctx, payload, rawPayload)
 	}
 
 	if !strings.HasPrefix(mailboxHash, "conv-") {
@@ -971,6 +999,10 @@ func (s *EmailFallbackService) ProcessInboundEmail(ctx context.Context, payload 
 }
 
 func (s *EmailFallbackService) processInboundConversationReply(ctx context.Context, conv *model.SupportConversation, route *model.SupportEmailRoute, payload model.PostmarkInboundPayload, rawPayload string) error {
+	return s.processInboundConversationReplyWithRecovery(ctx, conv, route, payload, rawPayload, nil)
+}
+
+func (s *EmailFallbackService) processInboundConversationReplyWithRecovery(ctx context.Context, conv *model.SupportConversation, route *model.SupportEmailRoute, payload model.PostmarkInboundPayload, rawPayload string, recovery *model.SupportInboundJob) error {
 	if conv == nil || conv.AnonymizedAt != nil {
 		return nil
 	}
@@ -981,6 +1013,22 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			"status", conv.Status,
 		)
 		return nil
+	}
+	// One email written to two Helpin addresses (say, both the Reply-To and the
+	// From of our email) arrives twice with the same Message-ID. An admin
+	// recovery is an explicit request, so it is never skipped.
+	if recovery == nil {
+		copied, err := s.emailLogRepo.HasInboundCopy(ctx, repository.InboundCopyQuery{WorkspaceID: conv.WorkspaceID, ConversationID: conv.ID, RFCMessageID: inboundHeaderMessageID(payload)})
+		if err != nil {
+			return err
+		}
+		if copied {
+			s.logger.InfoContext(ctx, "postmark inbound copy already in conversation",
+				"message_id", strings.TrimSpace(payload.MessageID),
+				"conversation_id", conv.ID,
+			)
+			return nil
+		}
 	}
 
 	fromEmail := inboundEmailAddress(payload)
@@ -1035,7 +1083,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 		customerEmail = strings.TrimSpace(*conv.CustomerEmail)
 	}
 	isTeammateReply := false
-	unknownSender := false
+	internalTeammateReply := false
 	knownParticipant := false
 	for _, address := range append(append([]string{}, conv.EmailCC...), conv.EmailThreadParticipants...) {
 		if strings.EqualFold(strings.TrimSpace(address), fromEmail) {
@@ -1045,29 +1093,48 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 	}
 	originalConversationID := conv.ID
 	mergeParticipant := false
+	formerMergeParticipant := false
 	if !knownParticipant && conv.MergeRevision > 0 && conv.MergedIntoID == nil && !strings.EqualFold(customerEmail, fromEmail) {
-		group, err := repository.NewSupportMergeRepository(s.convRepo.DB()).Group(ctx, conv.WorkspaceID, conv.ID)
+		mergeRepo := repository.NewSupportMergeRepository(s.convRepo.DB())
+		group, err := mergeRepo.Group(ctx, conv.WorkspaceID, conv.ID)
 		if err != nil {
 			return err
 		}
-		mergeParticipant = slices.Contains(model.SupportMergeEmailAudience(group), strings.ToLower(strings.TrimSpace(fromEmail)))
+		sender := strings.ToLower(strings.TrimSpace(fromEmail))
+		mergeParticipant = slices.Contains(model.SupportMergeEmailAudience(group), sender)
 		knownParticipant = mergeParticipant
+		if !mergeParticipant {
+			former, err := mergeRepo.FormerMergeAudience(ctx, conv.WorkspaceID, group)
+			if err != nil {
+				return err
+			}
+			formerMergeParticipant = slices.Contains(former, sender)
+		}
 	}
+	// Set when someone split out of this conversation writes to it again.
+	formerMergeSender := false
 	var teammate *model.WorkspaceMember
 	if !strings.EqualFold(customerEmail, fromEmail) {
 		replyToMatchesCustomer := replyToEmail != "" && strings.EqualFold(customerEmail, replyToEmail)
 		forwardedMatchesCustomer := forwardedAttribution.Applied && strings.EqualFold(customerEmail, strings.TrimSpace(forwardedAttribution.OriginalEmail))
-		if !replyToMatchesCustomer && !forwardedMatchesCustomer && !knownParticipant {
-			if s.workspaceRepo != nil && inboundPayloadIncludesRecipient(payload, customerEmail) {
+		if !replyToMatchesCustomer && !forwardedMatchesCustomer {
+			if s.workspaceRepo != nil {
 				teammate, err = s.workspaceRepo.GetActiveMembershipByEmail(ctx, conv.WorkspaceID, fromEmail)
 				if err != nil {
 					return err
 				}
 			}
-			if teammate == nil || teammate.UserID == nil {
-				unknownSender = true
+			if (teammate == nil || teammate.UserID == nil) && formerMergeParticipant {
+				// Their conversation was split from this one. Keep the email
+				// team-only so the remaining customer never sees it.
+				formerMergeSender = true
+			} else if teammate == nil || teammate.UserID == nil {
+				// Routing already matched this email to the conversation. Preserve
+				// new external participants as customer replies, not internal notes.
+				knownParticipant = true
 			} else {
 				isTeammateReply = true
+				internalTeammateReply = !inboundPayloadIncludesRecipient(payload, customerEmail)
 				senderName = strings.TrimSpace(teammate.DisplayName)
 				if senderName == "" {
 					senderName = fromEmail
@@ -1078,7 +1145,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			senderName = strings.TrimSpace(forwardedAttribution.OriginalName)
 		} else if !isTeammateReply && replyToMatchesCustomer && strings.TrimSpace(replyToName) != "" {
 			senderName = strings.TrimSpace(replyToName)
-		} else if !isTeammateReply && !knownParticipant && !unknownSender && conv.CustomerName != nil && strings.TrimSpace(*conv.CustomerName) != "" {
+		} else if !isTeammateReply && !knownParticipant && conv.CustomerName != nil && strings.TrimSpace(*conv.CustomerName) != "" {
 			senderName = strings.TrimSpace(*conv.CustomerName)
 		}
 	}
@@ -1094,6 +1161,10 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 	inReplyTo := normalizeRFCHeaderValue(inboundHeaderValue(payload.Headers, "In-Reply-To"))
 	referencesHeader := strings.TrimSpace(inboundHeaderValue(payload.Headers, "References"))
 	recipientAddress := inboundRecipientAddress(payload)
+	supportAddresses, err := s.inboundSupportAddresses(ctx, conv.WorkspaceID, route, payload)
+	if err != nil {
+		return err
+	}
 	ccEmails := inboundCCEmails(payload)
 	bccEmails := inboundBCCEmails(payload)
 
@@ -1103,7 +1174,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 	if forwardedAttribution.Applied {
 		messageMetadata = mergeForwardedAttributionMetadata(messageMetadata, forwardedAttribution)
 	}
-	if knownParticipant || unknownSender {
+	if (knownParticipant && !isTeammateReply) || formerMergeSender {
 		senderName = strings.TrimSpace(payload.FromFull.Name)
 		if senderName == "" {
 			senderName = fromEmail
@@ -1115,15 +1186,15 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 		inboundMeta = map[string]any{}
 	}
 	inboundMeta["email_sender"] = fromEmail
-	inboundMeta["email_participant_sender"] = knownParticipant || unknownSender
-	if unknownSender {
+	inboundMeta["email_participant_sender"] = knownParticipant || formerMergeSender
+	if formerMergeSender {
 		inboundMeta["email_unknown_sender"] = true
 		inboundMeta["email_ai_request"] = false
 	}
 	encodedMeta, _ := json.Marshal(inboundMeta)
 	messageMetadata = string(encodedMeta)
 	isNotice := inboundEmailHasAbsenceNotice(messageMetadata)
-	if isTeammateReply && !isNotice {
+	if isTeammateReply && !internalTeammateReply && !isNotice {
 		messageMetadata = mergeExternalEmailReplyMetadata(messageMetadata)
 	}
 	senderType := "customer"
@@ -1133,7 +1204,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 	if isTeammateReply {
 		senderType = "user"
 		senderUserID = teammate.UserID
-		if !isNotice {
+		if !isNotice && !internalTeammateReply {
 			emailDirection = "outbound"
 			emailStatus = "external"
 		}
@@ -1146,7 +1217,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 		SenderUserID:              senderUserID,
 		SenderDisplayName:         &senderName,
 		Content:                   content,
-		IsInternal:                unknownSender,
+		IsInternal:                internalTeammateReply || formerMergeSender,
 		MessageType:               "reply",
 		Metadata:                  messageMetadata,
 		ViaChannel:                &viaEmail,
@@ -1165,6 +1236,10 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			msg.UpdatedAt = *sentAt
 		}
 	}
+	if receivedAt := inboundRecoveryReceivedAt(ctx); !receivedAt.IsZero() {
+		msg.CreatedAt = receivedAt
+		msg.UpdatedAt = receivedAt
+	}
 
 	if isNotice {
 		msg.MessageType = model.SupportMessageTypeEmailNotice
@@ -1173,13 +1248,23 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 	normalizedStatus := model.NormalizeSupportConversationStatus(conv.Status)
 	wasResolved := normalizedStatus == model.SupportConversationStatusResolved
 	shouldReopenCustomerReply := !isTeammateReply && !isNotice && (wasResolved || normalizedStatus == model.SupportConversationStatusWaitingOnCustomer)
-	shouldMoveTeammateReplyToWaiting := isTeammateReply && !isNotice && wasResolved
+	shouldMoveTeammateReplyToWaiting := isTeammateReply && !internalTeammateReply && !isNotice && wasResolved
 
 	var createdMsg *model.SupportMessage
+	var recipientsUpdated *model.SupportMessage
 	txErr := s.convRepo.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		msgRepoTx := s.messageRepo.WithTx(tx)
 		emailLogRepoTx := s.emailLogRepo.WithTx(tx)
 		convRepoTx := s.convRepo.WithTx(tx)
+		if recovery != nil {
+			var current model.SupportConversation
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND workspace_id = ?", conv.ID, conv.WorkspaceID).First(&current).Error; err != nil {
+				return err
+			}
+			if !validInboundRecoveryDestination(recovery, &current, payload) {
+				return ErrInboundRecoveryDestination
+			}
+		}
 
 		if err := msgRepoTx.Create(ctx, msg); err != nil {
 			return err
@@ -1195,21 +1280,36 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			shouldReopenCustomerReply = !isTeammateReply && !isNotice && (wasResolved || normalizedStatus == model.SupportConversationStatusWaitingOnCustomer)
 			shouldMoveTeammateReplyToWaiting = isTeammateReply && !isNotice && wasResolved
 		}
-		// Learn visible participants only from an accepted sender, without changing
-		// the primary customer or the team's selected outbound CC recipients.
-		if !unknownSender && !isNotice && conv.MergeRevision == 0 {
+		// Add newly introduced visible recipients, but do not restore recipients
+		// already seen on the thread and explicitly removed by a teammate.
+		if !isNotice && !internalTeammateReply && !formerMergeSender && conv.MergeRevision == 0 {
 			var current model.SupportConversation
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND workspace_id = ?", conv.ID, conv.WorkspaceID).First(&current).Error; err != nil {
 				return err
 			}
-			routeAddress := recipientAddress
-			if route != nil {
-				routeAddress = route.InboundAddress
+			primary := strings.TrimSpace(derefString(current.CustomerEmail))
+			visibleAddresses := inboundVisibleThreadParticipants(payload, "", primary)
+			if !isTeammateReply && knownParticipant {
+				visibleAddresses = append(visibleAddresses, fromEmail)
 			}
-			participants := normalizedEmailAddressList(append([]string(current.EmailThreadParticipants), inboundVisibleThreadParticipants(payload, routeAddress, customerEmail)...))
-			if err := convRepoTx.UpdateFields(ctx, conv.WorkspaceID, conv.ID, map[string]any{"email_thread_participants": model.DocsStringArray(participants)}); err != nil {
+			visible := normalizeSupportEmailListExcluding(visibleAddresses, append(supportAddresses, primary)...)
+			newRecipients := normalizeSupportEmailListExcluding(visible, current.EmailThreadParticipants...)
+			participants := normalizedEmailAddressList(append([]string(current.EmailThreadParticipants), visible...))
+			cc := normalizeSupportEmailListExcluding(append([]string(current.EmailCC), newRecipients...), append(supportAddresses, primary)...)
+			if err := convRepoTx.UpdateFields(ctx, conv.WorkspaceID, conv.ID, map[string]any{
+				"email_thread_participants": model.DocsStringArray(participants),
+				"email_cc":                  model.DocsStringArray(cc),
+			}); err != nil {
 				return err
 			}
+			if added := supportEmailListDifference(cc, current.EmailCC); len(added) > 0 {
+				recipientsUpdated = inboundCCAddedSystemMessage(conv, payload, added)
+				if err := msgRepoTx.Create(ctx, recipientsUpdated); err != nil {
+					return err
+				}
+			}
+			conv.EmailThreadParticipants = participants
+			conv.EmailCC = cc
 		}
 		if err := s.enqueueInboundAttachments(ctx, tx, msg, payload); err != nil {
 			return err
@@ -1231,6 +1331,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			Direction:                 emailDirection,
 			MessageIDs:                model.DocsStringArray{msg.ID},
 			FromEmail:                 fromEmail,
+			FromDisplayName:           senderName,
 			ToEmail:                   strings.TrimSpace(payload.To),
 			ReplyTo:                   replyToRaw,
 			RecipientAddress:          recipientAddress,
@@ -1261,7 +1362,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			return err
 		}
 
-		if unknownSender {
+		if formerMergeSender {
 			if err := convRepoTx.UpdateFields(ctx, conv.WorkspaceID, conv.ID, map[string]any{
 				"human_takeover": true, "assigned_agent_id": nil, "ai_state": "escalated", "flow_state": supportEmailReopenFlowState(conv),
 			}); err != nil {
@@ -1270,6 +1371,9 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			conv.HumanTakeover = boolPtr(true)
 			conv.AssignedAgentID = nil
 			conv.AIState = strPtr("escalated")
+		}
+		if err := repository.LoadSupportMailboxAIPolicy(tx, conv); err != nil {
+			return err
 		}
 		// Email replies belong to the human inbox. Cancel AI ownership silently:
 		// sending a handoff email here can itself feed an autoresponder loop.
@@ -1315,7 +1419,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 				}
 			}
 		}
-		if isTeammateReply && !isNotice {
+		if isTeammateReply && !internalTeammateReply && !isNotice {
 			updates := map[string]any{
 				"flow_state":        model.SupportConversationFlowStateAssignedToHuman,
 				"opened_by_user_id": teammate.UserID,
@@ -1361,7 +1465,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 	if !isTeammateReply && !isNotice {
 		ProcessSupportCustomerReplyNotification(ctx, s.notificationService, s.pushSenderService, conv, supportEmailNotificationPreview(payload, projection), senderName, createdMsg.ID)
 	}
-	if !isTeammateReply && !isNotice && !unknownSender && s.supportInboxService != nil {
+	if !isTeammateReply && !isNotice && !formerMergeSender && s.supportInboxService != nil {
 		s.supportInboxService.recordSupportEvent(SupportEventInput{
 			WorkspaceID: conv.WorkspaceID, EventType: model.SupportEventCustomerMessageCreated,
 			ConversationID: &conv.ID, MessageID: &createdMsg.ID,
@@ -1382,7 +1486,11 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 		actorID = *teammate.UserID
 	}
 	s.wsPublisher.Publish(websocket.SupportMessageEvent(conv.WorkspaceID, createdMsg, actorID))
-	if shouldReopenCustomerReply || unknownSender || (isTeammateReply && !isNotice) {
+	s.scanInboundEmailLinksAsync(createdMsg, actorID)
+	if recipientsUpdated != nil {
+		s.wsPublisher.Publish(websocket.SupportMessageEvent(conv.WorkspaceID, recipientsUpdated, ""))
+	}
+	if shouldReopenCustomerReply || recipientsUpdated != nil || formerMergeSender || (isTeammateReply && !internalTeammateReply && !isNotice) {
 		s.wsPublisher.Publish(websocket.Event{
 			Action:      "updated",
 			Entity:      "support_conversation",
@@ -1390,7 +1498,7 @@ func (s *EmailFallbackService) processInboundConversationReply(ctx context.Conte
 			WorkspaceID: conv.WorkspaceID,
 		})
 	}
-	if !isTeammateReply && !unknownSender {
+	if !isTeammateReply && !formerMergeSender {
 		return s.publishInboundCustomerAIRequest(ctx, conv.WorkspaceID, conv.ID, createdMsg)
 	}
 	return nil
@@ -1442,7 +1550,7 @@ func (s *EmailFallbackService) publishInboundCustomerAIRequest(ctx context.Conte
 	if err != nil {
 		return fmt.Errorf("%w: load inbound email AI ownership: %w", ErrInboundEmailAIDispatchRetry, err)
 	}
-	if conv == nil || conv.AnonymizedAt != nil || supportConversationHumanOwned(conv) || conv.CustomerRequestedHumanAt != nil || derefString(conv.AIState) == "escalated" || derefString(conv.FlowState) == model.SupportConversationFlowStateAssignedToHuman || conv.PrimaryRecipientState == model.SupportPrimaryRecipientStateUnconfirmed || isEmailFallbackInboundTerminalStatus(conv.Status) {
+	if conv == nil || !model.SupportAIReplyAllowed(parseSettings(inst.Settings), conv, msg) || conv.AnonymizedAt != nil || supportConversationHumanOwned(conv) || conv.CustomerRequestedHumanAt != nil || derefString(conv.AIState) == "escalated" || derefString(conv.FlowState) == model.SupportConversationFlowStateAssignedToHuman || conv.PrimaryRecipientState == model.SupportPrimaryRecipientStateUnconfirmed || isEmailFallbackInboundTerminalStatus(conv.Status) {
 		return nil
 	}
 	if err := s.supportInboxService.supportAIService.PublishAIRequest(ctx, workspaceID, conversationID, msg.ID, msg.Content); err != nil {
@@ -2154,7 +2262,42 @@ func (s *EmailFallbackService) fireEmailBatch(ctx context.Context, conversationI
 		chatLink = ""
 	}
 	preparedPending, emailAttachments := s.prepareEmailAttachments(ctx, pending)
-	htmlBody, textBody := s.renderBodies(preparedPending, agentName, workspaceName, chatLink, unsubscribeEmail)
+	teamReplyURL := ""
+	if s.teamReplyLinks != nil && aiOnly && settings.ShowTalkToHuman && !model.SupportAIConversationBlocked(conv) {
+		teamReplyURL = s.teamReplyLinks.TeamReplyURL(conv.WorkspaceID, conv.ID)
+	}
+	htmlBody, textBody := s.renderBodiesWithTeamReply(preparedPending, agentName, workspaceName, chatLink, unsubscribeEmail, teamReplyURL)
+	// The portal link is advisory: signing in claims eligible email conversations
+	// (see CustomerPortalRepository.AssociateVerifiedEmail), so sending never
+	// changes visibility or creates identities for an unverified address.
+	portalEmailEligible := conv.Channel == "email" && conv.Source == "email" &&
+		conv.Status != model.SupportConversationStatusSpam &&
+		strings.TrimSpace(conv.PrimaryRecipientState) != model.SupportPrimaryRecipientStateUnconfirmed &&
+		strings.TrimSpace(derefString(conv.CustomerEmail)) != ""
+	if settings.PortalEnabled && workspace != nil && strings.TrimSpace(s.appBaseURL) != "" && (conv.PortalVisible || portalEmailEligible && conv.PortalVisibilityChangedAt == nil) {
+		portalURL := strings.TrimRight(s.appBaseURL, "/") + "/portal/" + url.PathEscape(workspace.Slug)
+		portalRepo := repository.NewCustomerPortalRepository(s.convRepo.DB())
+		// Only customers who may sign in get the link; others would hit a dead end.
+		contacts, err := portalRepo.ContactsForEmail(ctx, conv.WorkspaceID, derefString(conv.CustomerEmail))
+		portalEligible := err == nil && evaluatePortalEligibility(settings.EffectivePortalAccessMode(), contacts).Eligible
+		if err != nil {
+			s.logger.WarnContext(ctx, "portal email eligibility lookup failed", "workspace_id", conv.WorkspaceID, "conversation_id", conv.ID, "error", err)
+		}
+		reference, err := portalRepo.ReferenceForCustomer(ctx, conv.WorkspaceID, conv.ID, derefString(conv.CustomerEmail))
+		if err != nil {
+			s.logger.WarnContext(ctx, "portal email link lookup failed", "workspace_id", conv.WorkspaceID, "conversation_id", conv.ID, "error", err)
+			reference = ""
+		}
+		if s.portalLinks != nil {
+			portalURL = s.portalLinks.PortalRequestURL(ctx, conv.WorkspaceID, workspace.Slug, reference)
+		} else if reference != "" {
+			portalURL += "/requests/" + url.PathEscape(reference)
+		}
+		if portalEligible {
+			htmlBody += `<p><a href="` + html.EscapeString(portalURL) + `">View your request in the support portal</a> (sign-in required)</p>`
+			textBody += "\n\nView your request in the support portal (sign-in required):\n" + portalURL
+		}
+	}
 
 	var postmarkMessageID, sentFromAddress, fromFallbackReason, fromSource string
 	var sendErr error
@@ -2912,6 +3055,19 @@ func (s *EmailFallbackService) buildChatLink(ctx context.Context, conv *model.Su
 }
 
 func (s *EmailFallbackService) renderBodies(messages []model.SupportMessage, agentName, workspaceName, chatLink, unsubscribeEmail string) (string, string) {
+	return s.renderBodiesWithTeamReply(messages, agentName, workspaceName, chatLink, unsubscribeEmail, "")
+}
+
+// supportTeamReplyLinkLead and supportTeamReplyLinkText make up the footer line
+// on AI-written emails that lets the customer ask for a person.
+const (
+	supportTeamReplyLinkLead = "Written by our AI assistant. Prefer a person?"
+	supportTeamReplyLinkText = "Ask our team to reply"
+)
+
+// renderBodiesWithTeamReply renders the email; a non-empty teamReplyURL adds
+// the "Ask our team to reply" line under the signature.
+func (s *EmailFallbackService) renderBodiesWithTeamReply(messages []model.SupportMessage, agentName, workspaceName, chatLink, unsubscribeEmail, teamReplyURL string) (string, string) {
 	htmlChunks := make([]string, 0, len(messages))
 	textChunks := make([]string, 0, len(messages))
 	for _, msg := range messages {
@@ -2962,6 +3118,15 @@ func (s *EmailFallbackService) renderBodies(messages []model.SupportMessage, age
 	htmlBody.WriteString(" via ")
 	htmlBody.WriteString(html.EscapeString(workspaceName))
 	htmlBody.WriteString("</p>")
+	if teamReplyURL != "" {
+		htmlBody.WriteString(`<p style="color:#6b7280;font-size:13px;line-height:20px;">`)
+		htmlBody.WriteString(html.EscapeString(supportTeamReplyLinkLead))
+		htmlBody.WriteString(` <a href="`)
+		htmlBody.WriteString(html.EscapeString(teamReplyURL))
+		htmlBody.WriteString(`">`)
+		htmlBody.WriteString(html.EscapeString(supportTeamReplyLinkText))
+		htmlBody.WriteString("</a></p>")
+	}
 	if chatLink != "" {
 		htmlBody.WriteString(`<p><a href="`)
 		htmlBody.WriteString(html.EscapeString(chatLink))
@@ -2976,6 +3141,9 @@ func (s *EmailFallbackService) renderBodies(messages []model.SupportMessage, age
 		textBody += "\n\n"
 	}
 	textBody += "--\n" + agentName + " via " + workspaceName
+	if teamReplyURL != "" {
+		textBody += "\n\n" + supportTeamReplyLinkLead + " " + supportTeamReplyLinkText + ":\n" + teamReplyURL
+	}
 	if chatLink != "" {
 		textBody += "\n\nView conversation in browser:\n" + chatLink
 	}
@@ -3334,40 +3502,71 @@ func (s *EmailFallbackService) sendFallbackEmailWithSenderFallback(
 		return "", fromAddress, "", err
 	}
 
-	fallbackFromAddress := strings.TrimSpace(s.emailClient.FromEmail())
-	if fallbackFromAddress == "" || strings.EqualFold(fallbackFromAddress, strings.TrimSpace(fromAddress)) {
-		return "", fromAddress, "", err
+	// Prefer the conversation-tagged fallback; keep the plain verified sender as
+	// a last resort in case the provider refuses the tagged address.
+	plainFallback := strings.TrimSpace(s.emailClient.FromEmail())
+	tried := strings.TrimSpace(fromAddress)
+	sendErr := err
+	for _, fallbackFromAddress := range []string{supportConversationFallbackAddress(plainFallback, conversationID), plainFallback} {
+		if fallbackFromAddress == "" || strings.EqualFold(fallbackFromAddress, tried) {
+			continue
+		}
+		fallbackFrom := fmt.Sprintf("%s <%s>", fromDisplayName, fallbackFromAddress)
+		s.logger.WarnContext(ctx, "email fallback branded sender rejected, retrying with verified sender",
+			"error", sendErr,
+			"workspace_id", workspaceID,
+			"conversation_id", conversationID,
+			"branded_from_email", tried,
+			"fallback_from_email", fallbackFromAddress,
+			"reply_to", replyTo,
+		)
+		postmarkMessageID, fallbackErr := s.emailClient.SendEmailWithHeadersAttachmentsAndOptionsContext(ctx, fallbackFrom, to, subject, htmlBody, textBody, replyTo, headers, attachments, options)
+		if fallbackErr == nil {
+			s.logger.InfoContext(ctx, "email fallback sent with verified sender fallback",
+				"workspace_id", workspaceID,
+				"conversation_id", conversationID,
+				"branded_from_email", fromAddress,
+				"fallback_from_email", fallbackFromAddress,
+				"reply_to", replyTo,
+			)
+			return postmarkMessageID, fallbackFromAddress, "postmark_sender_signature_rejected", nil
+		}
+		if !email.IsSenderSignatureError(fallbackErr) || strings.EqualFold(fallbackFromAddress, plainFallback) {
+			return "", fallbackFromAddress, "postmark_sender_signature_rejected", fmt.Errorf("retry with verified sender after branded sender rejection: %w", fallbackErr)
+		}
+		tried, sendErr = fallbackFromAddress, fallbackErr
 	}
-	fallbackFrom := fmt.Sprintf("%s <%s>", fromDisplayName, fallbackFromAddress)
-	s.logger.WarnContext(ctx, "email fallback branded sender rejected, retrying with verified sender",
-		"error", err,
-		"workspace_id", workspaceID,
-		"conversation_id", conversationID,
-		"branded_from_email", fromAddress,
-		"fallback_from_email", fallbackFromAddress,
-		"reply_to", replyTo,
-	)
-	postmarkMessageID, fallbackErr := s.emailClient.SendEmailWithHeadersAttachmentsAndOptionsContext(ctx, fallbackFrom, to, subject, htmlBody, textBody, replyTo, headers, attachments, options)
-	if fallbackErr != nil {
-		return "", fallbackFromAddress, "postmark_sender_signature_rejected", fmt.Errorf("retry with verified sender after branded sender rejection: %w", fallbackErr)
-	}
-	s.logger.InfoContext(ctx, "email fallback sent with verified sender fallback",
-		"workspace_id", workspaceID,
-		"conversation_id", conversationID,
-		"branded_from_email", fromAddress,
-		"fallback_from_email", fallbackFromAddress,
-		"reply_to", replyTo,
-	)
-	return postmarkMessageID, fallbackFromAddress, "postmark_sender_signature_rejected", nil
+	return "", fromAddress, "", err
 }
 
-// resolveOutboundFromAddress returns the preferred branded sender address for a
-// conversation's outbound email. Postmark may still reject this address until
-// the workspace/domain is verified for outbound sending; the send path retries
-// with the configured verified sender while keeping the conversation Reply-To.
+// supportConversationFallbackAddress tags the shared fallback sender with the
+// conversation, e.g. support+conv-<id>@helpin.email. Postmark passes the part
+// after "+" as the mailbox hash, so mail sent to the From address still reaches
+// the conversation instead of an address Helpin cannot route.
+func supportConversationFallbackAddress(base, conversationID string) string {
+	base = strings.TrimSpace(base)
+	local, domain, ok := strings.Cut(base, "@")
+	if !ok || local == "" || domain == "" || strings.Contains(local, "+") {
+		return base
+	}
+	conversationID = strings.TrimSpace(conversationID)
+	if _, err := uuid.Parse(conversationID); err != nil {
+		return base
+	}
+	return local + "+conv-" + conversationID + "@" + domain
+}
+
+// resolveOutboundFromAddress uses a verified custom sender when available.
+// Generated inbox addresses are for receiving; their wildcard MX does not verify
+// them for sending. Use the configured sender while keeping the inbox Reply-To,
+// tagged with the conversation so replies sent to From are not lost.
 func (s *EmailFallbackService) resolveOutboundFromAddress(ctx context.Context, conv *model.SupportConversation) SupportOutboundFromAddressResult {
 	fallback := SupportOutboundFromAddressResult{Email: s.emailClient.FromEmail(), Source: "verified_fallback_sender"}
-	if s.supportInboxService == nil || conv == nil {
+	if conv == nil {
+		return fallback
+	}
+	fallback.Email = supportConversationFallbackAddress(fallback.Email, conv.ID)
+	if s.supportInboxService == nil {
 		return fallback
 	}
 	result, err := s.supportInboxService.ResolveOutboundFromAddress(ctx, conv.WorkspaceID, conv.MailboxID)
@@ -3379,7 +3578,7 @@ func (s *EmailFallbackService) resolveOutboundFromAddress(ctx context.Context, c
 		)
 		return fallback
 	}
-	if strings.TrimSpace(result.Email) == "" {
+	if strings.TrimSpace(result.Email) == "" || result.Source == supportOutboundSenderSourceGeneratedRoute {
 		return fallback
 	}
 	return result
@@ -3583,6 +3782,9 @@ func (s *EmailFallbackService) resolveInboundRouteConversation(ctx context.Conte
 	return s.findConversationByID(ctx, threadLog.ConversationID)
 }
 
+// createInboundConversationFromRoute opens a conversation for a new email. The
+// route may be unsaved (no ID) when the email reached the shared sender; it
+// then only says which workspace and inbox receive it.
 func (s *EmailFallbackService) createInboundConversationFromRoute(ctx context.Context, route *model.SupportEmailRoute, payload model.PostmarkInboundPayload, rawPayload string) error {
 	if route == nil {
 		return nil
@@ -3666,19 +3868,24 @@ func (s *EmailFallbackService) createInboundConversationFromRoute(ctx context.Co
 	primaryRecipientState := model.SupportPrimaryRecipientStateConfirmed
 	var suggestedPrimaryRecipientEmail *string
 	var suggestedPrimaryRecipientName *string
-	threadParticipants := inboundVisibleThreadParticipants(payload, route.InboundAddress, customerEmail)
-	routeAddressInCC := inboundRouteAddressInCC(payload, route.InboundAddress)
-	emailCC := model.DocsStringArray{}
+	supportAddresses, err := s.inboundSupportAddresses(ctx, route.WorkspaceID, route, payload)
+	if err != nil {
+		return err
+	}
+	threadParticipants := normalizeSupportEmailListExcluding(inboundVisibleThreadParticipants(payload, route.InboundAddress, customerEmail), supportAddresses...)
+	routeAddressInCC := false
+	for _, address := range supportAddresses {
+		routeAddressInCC = routeAddressInCC || inboundRouteAddressInCC(payload, address)
+	}
+	emailCC := model.DocsStringArray(threadParticipants)
 	if routeAddressInCC {
-		if email, name := inboundSuggestedPrimaryRecipient(payload, route.InboundAddress, customerEmail); email != "" {
+		if email, name := inboundSuggestedPrimaryRecipient(payload, route.InboundAddress, customerEmail, supportAddresses...); email != "" {
 			primaryRecipientState = model.SupportPrimaryRecipientStateUnconfirmed
 			suggestedPrimaryRecipientEmail = strPtr(email)
 			if strings.TrimSpace(name) != "" {
 				suggestedPrimaryRecipientName = strPtr(strings.TrimSpace(name))
 			}
 		}
-	} else if inboundRouteAddressInTo(payload, route.InboundAddress) {
-		emailCC = model.DocsStringArray(normalizeSupportEmailListExcluding(inboundCCEmails(payload), route.InboundAddress, customerEmail))
 	}
 	viaEmail := "email"
 	now := s.now()
@@ -3762,6 +3969,10 @@ func (s *EmailFallbackService) createInboundConversationFromRoute(ctx context.Co
 		Metadata:          messageMetadata,
 		ViaChannel:        &viaEmail,
 	}
+	if receivedAt := inboundRecoveryReceivedAt(ctx); !receivedAt.IsZero() {
+		message.CreatedAt = receivedAt
+		message.UpdatedAt = receivedAt
+	}
 
 	if isNotice {
 		// System closure is not an AI or human resolution. Do not stamp
@@ -3822,10 +4033,14 @@ func (s *EmailFallbackService) createInboundConversationFromRoute(ctx context.Co
 		message.EmailProjectionConfidence = projection.ProjectionConfidence
 		message.EmailProjectionVersion = projection.Version
 
+		var emailRouteID *string
+		if route.ID != "" {
+			emailRouteID = &route.ID
+		}
 		logRow := &model.SupportEmailLog{
 			WorkspaceID:               route.WorkspaceID,
 			ConversationID:            conversation.ID,
-			EmailRouteID:              &route.ID,
+			EmailRouteID:              emailRouteID,
 			Direction:                 "inbound",
 			MessageIDs:                model.DocsStringArray{message.ID},
 			FromEmail:                 fromEmail,
@@ -3884,7 +4099,7 @@ func (s *EmailFallbackService) createInboundConversationFromRoute(ctx context.Co
 		}
 		return txErr
 	}
-	if s.supportInboxService.emailRouteRepo != nil {
+	if route.ID != "" && s.supportInboxService.emailRouteRepo != nil {
 		route.LastInboundAt = &now
 		if err := s.supportInboxService.emailRouteRepo.TouchInbound(ctx, route.ID, now); err != nil {
 			return err
@@ -3917,6 +4132,7 @@ func (s *EmailFallbackService) createInboundConversationFromRoute(ctx context.Co
 		})
 		s.wsPublisher.Publish(websocket.SupportMessageEvent(conversation.WorkspaceID, message, "email:"+message.ID))
 	}
+	s.scanInboundEmailLinksAsync(message, "email:"+message.ID)
 
 	s.logger.InfoContext(ctx, "postmark inbound created support conversation from route",
 		"message_id", strings.TrimSpace(payload.MessageID),
@@ -4013,6 +4229,11 @@ func mailboxHashFromRecipient(value string) string {
 	if strings.HasPrefix(local, "conv-") || strings.HasPrefix(local, "unsubscribe-") || strings.HasPrefix(local, "route-") || strings.HasPrefix(local, "verify-") {
 		return local
 	}
+	// The tagged fallback sender (support+conv-<id>@…) carries the conversation
+	// after "+"; Postmark usually reports it as MailboxHash already.
+	if _, tag, ok := strings.Cut(local, "+"); ok && strings.HasPrefix(tag, "conv-") {
+		return tag
+	}
 	return ""
 }
 
@@ -4064,6 +4285,48 @@ func mergeExternalEmailReplyMetadata(existing string) string {
 	return string(encoded)
 }
 
+// inboundSupportAddresses identifies our own addresses without treating other
+// recipients at the customer's domain as internal addresses.
+func (s *EmailFallbackService) inboundSupportAddresses(ctx context.Context, workspaceID string, route *model.SupportEmailRoute, payload model.PostmarkInboundPayload) ([]string, error) {
+	var addresses []string
+	if route != nil {
+		addresses = append(addresses, route.InboundAddress, derefString(route.SourceAddress))
+	}
+	// Conversation-specific reply addresses, and the shared fallback sender with
+	// its conversation tags, are not stored as routes.
+	fallbackSender := strings.TrimSpace(s.emailClient.FromEmail())
+	_, fallbackDomain, _ := strings.Cut(fallbackSender, "@")
+	addresses = append(addresses, fallbackSender)
+	for _, address := range inboundRecipientAddresses(payload) {
+		_, domain, hasDomain := strings.Cut(address, "@")
+		ownDomain := strings.EqualFold(domain, s.InboundDomain()) || (fallbackDomain != "" && strings.EqualFold(domain, fallbackDomain))
+		if hasDomain && ownDomain && strings.HasPrefix(mailboxHashFromRecipient(address), "conv-") {
+			addresses = append(addresses, address)
+		}
+	}
+	if s.supportInboxService != nil {
+		if repo := s.supportInboxService.emailRouteRepo; repo != nil {
+			routes, err := repo.ListByWorkspace(ctx, workspaceID)
+			if err != nil {
+				return nil, err
+			}
+			for _, r := range routes {
+				addresses = append(addresses, r.InboundAddress, derefString(r.SourceAddress))
+			}
+		}
+		if repo := s.supportInboxService.emailSenderRepo; repo != nil {
+			senders, err := repo.ListByWorkspace(ctx, workspaceID)
+			if err != nil {
+				return nil, err
+			}
+			for _, sender := range senders {
+				addresses = append(addresses, sender.Email, sender.ForwardingAddress)
+			}
+		}
+	}
+	return normalizedEmailAddressList(addresses), nil
+}
+
 func inboundCCEmails(payload model.PostmarkInboundPayload) []string {
 	values := []string{payload.Cc}
 	for _, addr := range payload.CcFull {
@@ -4093,35 +4356,18 @@ func inboundRouteAddressInCC(payload model.PostmarkInboundPayload, routeAddress 
 	return false
 }
 
-func inboundRouteAddressInTo(payload model.PostmarkInboundPayload, routeAddress string) bool {
-	routeAddress = strings.ToLower(strings.TrimSpace(routeAddress))
-	if routeAddress == "" {
-		return false
-	}
-	values := []string{payload.To}
-	for _, addr := range payload.ToFull {
-		values = append(values, addr.Email)
-	}
-	for _, email := range normalizedEmailAddressList(values) {
-		if strings.EqualFold(email, routeAddress) {
-			return true
-		}
-	}
-	return false
-}
-
-func inboundSuggestedPrimaryRecipient(payload model.PostmarkInboundPayload, routeAddress, currentPrimary string) (string, string) {
+func inboundSuggestedPrimaryRecipient(payload model.PostmarkInboundPayload, routeAddress, currentPrimary string, excluded ...string) (string, string) {
 	routeAddress = strings.ToLower(strings.TrimSpace(routeAddress))
 	currentPrimary = strings.ToLower(strings.TrimSpace(currentPrimary))
 	for _, addr := range payload.ToFull {
 		email := strings.ToLower(strings.TrimSpace(addr.Email))
-		if email == "" || email == routeAddress || email == currentPrimary {
+		if len(normalizeSupportEmailListExcluding([]string{email}, append(excluded, routeAddress, currentPrimary)...)) == 0 {
 			continue
 		}
 		return email, strings.TrimSpace(addr.Name)
 	}
 	for _, email := range normalizedEmailAddressList([]string{payload.To}) {
-		if email == "" || email == routeAddress || email == currentPrimary {
+		if len(normalizeSupportEmailListExcluding([]string{email}, append(excluded, routeAddress, currentPrimary)...)) == 0 {
 			continue
 		}
 		return email, ""

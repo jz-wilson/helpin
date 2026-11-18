@@ -18,6 +18,7 @@ func setupProcessingTestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("open sqlite db: %v", err)
 	}
 	if err := db.Exec(`CREATE TABLE ai_message_processing (
+ action_validation_repair_used BOOLEAN NOT NULL DEFAULT 0,validation_repair_used BOOLEAN NOT NULL DEFAULT 0,
 		id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 		workspace_id TEXT NOT NULL,
 		source_message_id TEXT NOT NULL UNIQUE,
@@ -39,11 +40,11 @@ func TestAIMessageProcessingDeferredLifecycle(t *testing.T) {
 	repo := NewAIMessageProcessingRepository(db)
 	ctx := context.Background()
 
-	first, ok := repo.BeginAttempt(ctx, "ws-1", "msg-1", "conv-1")
+	first, ok, _ := repo.BeginAttempt(ctx, "ws-1", "msg-1", "conv-1")
 	if !ok || first == nil {
 		t.Fatal("begin first attempt")
 	}
-	second, ok := repo.BeginAttempt(ctx, "ws-1", "msg-2", "conv-1")
+	second, ok, _ := repo.BeginAttempt(ctx, "ws-1", "msg-2", "conv-1")
 	if !ok || second == nil {
 		t.Fatal("begin second attempt")
 	}

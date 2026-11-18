@@ -1,3 +1,4 @@
+import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard';
 import { useEffect, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { toast } from 'sonner';
@@ -10,6 +11,7 @@ import { useWorkspaceStore } from '@/stores/workspaceStore';
 import { useCreateContact } from '@/hooks/queries';
 import type { CRMContact, LifecycleStage, LeadStatus } from '@/lib/crmTypes';
 import { entityCreatedToastIcons, showEntityCreatedToast } from '@/components/ui/entity-created-toast';
+import { LIFECYCLE_STAGE_OPTIONS } from '@/lib/crmLifecycle';
 
 interface CreateContactDialogProps {
   open: boolean;
@@ -27,16 +29,6 @@ interface CreateContactDialogProps {
   showCreatedToast?: boolean;
   onCreated?: (contact: CRMContact) => void | Promise<void>;
 }
-
-const lifecycleOptions: { value: LifecycleStage; label: string }[] = [
-  { value: 'subscriber', label: 'Subscriber' },
-  { value: 'lead', label: 'Lead' },
-  { value: 'marketing_qualified', label: 'Marketing Qualified' },
-  { value: 'sales_qualified', label: 'Sales Qualified' },
-  { value: 'opportunity', label: 'Opportunity' },
-  { value: 'customer', label: 'Customer' },
-  { value: 'evangelist', label: 'Evangelist' },
-];
 
 const leadStatusOptions: { value: LeadStatus; label: string }[] = [
   { value: 'new', label: 'New' },
@@ -67,6 +59,18 @@ export function CreateContactDialog({
   const [lifecycleStage, setLifecycleStage] = useState<LifecycleStage>(initialValues?.lifecycle_stage ?? 'subscriber');
   const [leadStatus, setLeadStatus] = useState<LeadStatus>(initialValues?.lead_status ?? 'new');
   const [source, setSource] = useState(initialValues?.source ?? '');
+  useUnsavedChangesGuard(
+    open && (createContact.isPending ||
+      firstName !== (initialValues?.first_name ?? '') ||
+      lastName !== (initialValues?.last_name ?? '') ||
+      email !== (initialValues?.email ?? '') ||
+      phone !== (initialValues?.phone ?? '') ||
+      jobTitle !== (initialValues?.job_title ?? '') ||
+      lifecycleStage !== (initialValues?.lifecycle_stage ?? 'subscriber') ||
+      leadStatus !== (initialValues?.lead_status ?? 'new') ||
+      source !== (initialValues?.source ?? '')),
+    'Save or discard your new contact before refreshing.',
+  );
 
   const resetForm = () => {
     setFirstName(initialValues?.first_name ?? '');
@@ -168,7 +172,7 @@ export function CreateContactDialog({
               <Select value={lifecycleStage} onValueChange={(v) => setLifecycleStage(v as LifecycleStage)}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {lifecycleOptions.map((opt) => (
+                  {LIFECYCLE_STAGE_OPTIONS.map((opt) => (
                     <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
                   ))}
                 </SelectContent>

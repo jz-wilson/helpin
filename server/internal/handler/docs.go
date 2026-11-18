@@ -79,6 +79,7 @@ type DocsHandler struct {
 	translationSvc       *service.DocsHelpcenterTranslationService
 	searchSvc            *service.DocsSearchService
 	importService        *service.DocsImportService
+	aiRewriteSvc         *service.DocsAIRewriteService
 	imageEditSvc         *service.DocsImageEditService
 	embeddingSvc         *service.DocsEmbeddingService
 	embedResolverSvc     *service.DocsEmbedResolverService
@@ -89,6 +90,8 @@ type DocsHandler struct {
 	supportEventRecorder service.SupportEventRecorder
 	supportWidgetConfig  supportWidgetConfigProvider
 	aiSearchSvc          *service.HelpcenterAISearchService
+	helpAssistant        *service.HelpAssistantService
+	supportRequestURL    func(ctx context.Context, workspaceID string) string
 	apiReferenceSvc      *service.DocsAPIReferenceService
 }
 
@@ -112,6 +115,12 @@ type publicHelpcenterConfigResponse struct {
 	PublicSDKURL    string `json:"public_sdk_url,omitempty"`
 	*model.DocsHelpcenterConfig
 	SupportWidgetKey *string `json:"support_widget_key,omitempty"`
+	// AIAssistantEnabled reports whether the help center offers the Ask AI
+	// help assistant.
+	AIAssistantEnabled bool `json:"ai_assistant_enabled"`
+	// SupportRequestURL is the customer portal's new-request form, where the
+	// help assistant hands visitors off; empty when the portal takes none.
+	SupportRequestURL string `json:"support_request_url,omitempty"`
 }
 
 type publicHelpcenterBootstrapResponse struct {
@@ -423,6 +432,8 @@ func (h *DocsHandler) ListDocuments(w http.ResponseWriter, r *http.Request) {
 	teamID := ptrIfSet(q.Get("team_id"))
 	ownerID := ptrIfSet(q.Get("owner_id"))
 	includeArchived := q.Get("include_archived") == "true"
+	// mine=true: documents the caller owns or created (My documents).
+	mine := q.Get("mine") == "true"
 
 	role := ""
 	if actor != nil {
@@ -441,7 +452,19 @@ func (h *DocsHandler) ListDocuments(w http.ResponseWriter, r *http.Request) {
 		"raw_query", r.URL.RawQuery,
 	)
 
-	docs, err := h.documentSvc.ListWithOwner(r.Context(), wsID, spaceID, collectionID, status, teamID, ownerID, userID, role, includeArchived)
+	var (
+		docs []model.DocsDocument
+		err  error
+	)
+	if mine {
+		memberID := ""
+		if actor != nil {
+			memberID = actor.WorkspaceMemberID
+		}
+		docs, err = h.documentSvc.ListMine(r.Context(), wsID, spaceID, collectionID, status, teamID, memberID, userID, role, includeArchived)
+	} else {
+		docs, err = h.documentSvc.ListWithOwner(r.Context(), wsID, spaceID, collectionID, status, teamID, ownerID, userID, role, includeArchived)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -544,7 +567,7 @@ func (h *DocsHandler) UnpublishDocument(w http.ResponseWriter, r *http.Request) 
 
 	// If externally published, unpublish first.
 	art, _ := h.helpcenterSvc.GetArticle(r.Context(), docID)
-	if art != nil && art.PublicPublishedAt != nil {
+	if art.LivePublishedAt() != nil {
 		_ = h.helpcenterSvc.UnpublishExternally(r.Context(), docID)
 	}
 
@@ -562,7 +585,7 @@ func (h *DocsHandler) ArchiveDocument(w http.ResponseWriter, r *http.Request) {
 
 	// If externally published, unpublish first.
 	art, _ := h.helpcenterSvc.GetArticle(r.Context(), docID)
-	if art != nil && art.PublicPublishedAt != nil {
+	if art.LivePublishedAt() != nil {
 		_ = h.helpcenterSvc.UnpublishExternally(r.Context(), docID)
 	}
 
@@ -1540,6 +1563,27 @@ func (h *DocsHandler) ResolveEmbed(w http.ResponseWriter, r *http.Request) {
 
 // ─── Help Center Config ─────────────────────────────────────────────────────
 
+// helpcenterConfigResponse is the admin view of the help center config, with
+// the DNS records its custom domain needs.
+type helpcenterConfigResponse struct {
+	*model.DocsHelpcenterConfig
+	// CustomDomainTarget is the CNAME target; empty when domains aren't verified.
+	CustomDomainTarget         string `json:"custom_domain_target,omitempty"`
+	CustomDomainChallengeName  string `json:"custom_domain_challenge_name,omitempty"`
+	CustomDomainChallengeValue string `json:"custom_domain_challenge_value,omitempty"`
+}
+
+func (h *DocsHandler) helpcenterConfigResponse(cfg *model.DocsHelpcenterConfig) any {
+	if cfg == nil {
+		return nil
+	}
+	resp := helpcenterConfigResponse{DocsHelpcenterConfig: cfg, CustomDomainTarget: h.helpcenterSvc.CustomDomainTarget()}
+	if resp.CustomDomainTarget != "" {
+		resp.CustomDomainChallengeName, resp.CustomDomainChallengeValue = service.CustomDomainChallenge(cfg)
+	}
+	return resp
+}
+
 func (h *DocsHandler) GetHelpcenterConfig(w http.ResponseWriter, r *http.Request) {
 	wsID := middleware.GetWorkspaceID(r.Context())
 	cfg, err := h.helpcenterSvc.GetConfig(r.Context(), wsID)
@@ -1547,7 +1591,23 @@ func (h *DocsHandler) GetHelpcenterConfig(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, cfg)
+	writeJSON(w, http.StatusOK, h.helpcenterConfigResponse(cfg))
+}
+
+// VerifyHelpcenterCustomDomain checks the custom domain's DNS records now.
+func (h *DocsHandler) VerifyHelpcenterCustomDomain(w http.ResponseWriter, r *http.Request) {
+	wsID := middleware.GetWorkspaceID(r.Context())
+	cfg, err := h.helpcenterSvc.VerifyCustomDomain(r.Context(), wsID)
+	if errors.Is(err, service.ErrHelpcenterDomainNotSet) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		slog.ErrorContext(r.Context(), "help center domain check failed", "workspace_id", wsID, "error", err)
+		writeError(w, http.StatusInternalServerError, "unable to check the custom domain")
+		return
+	}
+	writeJSON(w, http.StatusOK, h.helpcenterConfigResponse(cfg))
 }
 
 func (h *DocsHandler) UpdateHelpcenterConfig(w http.ResponseWriter, r *http.Request) {
@@ -1562,7 +1622,7 @@ func (h *DocsHandler) UpdateHelpcenterConfig(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, cfg)
+	writeJSON(w, http.StatusOK, h.helpcenterConfigResponse(cfg))
 }
 
 func (h *DocsHandler) UpdateHelpcenterArticleMetadata(w http.ResponseWriter, r *http.Request) {
@@ -1588,6 +1648,13 @@ func (h *DocsHandler) UploadHelpcenterAsset(w http.ResponseWriter, r *http.Reque
 	assetType := r.URL.Query().Get("type")
 	if assetType != "logo" && assetType != "logo_dark" && assetType != "favicon" && assetType != "og_image" {
 		writeError(w, http.StatusBadRequest, "type must be 'logo', 'logo_dark', 'favicon', or 'og_image'")
+		return
+	}
+
+	// A JSON body names an image to copy from a public address instead of
+	// carrying the file.
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		h.uploadHelpcenterAssetFromURL(w, r, wsID, assetType)
 		return
 	}
 
@@ -1621,6 +1688,59 @@ func (h *DocsHandler) UploadHelpcenterAsset(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"url": publicURL})
+}
+
+func (h *DocsHandler) uploadHelpcenterAssetFromURL(w http.ResponseWriter, r *http.Request, workspaceID, assetType string) {
+	var req struct {
+		SourceURL string `json:"source_url"`
+	}
+	if err := decodeJSON(r, &req); err != nil || strings.TrimSpace(req.SourceURL) == "" {
+		writeError(w, http.StatusBadRequest, "source_url is required")
+		return
+	}
+	publicURL, err := h.helpcenterSvc.UploadAssetFromURL(r.Context(), workspaceID, assetType, req.SourceURL)
+	if err != nil {
+		writeHelpcenterBrandError(w, r, err, "The image could not be saved. Try again in a moment.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": publicURL})
+}
+
+// writeHelpcenterBrandError shows a problem the caller can fix as written
+// and reports anything else without internals.
+func writeHelpcenterBrandError(w http.ResponseWriter, r *http.Request, err error, fallback string) {
+	if errors.Is(err, service.ErrHelpcenterBrandInvalid) {
+		writeError(w, http.StatusBadRequest, strings.TrimPrefix(err.Error(), service.ErrHelpcenterBrandInvalid.Error()+": "))
+		return
+	}
+	slog.ErrorContext(r.Context(), "help center brand import", "error", err, "workspace_id", middleware.GetWorkspaceID(r.Context()))
+	writeError(w, http.StatusBadGateway, fallback)
+}
+
+// ImportHelpcenterBrand handles POST /docs/helpcenter/brand-import. It reads
+// the branding of a public help center or website and returns it as a
+// proposal; nothing is saved.
+func (h *DocsHandler) ImportHelpcenterBrand(w http.ResponseWriter, r *http.Request) {
+	var req model.HelpcenterBrandImportRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	proposal, err := h.helpcenterSvc.ProposeBrand(r.Context(), req.URL)
+	if err != nil {
+		writeHelpcenterBrandError(w, r, err, "The site could not be read. Try again in a moment.")
+		return
+	}
+	if proposal.HeaderLinks == nil {
+		proposal.HeaderLinks = []model.HelpcenterHeaderLink{}
+	}
+	if proposal.SocialLinks == nil {
+		proposal.SocialLinks = []model.HelpcenterSocialLink{}
+	}
+	if proposal.Notes == nil {
+		proposal.Notes = []string{}
+	}
+	writeJSON(w, http.StatusOK, proposal)
 }
 
 // ImportExternalImage handles POST /docs/images/import.
@@ -2128,21 +2248,14 @@ func (h *DocsHandler) PublicSearchArticles(w http.ResponseWriter, r *http.Reques
 	var results []model.PublicSearchResultResponse
 	var err error
 	if mode == "semantic" && h.aiSearchSvc != nil {
-		// Semantic retrieval over public chunks; empty results or errors fall
-		// back to full-text search so the search box never regresses.
-		results, err = h.aiSearchSvc.SemanticSearch(r.Context(), cfg.WorkspaceID, locale, publicAnswerFallbackLocale(cfg, locale), query, spaceSlug, limit)
-		if err != nil {
-			slog.WarnContext(r.Context(), "helpcenter semantic search failed; falling back to full-text",
-				"error", err, "workspace_id", cfg.WorkspaceID)
-			results = nil
-		}
-	}
-	if len(results) == 0 {
+		// Semantic retrieval with the shared full-text fallback.
+		results, err = h.aiSearchSvc.Search(r.Context(), cfg.WorkspaceID, locale, publicAnswerFallbackLocale(cfg, locale), query, spaceSlug, limit)
+	} else {
 		results, err = h.searchSvc.PublicSearch(r.Context(), cfg.WorkspaceID, locale, query, spaceSlug, limit)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
 	searchSourceSignal := model.SupportCoverageSourceSelfService

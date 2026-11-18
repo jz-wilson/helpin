@@ -97,7 +97,8 @@ func (r *DocsHelpcenterRepository) GetConfigBySubdomain(ctx context.Context, sub
 // GetConfigByCustomDomain returns the help center config by custom domain.
 func (r *DocsHelpcenterRepository) GetConfigByCustomDomain(ctx context.Context, domain string) (*model.DocsHelpcenterConfig, error) {
 	var cfg model.DocsHelpcenterConfig
-	if err := r.db.WithContext(ctx).Where("custom_domain = ?", domain).First(&cfg).Error; err != nil {
+	// Only a verified domain serves a help center.
+	if err := r.db.WithContext(ctx).Where("custom_domain = ? AND custom_domain_status IN ?", domain, liveHelpcenterDomainStatuses).First(&cfg).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
@@ -107,13 +108,13 @@ func (r *DocsHelpcenterRepository) GetConfigByCustomDomain(ctx context.Context, 
 	return &cfg, nil
 }
 
-// CustomDomainRegistered reports whether any help center config claims the
+// CustomDomainRegistered reports whether a help center serves the verified
 // domain. It selects nothing but existence so the deny path stays a single
 // hit on the partial unique index idx_docs_hc_config_custom_domain.
 func (r *DocsHelpcenterRepository) CustomDomainRegistered(ctx context.Context, domain string) (bool, error) {
 	var exists bool
 	err := r.db.WithContext(ctx).
-		Raw("SELECT EXISTS(SELECT 1 FROM docs_helpcenter_configs WHERE custom_domain = ?)", domain).
+		Raw("SELECT EXISTS(SELECT 1 FROM docs_helpcenter_configs WHERE custom_domain = ? AND custom_domain_status IN ?)", domain, liveHelpcenterDomainStatuses).
 		Scan(&exists).Error
 	if err != nil {
 		return false, fmt.Errorf("check helpcenter custom domain: %w", err)
@@ -135,6 +136,12 @@ func (r *DocsHelpcenterRepository) UpsertConfig(ctx context.Context, workspaceID
 	}
 
 	cfg := &model.DocsHelpcenterConfig{WorkspaceID: workspaceID}
+	if v, ok := updates["demo_mode"].(bool); ok {
+		cfg.DemoMode = v
+	}
+	if v, ok := updates["official_docs_url"].(string); ok {
+		cfg.OfficialDocsURL = v
+	}
 	if v, ok := updates["subdomain"].(string); ok {
 		cfg.Subdomain = v
 	}
@@ -149,6 +156,15 @@ func (r *DocsHelpcenterRepository) UpsertConfig(ctx context.Context, workspaceID
 	}
 	if v, ok := updates["public_url_mode"].(string); ok {
 		cfg.PublicURLMode = v
+	}
+	if v, ok := updates["custom_domain_status"].(string); ok {
+		cfg.CustomDomainStatus = &v
+	}
+	if v, ok := updates["custom_domain_token"].(string); ok {
+		cfg.CustomDomainToken = &v
+	}
+	if v, ok := updates["custom_domain_verified_at"].(time.Time); ok {
+		cfg.CustomDomainVerifiedAt = &v
 	}
 	if v, ok := updates["reverse_proxy_host"].(*string); ok {
 		cfg.ReverseProxyHost = v
@@ -236,7 +252,16 @@ func (r *DocsHelpcenterRepository) UpsertConfig(ctx context.Context, workspaceID
 	if _, ok := updates["fallback_to_default_locale"]; !ok {
 		cfg.FallbackToDefaultLocale = true
 	}
-	if err := r.db.WithContext(ctx).Create(cfg).Error; err != nil {
+	if err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(cfg).Error; err != nil {
+			return err
+		}
+		if enabled, ok := updates["search_indexing_enabled"].(bool); ok {
+			cfg.SearchIndexingEnabled = enabled
+			return tx.Model(cfg).Update("search_indexing_enabled", enabled).Error
+		}
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("create helpcenter config: %w", err)
 	}
 	return cfg, nil
@@ -376,6 +401,7 @@ func (r *DocsHelpcenterRepository) ListPublicSpaceTranslations(ctx context.Conte
 			AND st.published_at IS NOT NULL
 			AND s.deleted_at IS NULL
 			AND s.type = ?
+			AND s.helpcenter_audience = 'public'
 		`, workspaceID, locale, model.DocsHelpcenterTranslationStatusPublished, model.SpaceTypeExternalCapable).
 		Order("s.position ASC, s.created_at ASC").
 		Scan(&translations).Error; err != nil {
@@ -398,6 +424,7 @@ func (r *DocsHelpcenterRepository) GetPublicSpaceTranslationBySlug(ctx context.C
 			AND st.published_at IS NOT NULL
 			AND s.deleted_at IS NULL
 			AND s.type = ?
+			AND s.helpcenter_audience = 'public'
 		`, workspaceID, locale, slug, model.DocsHelpcenterTranslationStatusPublished, model.SpaceTypeExternalCapable).
 		First(&translation).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -467,6 +494,7 @@ func (r *DocsHelpcenterRepository) GetPublicCollectionTranslationByWorkspaceSlug
 			AND c.deleted_at IS NULL
 			AND s.deleted_at IS NULL
 			AND s.type = ?
+			AND s.helpcenter_audience = 'public'
 		`, workspaceID, locale, slug, model.DocsHelpcenterTranslationStatusPublished, model.SpaceTypeExternalCapable).
 		Limit(2).Find(&translations).Error; err != nil {
 		return nil, fmt.Errorf("get public collection translation by workspace slug: %w", err)
@@ -856,6 +884,7 @@ func (r *DocsHelpcenterRepository) ListPublicCollectionTranslationsByCollection(
 			AND c.deleted_at IS NULL
 			AND s.deleted_at IS NULL
 			AND s.type = ?
+			AND s.helpcenter_audience = 'public'
 		`, collectionID, model.DocsHelpcenterTranslationStatusPublished, model.SpaceTypeExternalCapable).
 		Order("ct.locale ASC").
 		Scan(&translations).Error; err != nil {
@@ -1167,14 +1196,15 @@ func (r *DocsHelpcenterRepository) ListCollectionAncestors(ctx context.Context, 
 	return chain, nil
 }
 
-// ListPublicDocumentsBySpace returns internally published + externally published docs for a help-center space.
+// ListPublicDocumentsBySpace returns the live articles of a help center space,
+// for either audience, for search indexing.
 func (r *DocsHelpcenterRepository) ListPublicDocumentsBySpace(ctx context.Context, workspaceID, spaceID string) ([]model.DocsDocument, error) {
 	var docs []model.DocsDocument
 	if err := r.db.WithContext(ctx).
 		Table("docs_documents d").
 		Select("d.*").
 		Joins("JOIN docs_helpcenter_articles ha ON ha.document_id = d.id").
-		Where("d.workspace_id = ? AND d.space_id = ? AND d.status = 'published' AND d.deleted_at IS NULL AND ha.public_published_at IS NOT NULL", workspaceID, spaceID).
+		Where("d.workspace_id = ? AND d.space_id = ? AND d.status = 'published' AND d.deleted_at IS NULL AND (ha.public_published_at IS NOT NULL OR ha.customer_published_at IS NOT NULL)", workspaceID, spaceID).
 		Order("d.updated_at DESC").
 		Scan(&docs).Error; err != nil {
 		return nil, fmt.Errorf("list public docs by space: %w", err)

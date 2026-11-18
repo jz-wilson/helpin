@@ -742,6 +742,85 @@
         "x-helpin-toolset": "docs"
       }
     },
+    "/comments/{comment_id}": {
+      "delete": {
+        "description": "Permanently delete a task comment. Only the comment's author can delete it, and the deletion cannot be undone.\n\n**Required scope:** `helpin.pm.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "deleteTaskComment",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Delete a task comment",
+        "tags": [
+          "Tasks"
+        ],
+        "x-helpin-mcp-tool": "delete_task_comment",
+        "x-helpin-scope": "helpin.pm.write",
+        "x-helpin-toolset": "pm"
+      }
+    },
     "/crm/activities": {
       "post": {
         "description": "Log a note, call, meeting, or email against exactly one existing CRM contact, company, or deal.\n\n**Required scope:** `helpin.crm.write`. Write operations are unavailable to read-only tokens.",
@@ -866,10 +945,10 @@
         "x-helpin-toolset": "crm"
       }
     },
-    "/crm/companies": {
+    "/crm/associations": {
       "get": {
-        "description": "List a bounded set of CRM companies in the current workspace.\n\n**Required scope:** `helpin.crm.read`.",
-        "operationId": "listCrmCompanies",
+        "description": "List a bounded set of associations for one existing workspace object.\n\n**Required scope:** `helpin.crm.read`.",
+        "operationId": "listCrmAssociations",
         "parameters": [
           {
             "description": "Maximum number of results. Defaults to 50, max 100.",
@@ -879,6 +958,395 @@
             "schema": {
               "maximum": 100,
               "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Object ID whose associations should be listed.",
+            "in": "query",
+            "name": "object_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "object_type",
+            "required": true,
+            "schema": {
+              "enum": [
+                "contact",
+                "company",
+                "deal",
+                "epic",
+                "task",
+                "support_conversation"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "List associations for an object",
+        "tags": [
+          "CRM"
+        ],
+        "x-helpin-mcp-tool": "list_crm_associations",
+        "x-helpin-scope": "helpin.crm.read",
+        "x-helpin-toolset": "crm"
+      },
+      "post": {
+        "description": "Create a safe association between two existing objects in the current workspace.\n\n**Required scope:** `helpin.crm.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "linkCrmObjects",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "association_label": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "from_object_id": {
+                    "description": "Existing source object ID.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "from_object_type": {
+                    "enum": [
+                      "contact",
+                      "company",
+                      "deal",
+                      "epic",
+                      "task",
+                      "support_conversation"
+                    ],
+                    "type": "string"
+                  },
+                  "to_object_id": {
+                    "description": "Existing destination object ID.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "to_object_type": {
+                    "enum": [
+                      "contact",
+                      "company",
+                      "deal",
+                      "epic",
+                      "task",
+                      "support_conversation"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "from_object_id",
+                  "from_object_type",
+                  "to_object_id",
+                  "to_object_type"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Link two objects",
+        "tags": [
+          "CRM"
+        ],
+        "x-helpin-mcp-tool": "link_crm_objects",
+        "x-helpin-scope": "helpin.crm.write",
+        "x-helpin-toolset": "crm"
+      }
+    },
+    "/crm/associations/{association_id}": {
+      "delete": {
+        "description": "Remove one existing CRM association by ID without deleting either linked object.\n\n**Required scope:** `helpin.crm.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "unlinkCrmAssociation",
+        "parameters": [
+          {
+            "description": "Existing object ID.",
+            "in": "path",
+            "name": "association_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Remove an association",
+        "tags": [
+          "CRM"
+        ],
+        "x-helpin-mcp-tool": "unlink_crm_association",
+        "x-helpin-scope": "helpin.crm.write",
+        "x-helpin-toolset": "crm"
+      }
+    },
+    "/crm/companies": {
+      "get": {
+        "description": "List a bounded set of CRM companies in the current workspace, with their custom properties and product-usage behavior when synced. Use filter to segment on native fields or custom_properties.\u003ckey\u003e; call describe_crm_fields first to learn which keys and values exist.\n\n**Required scope:** `helpin.crm.read`.",
+        "operationId": "listCrmCompanies",
+        "parameters": [
+          {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "logic": {
+                      "default": "and",
+                      "enum": [
+                        "and",
+                        "or"
+                      ],
+                      "type": "string"
+                    },
+                    "rules": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "field": {
+                            "maxLength": 100,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "operator": {
+                            "enum": [
+                              "is",
+                              "is_not",
+                              "contains",
+                              "not_contains",
+                              "starts_with",
+                              "ends_with",
+                              "is_empty",
+                              "is_not_empty",
+                              "gt",
+                              "gte",
+                              "lt",
+                              "lte",
+                              "on",
+                              "before",
+                              "after",
+                              "on_or_before",
+                              "on_or_after",
+                              "between",
+                              "is_any_of",
+                              "is_none_of"
+                            ],
+                            "type": "string"
+                          },
+                          "value": {
+                            "maxLength": 500,
+                            "type": "string"
+                          },
+                          "values": {
+                            "items": {
+                              "maxLength": 500,
+                              "type": "string"
+                            },
+                            "maxItems": 50,
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "field",
+                          "operator"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 20,
+                      "minItems": 1,
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "rules"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Structured filter. Fields: name, domain, external_id, industry, headquarters, description (text); employee_count, annual_revenue, sessions_30d (number); owner_member_id (id); created_at, updated_at, first_seen_at, last_seen_at (date); custom_properties.\u003ckey\u003e (text or number; describe_crm_fields lists the keys in use). Text matching is case-insensitive; is_empty and is_not_empty take no value; between takes two values; is_any_of and is_none_of take values and also match elements of list-valued custom properties (is_none_of includes records without a value); gt, gte, lt, lte, and between compare custom properties as numbers, skipping values that are not numeric. first_seen_at, last_seen_at, and sessions_30d come from synced product events; records without events are empty.",
+            "in": "query",
+            "name": "filter",
+            "required": false
+          },
+          {
+            "description": "Maximum number of results. Defaults to 50, max 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Zero-based result offset for paging.",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "minimum": 0,
               "type": "integer"
             }
           },
@@ -956,11 +1424,10 @@
     },
     "/crm/companies/{company_id}": {
       "get": {
-        "description": "Get one CRM company in the current workspace.\n\n**Required scope:** `helpin.crm.read`.",
+        "description": "Get one CRM company with its custom properties. Optionally include its logged activities (notes, calls, meetings, emails), contacts, and deals.\n\n**Required scope:** `helpin.crm.read`.",
         "operationId": "getCrmCompany",
         "parameters": [
           {
-            "description": "Existing object ID.",
             "in": "path",
             "name": "company_id",
             "required": true,
@@ -968,6 +1435,26 @@
               "minLength": 1,
               "type": "string"
             }
+          },
+          {
+            "description": "Related records to return, newest first, up to 25 of each.",
+            "explode": false,
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "items": {
+                "enum": [
+                  "activities",
+                  "contacts",
+                  "deals"
+                ],
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "style": "form"
           }
         ],
         "responses": {
@@ -1126,9 +1613,93 @@
     },
     "/crm/contacts": {
       "get": {
-        "description": "List CRM contacts in the workspace, optionally filtered by a case-insensitive name, email, or job-title query. Returns name, email, and job title.\n\n**Required scope:** `helpin.crm.read`.",
+        "description": "List CRM contacts in the workspace, optionally filtered by a case-insensitive name, email, or job-title query, or by a structured filter on native fields or custom_properties.\u003ckey\u003e. Returns name, email, job title, custom properties, and product-usage behavior when synced. Call describe_crm_fields first to learn which custom property keys and values exist; an unknown key matches nothing.\n\n**Required scope:** `helpin.crm.read`.",
         "operationId": "listContacts",
         "parameters": [
+          {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "logic": {
+                      "default": "and",
+                      "enum": [
+                        "and",
+                        "or"
+                      ],
+                      "type": "string"
+                    },
+                    "rules": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "field": {
+                            "maxLength": 100,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "operator": {
+                            "enum": [
+                              "is",
+                              "is_not",
+                              "contains",
+                              "not_contains",
+                              "starts_with",
+                              "ends_with",
+                              "is_empty",
+                              "is_not_empty",
+                              "gt",
+                              "gte",
+                              "lt",
+                              "lte",
+                              "on",
+                              "before",
+                              "after",
+                              "on_or_before",
+                              "on_or_after",
+                              "between",
+                              "is_any_of",
+                              "is_none_of"
+                            ],
+                            "type": "string"
+                          },
+                          "value": {
+                            "maxLength": 500,
+                            "type": "string"
+                          },
+                          "values": {
+                            "items": {
+                              "maxLength": 500,
+                              "type": "string"
+                            },
+                            "maxItems": 50,
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "field",
+                          "operator"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 20,
+                      "minItems": 1,
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "rules"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Structured filter. Fields: name, email, phone, job_title, source (text); lifecycle_stage, lead_status, portal_access (enum); owner_member_id (id); created_at, updated_at, first_seen_at, last_seen_at (date); sessions_30d (number); custom_properties.\u003ckey\u003e (text or number; describe_crm_fields lists the keys in use). Text matching is case-insensitive; is_empty and is_not_empty take no value; between takes two values; is_any_of and is_none_of take values and also match elements of list-valued custom properties (is_none_of includes records without a value); gt, gte, lt, lte, and between compare custom properties as numbers, skipping values that are not numeric. first_seen_at, last_seen_at, and sessions_30d come from synced product events; records without events are empty.",
+            "in": "query",
+            "name": "filter",
+            "required": false
+          },
           {
             "description": "Maximum number of contacts to return. Defaults to 20, max 50.",
             "in": "query",
@@ -1215,7 +1786,7 @@
     },
     "/crm/contacts/{contact_id}": {
       "get": {
-        "description": "Get one CRM contact by ID.\n\n**Required scope:** `helpin.crm.read`.",
+        "description": "Get one CRM contact with its custom properties. Optionally include its logged activities.\n\n**Required scope:** `helpin.crm.read`.",
         "operationId": "getCrmContact",
         "parameters": [
           {
@@ -1223,8 +1794,27 @@
             "name": "contact_id",
             "required": true,
             "schema": {
+              "minLength": 1,
               "type": "string"
             }
+          },
+          {
+            "description": "Related records to return, newest first, up to 25 of each.",
+            "explode": false,
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "items": {
+                "enum": [
+                  "activities"
+                ],
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "style": "form"
           }
         ],
         "responses": {
@@ -1407,6 +1997,107 @@
           "CRM"
         ],
         "x-helpin-mcp-tool": "update_crm_contact",
+        "x-helpin-scope": "helpin.crm.write",
+        "x-helpin-toolset": "crm"
+      }
+    },
+    "/crm/contacts/{contact_id}/primary-company": {
+      "put": {
+        "description": "Set an existing company as the primary company for an existing contact in the current workspace.\n\n**Required scope:** `helpin.crm.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "setPrimaryContactCompany",
+        "parameters": [
+          {
+            "description": "Existing CRM contact ID.",
+            "in": "path",
+            "name": "contact_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "company_id": {
+                    "description": "Existing CRM company ID.",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "company_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Set a contact's primary company",
+        "tags": [
+          "CRM"
+        ],
+        "x-helpin-mcp-tool": "set_primary_contact_company",
         "x-helpin-scope": "helpin.crm.write",
         "x-helpin-toolset": "crm"
       }
@@ -1632,7 +2323,7 @@
     },
     "/crm/deals/{deal_id}": {
       "get": {
-        "description": "Get one CRM deal by ID.\n\n**Required scope:** `helpin.crm.read`.",
+        "description": "Get one CRM deal. Optionally include its logged activities.\n\n**Required scope:** `helpin.crm.read`.",
         "operationId": "getCrmDeal",
         "parameters": [
           {
@@ -1640,8 +2331,27 @@
             "name": "deal_id",
             "required": true,
             "schema": {
+              "minLength": 1,
               "type": "string"
             }
+          },
+          {
+            "description": "Related records to return, newest first, up to 25 of each.",
+            "explode": false,
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "items": {
+                "enum": [
+                  "activities"
+                ],
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "style": "form"
           }
         ],
         "responses": {
@@ -2038,6 +2748,126 @@
         "x-helpin-toolset": "crm"
       }
     },
+    "/crm/fields": {
+      "get": {
+        "description": "Describe the fields list_contacts and list_crm_companies can filter on: native fields with their types, operators, and allowed values, and every custom property key in use with its value type, record count, most common values, and numeric range. Pass key to list one custom property's values, and value_query to search them. Call this before filtering on or writing custom properties, and reuse existing keys instead of inventing near-duplicates. Use compact=true for a reusable field map without record samples.\n\n**Required scope:** `helpin.crm.read`.",
+        "operationId": "describeCrmFields",
+        "parameters": [
+          {
+            "description": "Return field definitions without record samples. Reuse in this workspace and connection; refresh after field changes.",
+            "in": "query",
+            "name": "compact",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Optional custom property key (with or without the custom_properties. prefix). Returns that key's values instead of the field catalog.",
+            "in": "query",
+            "name": "key",
+            "required": false,
+            "schema": {
+              "maxLength": 100,
+              "type": "string"
+            }
+          },
+          {
+            "description": "With key: values to return. Defaults to 20, max 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Which records to describe.",
+            "in": "query",
+            "name": "object_type",
+            "required": true,
+            "schema": {
+              "enum": [
+                "contact",
+                "company"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Refresh a cached compact field map after schema changes or unknown-field errors.",
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With key: only values containing this case-insensitive text.",
+            "in": "query",
+            "name": "value_query",
+            "required": false,
+            "schema": {
+              "maxLength": 120,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Describe filterable contact or company fields and custom properties",
+        "tags": [
+          "CRM"
+        ],
+        "x-helpin-mcp-tool": "describe_crm_fields",
+        "x-helpin-scope": "helpin.crm.read",
+        "x-helpin-toolset": "crm"
+      }
+    },
     "/crm/pipelines": {
       "get": {
         "description": "List CRM pipelines and their ordered stages in the current workspace.\n\n**Required scope:** `helpin.crm.read`.",
@@ -2104,6 +2934,174 @@
         ],
         "x-helpin-mcp-tool": "list_crm_pipelines",
         "x-helpin-scope": "helpin.crm.read",
+        "x-helpin-toolset": "crm"
+      }
+    },
+    "/crm/records/upsert": {
+      "post": {
+        "description": "Create or update up to 100 CRM companies or contacts in one call, matched on a stable key so reruns never duplicate. Companies match on domain (normalized), external_id, or id; contacts on email or id. Use fill_only to fill empty values without overwriting existing ones. Each record may carry a note, logged once as a note activity. Returns a result per record; one bad record does not stop the batch. Before writing custom_properties, call describe_crm_fields to reuse existing keys; the response lists new_custom_property_keys this batch introduced. Company fields: annual_revenue, description, domain, employee_count, external_id, headquarters, industry, linkedin_url, logo_url, name. Contact fields: country_code, country_name, description, email, first_name, job_title, last_name, lead_status, lifecycle_stage, linkedin_url, phone, primary_location, source.\n\n**Required scope:** `helpin.crm.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "upsertCrmRecords",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "fill_only": {
+                    "default": false,
+                    "description": "Only fill empty fields and missing custom properties; never overwrite.",
+                    "type": "boolean"
+                  },
+                  "match_on": {
+                    "description": "Key used to find existing records. Defaults to domain for companies and email for contacts.",
+                    "enum": [
+                      "domain",
+                      "external_id",
+                      "email",
+                      "id"
+                    ],
+                    "type": "string"
+                  },
+                  "mode": {
+                    "default": "upsert",
+                    "enum": [
+                      "upsert",
+                      "create_only",
+                      "update_only"
+                    ],
+                    "type": "string"
+                  },
+                  "object_type": {
+                    "enum": [
+                      "company",
+                      "contact"
+                    ],
+                    "type": "string"
+                  },
+                  "records": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "custom_properties": {
+                          "description": "snake_case keys with string, number, boolean, or string-list values, merged into existing properties. null removes a key. Reuse keys describe_crm_fields reports before adding new ones. Filter on them with custom_properties.\u003ckey\u003e in list tools.",
+                          "type": "object"
+                        },
+                        "fields": {
+                          "additionalProperties": {
+                            "type": [
+                              "string",
+                              "number"
+                            ]
+                          },
+                          "description": "Native fields by name. Omit a field to leave it unchanged.",
+                          "type": "object"
+                        },
+                        "id": {
+                          "description": "Existing record ID. Required when match_on is id.",
+                          "type": "string"
+                        },
+                        "note": {
+                          "additionalProperties": false,
+                          "description": "Evidence to log as a note activity. An identical note already logged by this tool is not repeated.",
+                          "properties": {
+                            "body": {
+                              "maxLength": 20000,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "subject": {
+                              "maxLength": 500,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "body"
+                          ],
+                          "type": "object"
+                        },
+                        "ref": {
+                          "description": "Your identifier for this record, echoed in its result.",
+                          "maxLength": 200,
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "maxItems": 100,
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "object_type",
+                  "records"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Create or update companies or contacts in bulk",
+        "tags": [
+          "CRM"
+        ],
+        "x-helpin-mcp-tool": "upsert_crm_records",
+        "x-helpin-scope": "helpin.crm.write",
         "x-helpin-toolset": "crm"
       }
     },
@@ -5213,6 +6211,106 @@
         "x-helpin-toolset": "pm"
       }
     },
+    "/support/companies/{company_id}/sla-tier": {
+      "put": {
+        "description": "Set a company's SLA tier by tier name or ID, or clear it with an empty tier. SLA policies that match the tier apply to the company's open conversations from now on. Requires support admin access.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "setCompanySlaTier",
+        "parameters": [
+          {
+            "description": "CRM company ID.",
+            "in": "path",
+            "name": "company_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "tier": {
+                    "description": "Tier name or ID; empty or null clears the tier.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Set a company's SLA tier",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "set_company_sla_tier",
+        "x-helpin-scope": "helpin.support.write",
+        "x-helpin-toolset": "support"
+      }
+    },
     "/support/conversations": {
       "get": {
         "description": "List support conversations with optional status and search filters.\n\n**Required scope:** `helpin.support.read`.",
@@ -5305,6 +6403,114 @@
         ],
         "x-helpin-mcp-tool": "list_support_conversations",
         "x-helpin-scope": "helpin.support.read",
+        "x-helpin-toolset": "support"
+      },
+      "post": {
+        "description": "Start a support conversation with a customer and email them the first message as the authenticated teammate.\n\n**Required scope:** `helpin.support.reply`. Write operations are unavailable to read-only tokens.",
+        "operationId": "createSupportConversation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "content": {
+                    "description": "First message in Markdown.",
+                    "maxLength": 20000,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "customer_email": {
+                    "format": "email",
+                    "maxLength": 320,
+                    "type": "string"
+                  },
+                  "customer_name": {
+                    "maxLength": 200,
+                    "type": "string"
+                  },
+                  "inbox_id": {
+                    "description": "Team inbox ID. Omit for the main inbox.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "subject": {
+                    "maxLength": 500,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "content",
+                  "customer_email",
+                  "subject"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Start a conversation with a customer",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "create_support_conversation",
+        "x-helpin-scope": "helpin.support.reply",
         "x-helpin-toolset": "support"
       }
     },
@@ -5578,6 +6784,111 @@
         "x-helpin-toolset": "support"
       }
     },
+    "/support/conversations/{conversation_id}/fields": {
+      "patch": {
+        "description": "Set a support conversation's request type and conversation field values. Fields are set key by key; null clears one. Values must fit the field: text, a number, a YYYY-MM-DD date, true/false, or option values for choice fields. List request types and fields first.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "setSupportConversationFields",
+        "parameters": [
+          {
+            "description": "Support conversation ID.",
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "fields": {
+                    "additionalProperties": true,
+                    "description": "Field values by key; null clears a field.",
+                    "type": "object"
+                  },
+                  "request_type_id": {
+                    "description": "Request type ID; empty or null clears it. Leave out to keep the type.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Set the request type and fields",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "set_support_conversation_fields",
+        "x-helpin-scope": "helpin.support.write",
+        "x-helpin-toolset": "support"
+      }
+    },
     "/support/conversations/{conversation_id}/inbox": {
       "put": {
         "description": "Move an existing support conversation to another accessible inbox.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
@@ -5764,6 +7075,608 @@
         ],
         "x-helpin-mcp-tool": "list_conversation_messages",
         "x-helpin-scope": "helpin.support.read",
+        "x-helpin-toolset": "support"
+      }
+    },
+    "/support/conversations/{conversation_id}/notes": {
+      "post": {
+        "description": "Post a team-only note immediately; no customer delivery or status/AI-control change. Check existing conversation notes and linked-task context first. Write only when requested or when new actionable information is missing from both. Creating or linking a task alone needs no note. Use 1-3 short sentences or bullets unless more detail is requested. Include only the new finding, blocker, or next step; link existing details instead of repeating the thread, task, progress, or an unsolicited draft reply. Label hypotheses clearly: code behavior alone does not verify this customer's root cause. Attribute observations to their actual source. Omit secrets. A note does not replace a customer reply.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "addSupportConversationNote",
+        "parameters": [
+          {
+            "description": "Support conversation ID. Omit only when the run targets that conversation.",
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "content": {
+                    "description": "Brief internal note in Markdown. Only new actionable information or explicitly requested content; no repeated summaries or unverified conclusions stated as facts.",
+                    "maxLength": 20000,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "content"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Add an internal note",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "add_support_conversation_note",
+        "x-helpin-scope": "helpin.support.write",
+        "x-helpin-toolset": "support"
+      }
+    },
+    "/support/conversations/{conversation_id}/priority": {
+      "put": {
+        "description": "Change a support conversation's priority. SLA policies that match the new priority apply to its open targets.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "setSupportConversationPriority",
+        "parameters": [
+          {
+            "description": "Support conversation ID.",
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "priority": {
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high",
+                      "urgent"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "priority"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Change the priority",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "set_support_conversation_priority",
+        "x-helpin-scope": "helpin.support.write",
+        "x-helpin-toolset": "support"
+      }
+    },
+    "/support/conversations/{conversation_id}/replies": {
+      "post": {
+        "description": "Send a public reply to the customer as the authenticated teammate. It is delivered like a reply from the inbox: in chat, by email, or both.\n\n**Required scope:** `helpin.support.reply`. Write operations are unavailable to read-only tokens.",
+        "operationId": "replyToSupportConversation",
+        "parameters": [
+          {
+            "description": "Support conversation ID.",
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "content": {
+                    "description": "Reply in Markdown.",
+                    "maxLength": 20000,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "delivery_mode": {
+                    "description": "Omit to deliver the way the inbox would by default.",
+                    "enum": [
+                      "chat_only",
+                      "chat_and_email",
+                      "email_only"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "content"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Reply to the customer",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "reply_to_support_conversation",
+        "x-helpin-scope": "helpin.support.reply",
+        "x-helpin-toolset": "support"
+      }
+    },
+    "/support/conversations/{conversation_id}/snooze": {
+      "delete": {
+        "description": "Return a snoozed support conversation to the team's queues now.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "unsnoozeSupportConversation",
+        "parameters": [
+          {
+            "description": "Existing object ID.",
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Wake a snoozed conversation",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "unsnooze_support_conversation",
+        "x-helpin-scope": "helpin.support.write",
+        "x-helpin-toolset": "support"
+      },
+      "put": {
+        "description": "Hide an open support conversation from the team's queues until a time. A customer reply wakes it earlier.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "snoozeSupportConversation",
+        "parameters": [
+          {
+            "description": "Support conversation ID.",
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "until": {
+                    "description": "RFC 3339 time between one minute and one year from now.",
+                    "format": "date-time",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "until"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Snooze a conversation",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "snooze_support_conversation",
+        "x-helpin-scope": "helpin.support.write",
+        "x-helpin-toolset": "support"
+      }
+    },
+    "/support/conversations/{conversation_id}/status": {
+      "put": {
+        "description": "Change a support conversation's status: open, waiting_on_customer, resolved or spam. Resolving ends a snooze; customers may be asked to rate a resolved conversation.\n\n**Required scope:** `helpin.support.write`. Write operations are unavailable to read-only tokens.",
+        "operationId": "setSupportConversationStatus",
+        "parameters": [
+          {
+            "description": "Support conversation ID.",
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "open",
+                      "waiting_on_customer",
+                      "resolved",
+                      "spam"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "Change the status",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "set_support_conversation_status",
+        "x-helpin-scope": "helpin.support.write",
         "x-helpin-toolset": "support"
       }
     },
@@ -6027,6 +7940,62 @@
         "x-helpin-toolset": "support"
       }
     },
+    "/support/request-types": {
+      "get": {
+        "description": "List the workspace's request types, such as Bug report, with the conversation fields each asks for, and every active conversation field with its type and options.\n\n**Required scope:** `helpin.support.read`.",
+        "operationId": "listSupportRequestTypes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "List request types and fields",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "list_support_request_types",
+        "x-helpin-scope": "helpin.support.read",
+        "x-helpin-toolset": "support"
+      }
+    },
     "/support/setup": {
       "get": {
         "description": "Start or resume customer support onboarding. Read current configuration checks, permission-aware browser handoff links, and instructions for email, website chat, knowledge, inboxes, routing, AI, and end-to-end testing. No settings are changed. Requires support administration permission. Use the returned links with your own browser tools or hand them to the user, then call again to verify progress.\n\n**Required scope:** `helpin.support.read`.",
@@ -6079,6 +8048,62 @@
           "Support"
         ],
         "x-helpin-mcp-tool": "get_support_setup",
+        "x-helpin-scope": "helpin.support.read",
+        "x-helpin-toolset": "support"
+      }
+    },
+    "/support/sla-tiers": {
+      "get": {
+        "description": "List the workspace's SLA tiers, such as Gold or Standard, and how many companies carry each.\n\n**Required scope:** `helpin.support.read`.",
+        "operationId": "listSupportSlaTiers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The result. Its shape depends on the resource; fields match what the Helpin app shows."
+                    },
+                    "links": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Deep links into the Helpin app.",
+                      "type": "object"
+                    },
+                    "summary": {
+                      "description": "A short human-readable description of the outcome.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "summary": "List SLA tiers",
+        "tags": [
+          "Support"
+        ],
+        "x-helpin-mcp-tool": "list_support_sla_tiers",
         "x-helpin-scope": "helpin.support.read",
         "x-helpin-toolset": "support"
       }
@@ -6561,6 +8586,11 @@
                   },
                   "state_id": {
                     "description": "Optional workflow state ID override. Omit this field to use the workflow default state; do not send an empty string.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "support_conversation_id": {
+                    "description": "Support conversation the task comes from. Pass it whenever you create a task for a support conversation: the task is linked to it, gets its contact and company links, and the conversation shows it was created. Do not call link_support_conversation_task afterwards.",
                     "minLength": 1,
                     "type": "string"
                   },

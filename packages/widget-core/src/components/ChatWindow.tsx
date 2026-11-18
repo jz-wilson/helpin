@@ -42,7 +42,7 @@ interface ChatWindowProps {
   showPreChatForm: boolean;
   contactCaptureCompleted?: boolean;
   onCaptureEmail?: (email: string) => Promise<void>;
-  onPreChatSubmit: (data: { phone: string; email: string }) => void;
+  onPreChatSubmit: (data: { phone: string; email: string }) => void | Promise<void>;
   isTyping?: boolean;
   isAIThinking?: boolean;
   aiProgressLabel?: string;
@@ -76,7 +76,7 @@ interface ChatWindowProps {
   onAnswerFeedback?: (messageId: string, helpful: boolean) => Promise<boolean>;
   queuedMessageCount?: number;
   csatSubmitted?: boolean;
-  onCsatSubmit?: (rating: number, feedback?: string) => void;
+  onCsatSubmit?: (rating: number, feedback?: string) => void | Promise<void>;
 }
 
 export const ChatWindow: FunctionComponent<ChatWindowProps> = ({

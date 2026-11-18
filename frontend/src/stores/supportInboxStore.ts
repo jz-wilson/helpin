@@ -1,8 +1,9 @@
 import { create } from 'zustand';
+import { registerAppRefreshGuard } from '@/lib/appLoadRecovery';
 import type { ConversationListFilters } from '@/lib/supportInboxFilters';
 import { defaultConversationListFiltersForNav, parseSupportInboxViewFilters } from '@/lib/supportInboxFilters';
 
-export type NavFilter = 'inbox' | 'mine' | 'waiting' | 'resolved' | 'spam' | 'ai_active' | 'resolved_by_ai';
+export type NavFilter = 'inbox' | 'mine' | 'waiting' | 'snoozed' | 'resolved' | 'spam' | 'ai_active' | 'resolved_by_ai';
 export type ReplyMode = 'reply' | 'note';
 export type DetailSidebarMode = 'details' | 'agents';
 export type ActivePanel = 'nav' | 'list' | 'thread' | 'detail';
@@ -94,22 +95,28 @@ function loadDrafts(): Record<string, string> {
 
 let _draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function saveDraftsDebounced(drafts: Record<string, string>) {
+export function flushSupportDrafts(): boolean {
   if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
-  _draftSaveTimer = setTimeout(() => {
-    try {
-      const filtered = Object.fromEntries(
-        Object.entries(drafts).filter(([, v]) => v.length > 0)
-      );
-      if (Object.keys(filtered).length === 0) {
-        localStorage.removeItem(DRAFTS_STORAGE_KEY);
-      } else {
-        localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(filtered));
-      }
-    } catch {
-      // Ignore local storage write failures.
+  _draftSaveTimer = null;
+  const drafts = useSupportInboxStore.getState().drafts;
+  try {
+    const filtered = Object.fromEntries(
+      Object.entries(drafts).filter(([, v]) => v.length > 0)
+    );
+    if (Object.keys(filtered).length === 0) {
+      localStorage.removeItem(DRAFTS_STORAGE_KEY);
+    } else {
+      localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(filtered));
     }
-  }, 500);
+    return true;
+  } catch {
+    return !Object.values(drafts).some(value => value.length > 0);
+  }
+}
+
+function saveDraftsDebounced() {
+  if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
+  _draftSaveTimer = setTimeout(flushSupportDrafts, 500);
 }
 
 function removeDraftFromStorage(conversationId: string) {
@@ -161,6 +168,8 @@ interface SupportInboxState {
   // Detail sidebar
   detailSidebarCollapsed: boolean;
   detailSidebarMode: DetailSidebarMode;
+  /** A request waiting to prefill the conversation's Ask Agent chat. */
+  agentDraft: { conversationId: string; text: string } | null;
   // Create dialog
   createDialogOpen: boolean;
   createCustomViewOpen: boolean;
@@ -202,6 +211,8 @@ interface SupportInboxState {
   setReplyMode: (mode: ReplyMode) => void;
   toggleDetailSidebar: () => void;
   setDetailSidebarMode: (mode: DetailSidebarMode) => void;
+  askAgentWithDraft: (conversationId: string, text: string) => void;
+  clearAgentDraft: () => void;
   setCreateDialogOpen: (open: boolean) => void;
   setCreateCustomViewOpen: (open: boolean) => void;
   setTeamInboxDialogOpen: (open: boolean) => void;
@@ -231,6 +242,7 @@ export const useSupportInboxStore = create<SupportInboxState>((set, get) => {
     replyMode: 'reply',
     detailSidebarCollapsed: persisted.detailSidebarCollapsed,
     detailSidebarMode: 'details',
+    agentDraft: null,
     createDialogOpen: false,
     createCustomViewOpen: false,
     teamInboxDialogOpen: false,
@@ -419,6 +431,8 @@ export const useSupportInboxStore = create<SupportInboxState>((set, get) => {
       });
     },
     setDetailSidebarMode: (mode) => set({ detailSidebarMode: mode }),
+    askAgentWithDraft: (conversationId, text) => set({ detailSidebarMode: 'agents', agentDraft: { conversationId, text } }),
+    clearAgentDraft: () => set({ agentDraft: null }),
     setCreateDialogOpen: (open) => set({ createDialogOpen: open }),
     setCreateCustomViewOpen: (open) => set({ createCustomViewOpen: open }),
     setTeamInboxDialogOpen: (open) => set({ teamInboxDialogOpen: open, ...(!open && { editMailboxId: null }) }),
@@ -453,11 +467,11 @@ export const useSupportInboxStore = create<SupportInboxState>((set, get) => {
         if (!content) {
           const rest = { ...state.drafts };
           delete rest[conversationId];
-          saveDraftsDebounced(rest);
+          saveDraftsDebounced();
           return { drafts: rest };
         }
         const next = { ...state.drafts, [conversationId]: content };
-        saveDraftsDebounced(next);
+        saveDraftsDebounced();
         return { drafts: next };
       }),
     clearDraft: (conversationId) =>
@@ -470,3 +484,5 @@ export const useSupportInboxStore = create<SupportInboxState>((set, get) => {
       }),
   };
 });
+
+registerAppRefreshGuard(() => flushSupportDrafts() ? null : 'Your reply draft could not be saved. Copy it before refreshing.');

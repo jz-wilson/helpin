@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -9,14 +10,34 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/helpin-ai/helpin/server/internal/authorization"
+	"github.com/helpin-ai/helpin/server/internal/middleware"
 	"github.com/helpin-ai/helpin/server/internal/model"
 	"github.com/helpin-ai/helpin/server/internal/querybuilder"
+	"github.com/helpin-ai/helpin/server/internal/repository"
 	"github.com/helpin-ai/helpin/server/internal/service"
 )
 
 // CRMContactHandler handles CRM contact HTTP endpoints.
 type CRMContactHandler struct {
 	contactService *service.CRMContactService
+	authz          *authorization.AuthzService
+}
+
+// SetAuthorization lets the handler recognize support admins, who alone may
+// change the email of or delete a contact with a customer portal decision.
+func (h *CRMContactHandler) SetAuthorization(authz *authorization.AuthzService) *CRMContactHandler {
+	h.authz = authz
+	return h
+}
+
+// withPortalAccessAuthority marks support admin requests for the contact
+// repository's portal guard.
+func (h *CRMContactHandler) withPortalAccessAuthority(r *http.Request) context.Context {
+	actor := authorization.GetActor(r.Context())
+	if h.authz != nil && actor != nil && h.authz.Can(actor, authorization.PermSupportAdmin) {
+		return repository.WithPortalAccessAuthority(r.Context())
+	}
+	return r.Context()
 }
 
 // NewCRMContactHandler creates a new CRMContactHandler.
@@ -169,7 +190,11 @@ func (h *CRMContactHandler) Update(w http.ResponseWriter, r *http.Request) {
 		actorUserID = actor.UserID
 		actorMemberID = actor.WorkspaceMemberID
 	}
-	contact, err := h.contactService.UpdateWithActor(r.Context(), id, req, actorUserID, actorMemberID)
+	contact, err := h.contactService.UpdateWithActor(h.withPortalAccessAuthority(r), id, req, actorUserID, actorMemberID)
+	if errors.Is(err, repository.ErrPortalProtectedContact) {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -177,13 +202,47 @@ func (h *CRMContactHandler) Update(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, contact)
 }
 
+// SetCustomFields handles PATCH /api/crm/contacts/{id}/custom-properties:
+// defined field values, key by key; null clears a field.
+func (h *CRMContactHandler) SetCustomFields(w http.ResponseWriter, r *http.Request) {
+	var req model.SetCustomFieldValuesRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.contactService.SetCustomFieldValues(r.Context(), getWorkspaceID(r), chi.URLParam(r, "id"), middleware.GetUserID(r.Context()), req.Values); err != nil {
+		writeCustomFieldError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // Delete handles DELETE /api/crm/contacts/{id}.
 func (h *CRMContactHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if err := h.contactService.Delete(r.Context(), getWorkspaceID(r), id); err != nil {
+	if err := h.contactService.Delete(h.withPortalAccessAuthority(r), getWorkspaceID(r), id); errors.Is(err, repository.ErrPortalProtectedContact) {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	} else if err != nil {
 		slog.ErrorContext(r.Context(), "contact anonymization failed", "workspace_id", getWorkspaceID(r), "contact_id", id, "error", err)
 		writeError(w, http.StatusBadRequest, "Could not delete contact. No changes were made.")
 		return
 	}
 	writeJSON(w, http.StatusOK, model.MessageResponse{Message: "contact deleted; linked support identity anonymized"})
+}
+
+// FilterOptions handles GET /api/crm/contacts/filter-options. It returns the
+// custom property keys in use on contacts, with their common values.
+func (h *CRMContactHandler) FilterOptions(w http.ResponseWriter, r *http.Request) {
+	workspaceID := getWorkspaceID(r)
+	if workspaceID == "" {
+		writeError(w, http.StatusBadRequest, "workspace_id is required")
+		return
+	}
+	options, err := h.contactService.FilterOptions(r.Context(), workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load contact filter options")
+		return
+	}
+	writeJSON(w, http.StatusOK, options)
 }

@@ -20,6 +20,9 @@ const (
 	AgentPresetReviewAgent        = "review_agent"
 	AgentPresetCommandAgent       = "command_agent"
 	AgentPresetAskAgent           = "ask_agent"
+	// AgentPresetHelpAssistant answers help center and portal visitors from
+	// published help articles.
+	AgentPresetHelpAssistant = "help_assistant"
 	// AgentPresetResearcher is a legacy alias accepted for old command-agent rows.
 	AgentPresetResearcher = "researcher"
 
@@ -770,7 +773,7 @@ func (p *AgentRunInputPayload) SetTarget(targetType, targetID string) {
 		return
 	}
 	switch targetType {
-	case "workspace", "document", "task", "epic", "sprint", "objective", "crm_deal", "crm_contact", "crm_company", "support_conversation", "repository":
+	case "workspace", "document", "task", "epic", "sprint", "objective", "crm_deal", "crm_contact", "crm_company", "support_conversation", "support_investigation", "repository":
 	default:
 		return
 	}
@@ -1195,20 +1198,30 @@ type ToolCatalogResponse struct {
 	Categories []string           `json:"categories"`
 }
 type SkillCatalogEntry struct {
-	ID                *string  `json:"id,omitempty"`
-	Key               string   `json:"key"`
-	VersionKey        string   `json:"version_key,omitempty"`
-	Title             string   `json:"title"`
-	Description       string   `json:"description"`
-	Instructions      string   `json:"instructions,omitempty"`
-	SourceKind        string   `json:"source_kind"`
-	SourceRuntime     *string  `json:"source_runtime,omitempty"`
-	RequiredTools     []string `json:"required_tools,omitempty"`
-	SupportedRuntimes []string `json:"supported_runtimes,omitempty"`
-	Presets           []string `json:"presets,omitempty"`
+	IsCustomized      bool                  `json:"is_customized"`
+	DefaultContent    *SkillEditableContent `json:"default_content,omitempty"`
+	ID                *string               `json:"id,omitempty"`
+	Key               string                `json:"key"`
+	VersionKey        string                `json:"version_key,omitempty"`
+	Title             string                `json:"title"`
+	Description       string                `json:"description"`
+	Instructions      string                `json:"instructions,omitempty"`
+	SourceKind        string                `json:"source_kind"`
+	SourceRuntime     *string               `json:"source_runtime,omitempty"`
+	RequiredTools     []string              `json:"required_tools,omitempty"`
+	SupportedRuntimes []string              `json:"supported_runtimes,omitempty"`
+	Presets           []string              `json:"presets,omitempty"`
 }
 
 // SkillCatalogResponse is the response for GET /automation/library/skills.
 type SkillCatalogResponse struct {
 	Skills []SkillCatalogEntry `json:"skills"`
+}
+
+// SteerAgentRunRequest changes instructions on the same running execution.
+type SteerAgentRunRequest struct {
+	CommandID        string   `json:"command_id"`
+	ExpectedRevision int64    `json:"expected_revision"`
+	Content          string   `json:"content"`
+	DeniedTools      []string `json:"denied_tools,omitempty"`
 }

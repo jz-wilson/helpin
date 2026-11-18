@@ -442,6 +442,7 @@ func TestProjectSeparatesKnownQuotedWrappers(t *testing.T) {
 	}{
 		{name: "gmail", html: `<p>Fresh reply</p><div class="gmail_quote"><p>Gmail history</p></div>`},
 		{name: "outlook", html: `<p>Fresh reply</p><div id="divRplyFwdMsg"><p>Outlook history</p></div>`},
+		{name: "outlook mobile", html: `<p>Fresh reply</p><div id="mail-editor-reference-message-container"><p>Outlook mobile history</p></div>`},
 		{name: "apple", html: `<p>Fresh reply</p><blockquote type="cite"><p>Apple history</p></blockquote>`},
 		{name: "yahoo", html: `<p>Fresh reply</p><div class="yahoo_quoted"><p>Yahoo history</p></div>`},
 		{name: "proton", html: `<p>Fresh reply</p><div class="protonmail_quote"><p>Proton history</p></div>`},
@@ -476,11 +477,90 @@ func TestProjectSeparatesKnownQuotedWrappers(t *testing.T) {
 	}
 }
 
+func TestProjectOutlookMobileReply(t *testing.T) {
+	html := `<div style="font-family: Aptos, Arial, Helvetica, sans-serif" dir="ltr">Can you charge this via card?</div>
+<div style="font-family: Aptos, Arial, Helvetica, sans-serif" dir="ltr"><br/></div>
+<div id="mail-editor-reference-message-container">
+<div style="padding: 3pt 0in 0in; border-width: 1pt medium medium; border-style: solid none none">
+<div style="text-align: left; font-family: Aptos; font-size: 12pt; color: black">
+<b>From: </b>Support &lt;support@example.com&gt;<br/>
+<b>Date: </b>Friday, 23 October 2026 at 16:29<br/>
+<b>To: </b>customer@example.com &lt;customer@example.com&gt;<br/>
+<b>Subject: </b>Earlier question<br/>
+</div>
+</div>
+<div id="mail-editor-reference-message-body">
+<p class="ms-outlook-mobile-reference-message skipProofing">-- Please type your reply above this line --</p>
+<p class="ms-outlook-mobile-reference-message skipProofing">Please complete the payment through the invoice link.</p>
+</div>
+</div>`
+
+	got := Project(ProjectionInput{HTML: html})
+
+	if got.Markdown != "Can you charge this via card?" {
+		t.Errorf("Project().Markdown = %q, want only the new reply", got.Markdown)
+	}
+	if !got.HasQuotedContent || got.ProjectionConfidence != ProjectionConfidenceHigh {
+		t.Errorf("Project() quote = %v/%q, want true/%q", got.HasQuotedContent, got.ProjectionConfidence, ProjectionConfidenceHigh)
+	}
+	for _, want := range []string{"Date:", "invoice link"} {
+		if !strings.Contains(got.QuotedMarkdown, want) {
+			t.Errorf("Project().QuotedMarkdown missing %q: %q", want, got.QuotedMarkdown)
+		}
+	}
+	again := Project(ProjectionInput{HTML: got.HTML})
+	if again.Markdown != got.Markdown || again.QuotedMarkdown != got.QuotedMarkdown {
+		t.Error("reprocessing changed the visible/quoted split")
+	}
+}
+
 func TestProjectExtractsNestedQuotesOnce(t *testing.T) {
 	got := Project(ProjectionInput{HTML: `<p>Fresh reply</p><div class="gmail_quote"><p>Outer history</p><blockquote type="cite"><p>Inner history</p></blockquote></div>`})
 
 	if strings.Count(got.QuotedMarkdown, "Inner history") != 1 {
 		t.Fatalf("Project().QuotedMarkdown nested quote count = %d, want 1:\n%s", strings.Count(got.QuotedMarkdown, "Inner history"), got.QuotedMarkdown)
+	}
+}
+
+func TestProjectOutlookAppendOnSendDoesNotHideNewReply(t *testing.T) {
+	header := `<hr/><div><b>From:</b> Support<br/><b>Sent:</b> Tuesday<br/><b>To:</b> Customer<br/><b>Subject:</b> Earlier question</div><p>Old answer</p>`
+	for _, tt := range []struct {
+		name string
+		html string
+	}{
+		{"unmarked header after separator", `<div id="appendonsend"></div><p>New reply</p>` + header},
+		{"known Outlook header", `<div id="appendonsend"></div><p>New reply</p><hr/><div id="divRplyFwdMsg">From: Support</div><p>Old answer</p>`},
+		{"previously annotated email", `<div id="appendonsend" data-helpin-quote="true"></div><p data-helpin-quote="true">New reply</p><hr data-helpin-quote="true"/><div data-helpin-quote="true"><b>From:</b> Support<br/><b>Sent:</b> Tuesday<br/><b>To:</b> Customer<br/><b>Subject:</b> Earlier question</div><p data-helpin-quote="true">Old answer</p>`},
+		{"reply wrapper contains nested header", `<div style="border-top:1px solid #ddd"><p>New reply</p>` + header + `</div>`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Project(ProjectionInput{HTML: tt.html})
+			if got.Markdown != "New reply" {
+				t.Errorf("visible reply = %q, want only new reply", got.Markdown)
+			}
+			if !got.HasQuotedContent || !strings.Contains(got.QuotedMarkdown, "Old answer") || strings.Contains(got.QuotedMarkdown, "New reply") {
+				t.Errorf("incorrect quote split: %#v", got)
+			}
+			if !strings.Contains(got.HTML, "<p>New reply</p>") {
+				t.Errorf("new reply is marked as quoted in HTML: %s", got.HTML)
+			}
+			again := Project(ProjectionInput{HTML: got.HTML})
+			if again.Markdown != got.Markdown || again.QuotedMarkdown != got.QuotedMarkdown {
+				t.Error("reprocessing changed the visible/quoted split")
+			}
+		})
+	}
+}
+
+func TestProjectOutlookAppendOnSendAloneIsNotAQuoteBoundary(t *testing.T) {
+	for _, html := range []string{
+		`<div id="appendonsend"></div><p>Only new reply</p>`,
+		`<div id="appendonsend" data-helpin-quote="true"></div><p data-helpin-quote="true">Only new reply</p>`,
+	} {
+		got := Project(ProjectionInput{HTML: html})
+		if got.HasQuotedContent || got.QuotedMarkdown != "" || got.Markdown != "Only new reply" {
+			t.Errorf("placeholder hid new reply: %#v", got)
+		}
 	}
 }
 

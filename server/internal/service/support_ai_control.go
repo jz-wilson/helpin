@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,6 +12,10 @@ import (
 	"github.com/helpin-ai/helpin/server/internal/repository"
 	"github.com/helpin-ai/helpin/server/internal/websocket"
 )
+
+// ErrPortalRequestsHumanOwned rejects handing a portal request to AI: people
+// answer portal requests, and AI may only draft private suggestions for them.
+var ErrPortalRequestsHumanOwned = errors.New("portal requests are answered by your team; AI can only suggest replies privately")
 
 // ChangeConversationAIControl explicitly pauses AI or returns human ownership to AI.
 func (s *SupportInboxService) ChangeConversationAIControl(ctx context.Context, workspaceID, conversationID, actorID string, req model.SupportAIControlRequest) error {
@@ -27,6 +32,9 @@ func (s *SupportInboxService) ChangeConversationAIControl(ctx context.Context, w
 	if req.Action != "pause" && req.Action != "return" {
 		return fmt.Errorf("action must be pause or return")
 	}
+	if req.Action == "return" && strings.EqualFold(conv.Channel, "portal") {
+		return ErrPortalRequestsHumanOwned
+	}
 	var settings model.SupportInboxSettings
 	if req.Action == "return" {
 		inst, err := s.installationRepo.GetByWorkspace(ctx, workspaceID)
@@ -37,6 +45,7 @@ func (s *SupportInboxService) ChangeConversationAIControl(ctx context.Context, w
 			return fmt.Errorf("support AI is not enabled")
 		}
 		settings = parseSettings(inst.Settings)
+		settings = effectiveSupportAISettings(settings, conv)
 		if !shouldAutomaticallyProcessSupportAI(settings) || strings.TrimSpace(derefString(settings.AIAgentID)) == "" {
 			return fmt.Errorf("support AI is not enabled")
 		}
@@ -105,7 +114,8 @@ func (s *SupportInboxService) changeConversationAIControl(ctx context.Context, c
 			fields["ai_resumed_at"] = now
 			fields["ai_paused_at"] = nil
 			fields["ai_paused_by_user_id"] = nil
-			note = supportControlActivity(current, actorID, actorName, model.SystemEventAIReturned, actorName+" returned the conversation to AI. AI will respond to the next customer message.", "returned_by_teammate", now)
+			activity := actorName + " returned the conversation to AI. AI will respond to the next customer message."
+			note = supportControlActivity(current, actorID, actorName, model.SystemEventAIReturned, activity, "returned_by_teammate", now)
 			if current.CustomerRequestedHumanAt != nil {
 				note.Content += "\n\nA teammate explicitly confirmed this return after the customer requested a human."
 			}

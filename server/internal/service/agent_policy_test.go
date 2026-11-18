@@ -236,7 +236,8 @@ func TestListAgentPresetsUseProductDefaultRouting(t *testing.T) {
 	for _, preset := range presets {
 		usesFastOpenRouterDefault := preset.Key == model.AgentPresetEpicPlanner ||
 			preset.Key == model.AgentPresetDocumentationAgent ||
-			preset.Key == model.AgentPresetSupportAgent
+			preset.Key == model.AgentPresetSupportAgent ||
+			preset.Key == model.AgentPresetHelpAssistant
 		if usesFastOpenRouterDefault {
 			config, err := model.ParseAgentExecutionConfig(preset.ExecutionConfig)
 			if err != nil {
@@ -282,7 +283,7 @@ func TestListAgentPresetsUseProductDefaultRouting(t *testing.T) {
 			}
 			continue
 		}
-		if preset.Key == model.AgentPresetSupportAgent {
+		if preset.Key == model.AgentPresetSupportAgent || preset.Key == model.AgentPresetHelpAssistant {
 			if preset.Provider == nil || *preset.Provider != model.AgentModelProviderOpenRouter {
 				t.Errorf("preset %q provider = %+v, want openrouter", preset.Key, preset.Provider)
 			}
@@ -518,7 +519,7 @@ func TestManagedAskAgentCapabilitiesUpgradePinnedSnapshots(t *testing.T) {
 	for _, toolName := range []string{
 		"checkout_repositories", "repository_search", "read_files",
 		"read_symbol", "trace_symbol",
-		"find_skills", "read_skill", "update_plan",
+		"find_skills", "read_skill", "list_workspace_skills", "validate_skill_update", "update_skill", "update_plan",
 		"get_my_capabilities", "search_workspace", "search_documents", "create_document", "archive_document", "restore_document",
 		"insert_document_block", "preview_md", "preview_json", "list_task_checklist",
 		"list_epic_tasks", "ensure_task_label", "assign_task_agent", "set_task_dependencies",

@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func setupSupportMergeTestDB(t *testing.T) *gorm.DB {
 	}
 	for _, sql := range []string{
 		`CREATE TABLE support_events (id TEXT PRIMARY KEY, workspace_id TEXT, conversation_id TEXT, event_type TEXT, actor_type TEXT, channel TEXT, metadata TEXT, occurred_at DATETIME, created_at DATETIME)`,
-		`CREATE TABLE support_conversations (id TEXT PRIMARY KEY, workspace_id TEXT, display_id INTEGER, subject TEXT, status TEXT, merged_into_id TEXT, merge_revision INTEGER DEFAULT 0, customer_email TEXT, email_cc TEXT, email_unsubscribed BOOLEAN DEFAULT false, primary_recipient_state TEXT, contact_last_seen_at DATETIME, ai_resolved_at DATETIME, ai_resolution_type TEXT, crm_contact_id TEXT, anonymous_id TEXT, anonymized_at DATETIME, mailbox_id TEXT, assigned_user_id TEXT, assigned_agent_id TEXT, customer_requested_human_at DATETIME, customer_awaiting_response BOOLEAN DEFAULT false, needs_human_reply BOOLEAN DEFAULT false, human_takeover BOOLEAN, ai_paused_at DATETIME, ai_paused_by_user_id TEXT, ai_active_run_id TEXT, ai_control_version INTEGER DEFAULT 0, ai_state TEXT, flow_state TEXT, resolved_at DATETIME, closed_at DATETIME, support_state_version INTEGER DEFAULT 0, updated_at DATETIME, created_at DATETIME)`,
+		`CREATE TABLE support_conversations (snoozed_until DATETIME, snoozed_by_user_id TEXT, id TEXT PRIMARY KEY, workspace_id TEXT, display_id INTEGER, subject TEXT, status TEXT, merged_into_id TEXT, merge_revision INTEGER DEFAULT 0, customer_email TEXT, email_cc TEXT, email_unsubscribed BOOLEAN DEFAULT false, primary_recipient_state TEXT, contact_last_seen_at DATETIME, ai_resolved_at DATETIME, ai_resolution_type TEXT, crm_contact_id TEXT, anonymous_id TEXT, anonymized_at DATETIME, mailbox_id TEXT, assigned_user_id TEXT, assigned_agent_id TEXT, customer_requested_human_at DATETIME, customer_awaiting_response BOOLEAN DEFAULT false, needs_human_reply BOOLEAN DEFAULT false, human_takeover BOOLEAN, ai_paused_at DATETIME, ai_paused_by_user_id TEXT, ai_active_run_id TEXT, ai_control_version INTEGER DEFAULT 0, ai_state TEXT, flow_state TEXT, resolved_at DATETIME, closed_at DATETIME, support_state_version INTEGER DEFAULT 0, updated_at DATETIME, created_at DATETIME)`,
 		`CREATE TABLE support_messages (id TEXT PRIMARY KEY, workspace_id TEXT, conversation_id TEXT, origin_conversation_id TEXT, merge_revision INTEGER DEFAULT 0, sender_type TEXT, message_type TEXT, system_event_type TEXT, sender_user_id TEXT, sender_agent_id TEXT, sender_display_name TEXT, sender_avatar_url TEXT, content TEXT, is_internal BOOLEAN DEFAULT 0, metadata TEXT, via_channel TEXT, email_notified_at DATETIME, email_read_at DATETIME, cancellable_until DATETIME, deleted_at DATETIME, created_at DATETIME, updated_at DATETIME)`,
 		`INSERT INTO support_conversations (id, workspace_id, subject, status, customer_email) VALUES ('a','ws','First','open','sam@example.test'), ('b','ws','Second','open','sam@example.test'), ('c','ws','Third','open','sam@example.test'), ('foreign','other','Private','open','sam@example.test')`,
 	} {
@@ -180,6 +181,54 @@ func TestMergeGraphIdempotencyAndSubtreeRestoration(t *testing.T) {
 	root, err := repo.Root(ctx, "ws", "a")
 	if err != nil || root != "b" {
 		t.Fatalf("restored subtree root %q %v", root, err)
+	}
+}
+
+func TestFormerMergeAudienceIncludesSplitSubtree(t *testing.T) {
+	ctx := context.Background()
+	db := setupSupportMergeTestDB(t)
+	for id, sql := range map[string]string{
+		"a": `UPDATE support_conversations SET customer_email='ann@example.test' WHERE id='a'`,
+		"b": `UPDATE support_conversations SET customer_email='Bob@Example.test', email_cc='{colleague@example.test}' WHERE id='b'`,
+		"c": `UPDATE support_conversations SET customer_email='cara@example.test' WHERE id='c'`,
+	} {
+		if err := db.Exec(sql).Error; err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	repo := NewSupportMergeRepository(db)
+	if _, err := repo.Merge(ctx, "ws", "b", []string{"a"}, "actor", "op1", true); err != nil {
+		t.Fatal(err)
+	}
+	split, err := repo.Merge(ctx, "ws", "c", []string{"b"}, "actor", "op2", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := repo.Group(ctx, "ws", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if former, err := repo.FormerMergeAudience(ctx, "ws", group); err != nil || len(former) != 0 {
+		t.Fatalf("active merge reported former participants: %v %v", former, err)
+	}
+	if err := repo.Unmerge(ctx, "ws", split[0].ID, "actor", "undo"); err != nil {
+		t.Fatal(err)
+	}
+	group, err = repo.Group(ctx, "ws", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	former, err := repo.FormerMergeAudience(ctx, "ws", group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ann@example.test", "bob@example.test", "colleague@example.test"} {
+		if !slices.Contains(former, want) {
+			t.Errorf("FormerMergeAudience() = %v, missing %q", former, want)
+		}
+	}
+	if slices.Contains(former, "cara@example.test") {
+		t.Errorf("FormerMergeAudience() = %v, includes the remaining customer", former)
 	}
 }
 

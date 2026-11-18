@@ -1,6 +1,6 @@
 import type { NavFilter } from '@/stores/supportInboxStore';
-import { defaultAIStatesForNav, defaultAssignmentForNav, defaultStatesForNav, statesEqual, stringArraysEqual } from '@/lib/supportInboxFilters';
-import type { ConversationListFilters } from '@/lib/supportInboxFilters';
+import { defaultAIStatesForNav, defaultAssignmentForNav, defaultStatesForNav, parseConversationSLAFilter, statesEqual, stringArraysEqual } from '@/lib/supportInboxFilters';
+import type { ConversationListFilters, ConversationSLAFilter } from '@/lib/supportInboxFilters';
 
 export type SupportInboxRouteSearch = {
   view?: string;
@@ -13,16 +13,20 @@ export type SupportInboxRouteSearch = {
   assigned_to?: string;
   ai?: string;
   sort?: string;
+  sla?: ConversationSLAFilter;
   states?: string;
   mailbox_ids?: string;
   tag_ids?: string;
+  priority?: string;
   system_tags?: string;
+  request_type?: string;
 };
 
 const VIEW_BY_FILTER: Record<NavFilter, string> = {
   inbox: 'inbox',
   mine: 'mine',
   waiting: 'waiting',
+  snoozed: 'snoozed',
   resolved: 'resolved',
   spam: 'spam',
   ai_active: 'ai-handling',
@@ -41,6 +45,7 @@ const FILTER_BY_VIEW: Record<string, NavFilter> = {
   custom: 'inbox',
   mentions: 'mine',
   waiting: 'waiting',
+  snoozed: 'snoozed',
   resolved: 'resolved',
   spam: 'spam',
   ai: 'ai_active',
@@ -63,10 +68,13 @@ export function normalizeSupportInboxRouteSearch(search: Record<string, unknown>
     assigned_to: typeof search.assigned_to === 'string' ? search.assigned_to : undefined,
     ai: typeof search.ai === 'string' ? search.ai : undefined,
     sort: typeof search.sort === 'string' ? search.sort : undefined,
+    sla: parseConversationSLAFilter(search.sla),
     states: typeof search.states === 'string' ? search.states : undefined,
     mailbox_ids: typeof search.mailbox_ids === 'string' ? search.mailbox_ids : undefined,
     tag_ids: typeof search.tag_ids === 'string' ? search.tag_ids : undefined,
+    priority: typeof search.priority === 'string' ? search.priority : undefined,
     system_tags: typeof search.system_tags === 'string' ? search.system_tags : undefined,
+    request_type: typeof search.request_type === 'string' ? search.request_type : undefined,
   };
 }
 
@@ -121,6 +129,9 @@ export function buildSupportInboxSearch({
   if (listFilters?.sort && listFilters.sort !== 'newest') {
     search.sort = listFilters.sort;
   }
+  if (listFilters?.sla) {
+    search.sla = listFilters.sla;
+  }
   if (listFilters?.states && !statesEqual(listFilters.states, defaultStatesForNav(navFilter))) {
     search.states = listFilters.states.join(',');
   }
@@ -129,6 +140,12 @@ export function buildSupportInboxSearch({
   }
   if (listFilters?.tagIds && listFilters.tagIds.length > 0) {
     search.tag_ids = listFilters.tagIds.join(',');
+  }
+  if (listFilters?.priorities?.length) {
+    search.priority = listFilters.priorities.join(',');
+  }
+  if (listFilters?.requestTypeIds?.length) {
+    search.request_type = listFilters.requestTypeIds.join(',');
   }
   if (listFilters?.aiStates && !stringArraysEqual(listFilters.aiStates, defaultAIStatesForNav(navFilter))) {
     search.ai = listFilters.aiStates.length > 0 ? listFilters.aiStates.join(',') : 'none';

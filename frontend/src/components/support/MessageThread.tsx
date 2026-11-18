@@ -1,16 +1,18 @@
-import { ConversationMergeHistoryEvent, MergedConversationContinuation } from './ConversationMergeHistory';
-import { groupSupportTimeline } from './groupSupportTimeline';
+import { AppLoadBoundary } from '@/components/layout/AppLoadError';
+import { ConversationSnoozeControl } from './ConversationSnoozeControl';
+import { onSupportShortcut, supportShortcutLabel } from '@/lib/supportShortcuts';
+import { SupportSLABadge } from './SupportSLABadge';
+import { MergedConversationContinuation } from './ConversationMergeHistory';
+import { DaySeparator } from './SupportDaySeparator';
 import { useConversationMerges } from '@/hooks/queries/useSupportMerge';
 import { usePendingSupportSends } from '@/hooks/queries/usePendingSupportSends';
 import { LiveTranslateBar } from './LiveTranslateBar';
-import { useCachedSupportTranslations } from '@/hooks/queries/useSupportTranslation';
-import { pmTriageService, type TriageView, type SupportTaskDraft } from '@/lib/services/pmTriageService';
-import { unwrapRequired } from '@/lib/queryUtils';
+import { SupportCreateTaskModal } from './SupportCreateTaskModal';
 import { getReplyDeliveryMode, getReplyEmailSubject } from './replyDelivery';
 import { useCallback, lazy, memo, Suspense, useEffect, useLayoutEffect, useRef, useState, useMemo } from 'react';
-import { useLocation, useNavigate } from '@tanstack/react-router';
+import { useNavigate } from '@tanstack/react-router';
 import { toast } from 'sonner';
-import { ArrowLeft02Icon, ClipboardIcon, Message01Icon, Loading01Icon, CheckmarkCircle02Icon, CancelCircleIcon, MoreHorizontalIcon } from '@/lib/icons';
+import { ArrowLeft02Icon, PlusSignIcon, Message01Icon, Loading01Icon, CheckmarkCircle02Icon, CancelCircleIcon, MoreHorizontalIcon } from '@/lib/icons';
 import { Badge } from '@/components/ui/badge';
 import { UpgradeRequiredDialog } from '@edition';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -22,41 +24,45 @@ import {
   useInboxScopes,
   useSupportTeammatePresence,
   useUpdateConversationStatus,
-  useCreateTaskFromConversation,
   useMoveConversation,
   useDismissConversationTriage,
   useDeleteSupportMessage,
   useMarkConversationRead,
 } from '@/hooks/queries/useSupport';
-import { useWorkspaceAccess, useUpdateSupportTaskPreferences } from '@/hooks/queries/useSession';
-import { useWorkspaceSettings } from '@/hooks/queries/useSettings';
+import { useWorkspaceAccess } from '@/hooks/queries/useSession';
 import { useWorkspaceMembers } from '@/hooks/queries/useWorkspaces';
 import { agentService } from '@/lib/services/agentService';
 // supportService import kept for non-presence HTTP calls
 import { type AgentTypingState, useSupportPresenceStore } from '@/stores/supportPresenceStore';
 import { useAuthStore } from '@/stores/authStore';
 import { resolveTeamMemberAvatarSrc } from '@/lib/teamMemberAvatar';
-import type { AgentRun, ConversationStatus, SupportMessage } from '@/lib/pmTypes';
-import { flattenSupportMessagePages, supportMessageRenderKey } from '@/lib/supportMessagePages';
+import type { AgentRun, ConversationStatus, SupportConversationMerge, SupportMessage } from '@/lib/pmTypes';
+import { flattenSupportMessagePages } from '@/lib/supportMessagePages';
 import { useWorkspaceStore } from '@/stores/workspaceStore';
-import { openTaskRoute } from '@/components/pm/task-detail/taskRouteNavigation';
 import { isAgentRunLifecycleEvent } from '@/lib/agentRunRealtime';
-import { getSupportReceiptStatus, getInitial, isAIActiveConversation, type SupportReceiptStatus } from './helpers';
-import { TranslatedMessageBubble } from './TranslatedMessageBubble';
+import { getInitial, isAIActiveConversation } from './helpers';
+import { getSupportCodeCheck } from './supportAIActivityModel';
+import { AIThinkingBubble } from './AIThinkingBubble';
+import { CREATE_SUPPORT_TASK_EVENT } from './supportAICardActions';
 import { useJoinedMessagePosition } from './useJoinedMessagePosition';
 import { EmptyState } from './EmptyState';
 import { SupportFollowUpStatus } from './SupportFollowUpStatus';
-import { getSupportFollowUpStage, isFollowUpStatusNote } from './supportFollowUpState';
+import { getSupportFollowUpStage } from './supportFollowUpState';
 import { AgentRunsCard } from './AgentRunsCard';
 import { AIRunApprovalCard } from './AIRunApprovalCard';
 import { ConversationActionsMenu } from './ConversationActionsMenu';
 import { SupportInboxOnboarding } from './SupportInboxOnboarding';
 import type { SupportInboxEmptyState } from './ConversationList';
+import { InboxClearedCelebration } from './inboxCleared/InboxClearedCelebration';
+import { inboxClearScopeFor } from './inboxCleared/inboxClearedScope';
+import { hiddenDuringHandoff } from './threadHandoff';
+import { useSupportInboxStore } from '@/stores/supportInboxStore';
+import { useSupportInboxCelebrationStore } from '@/stores/supportInboxCelebrationStore';
 import { SupportInboxPanelHeader } from './SupportInboxPanelHeader';
 import { ReplyComposerLoading } from './ReplyComposerLoading';
 import { getInitialThreadScrollTarget, getPrependRestoredScrollTop, isNearThreadBottom, isNearThreadTop, shouldAutoScrollThread, shouldMarkOpenThreadRead } from './threadAutoScroll';
 import { getScrollDateIndicator } from './threadDateIndicator';
-import { cn } from '@/lib/utils';
+import { isShownInSupportThread, SupportThreadMessages } from './SupportThreadMessages';
 import type { UpgradeRequiredReason } from '@edition';
 
 interface MessageThreadProps {
@@ -70,13 +76,12 @@ interface MessageThreadProps {
   onCreateConversationClick?: () => void;
 }
 
-const LazyCreateTaskDialog = lazy(() => import('./CreateTaskDialog').then((module) => ({ default: module.CreateTaskDialog })));
-const LazySupportTaskTriageDialog = lazy(() => import('./SupportTaskTriageDialog').then((module) => ({ default: module.SupportTaskTriageDialog })));
 const loadReplyComposer = () => import('./ReplyComposer').then((module) => ({ default: module.ReplyComposer }));
 const LazyReplyComposer = lazy(loadReplyComposer);
 
 const THREAD_SELECTION_FADE_MS = 160;
 const RESTORE_SUPPORT_DRAFT_EVENT = 'support:restore-draft';
+const EMPTY_MERGES: SupportConversationMerge[] = [];
 
 function TypingIndicatorBar({ conversationId }: { conversationId: string | null }) {
   const typingState = useSupportPresenceStore(
@@ -184,49 +189,6 @@ function resolveAgentIdentity(
   };
 }
 
-function DaySeparator({
-  label,
-  floating = false,
-  phase = 'visible',
-  separatorRef,
-}: {
-  label: string;
-  floating?: boolean;
-  phase?: 'visible' | 'handoff' | 'hidden';
-  separatorRef?: (node: HTMLDivElement | null) => void;
-}) {
-  const dateLabel = (
-    <span className="shrink-0 rounded-full bg-muted px-3 py-1 text-xs font-semibold text-foreground/75">
-      {label}
-    </span>
-  );
-
-  if (floating) {
-    return (
-      <div
-        data-support-floating-date
-        aria-hidden="true"
-        className={cn(
-          'flex justify-center motion-reduce:transition-none',
-          phase === 'handoff' ? 'transition-none translate-y-0 opacity-0'
-            : 'transition-[opacity,transform] duration-200 ease-out',
-          phase === 'visible' ? 'translate-y-0 opacity-100' : phase === 'hidden' ? '-translate-y-2 opacity-0' : null,
-        )}
-      >
-        {dateLabel}
-      </div>
-    );
-  }
-
-  return (
-    <div ref={separatorRef} data-support-day-separator className="my-5 flex items-center gap-3">
-      <div className="h-px flex-1 bg-border" aria-hidden />
-      {dateLabel}
-      <div className="h-px flex-1 bg-border" aria-hidden />
-    </div>
-  );
-}
-
 /** Skeleton message bubbles shown while loading */
 const MessageSkeleton = memo(function MessageSkeleton() {
   return (
@@ -316,11 +278,10 @@ export function MessageThread({
 }: MessageThreadProps) {
   const isMobileSheet = presentation === 'mobile-sheet';
   const navigate = useNavigate();
-  const location = useLocation();
   const workspaceSlug = useWorkspaceStore((s) => s.currentWorkspace?.slug ?? '');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
-  const previousConversationIdRef = useRef<string | null>(conversationId);
+  const [transitionConversationId, setTransitionConversationId] = useState<string | null>(conversationId);
   const separatorRefs = useRef(new Map<number, HTMLDivElement>());
   const lastDateScrollTopRef = useRef(0);
   const isNearBottomRef = useRef(true);
@@ -341,45 +302,48 @@ export function MessageThread({
     isFetchingNextPage,
     isFetchNextPageError,
   } = useConversationMessages(workspaceId, conversationId);
+  const isHandingOff = useSupportInboxStore((s) => !!conversationId && s.conversationHandoff?.fromConversationId === conversationId);
+  const celebration = useSupportInboxCelebrationStore((s) => s.celebration);
+  const clearScopeKey = useSupportInboxStore((s) => inboxClearScopeFor(s.navFilter, s.selectedMailboxId)?.scopeKey ?? null);
   const loadedMessages = useMemo(
     () => flattenSupportMessagePages(messagePages).filter(
-      message => !(message.message_type === 'system' && message.system_event_type === 'teammate_joined') && !isFollowUpStatusNote(message),
+      message => isShownInSupportThread(message) && !hiddenDuringHandoff(message, isHandingOff),
     ),
-    [messagePages],
+    [isHandingOff, messagePages],
   );
   const messages=usePendingSupportSends(workspaceId,conversationId||'',loadedMessages);
   const latestPublicMessage = useMemo(() => messages.findLast(message => !message.is_internal && message.message_type === 'reply' && !message.pending_send), [messages]);
-  const translationIds=useMemo(()=>messages.filter(m=>m.message_type==='reply'&&!m.is_internal&&!m.pending_send).map(m=>m.id),[messages]);
-  const cachedTranslations=useCachedSupportTranslations(workspaceId,conversationId||'',translationIds, Math.max(0, ...messages.filter(m=>!m.is_internal).map(m=>Date.parse(m.created_at)))).data;
-  const translationMap=useMemo(()=>new Map((cachedTranslations||[]).map(t=>[t.purpose === 'outgoing_reply' ? t.sent_message_id : t.source_message_id,t])),[cachedTranslations]);
   const { data: inboxScopes } = useInboxScopes(workspaceId);
   const { data: installation } = useChatSettings(workspaceId);
   useSupportTeammatePresence(workspaceId);
   const { data: members = [] } = useWorkspaceMembers(workspaceId);
   const updateStatus = useUpdateConversationStatus(workspaceId);
-  const createTaskFromConversation = useCreateTaskFromConversation(workspaceId);
   const moveConversation = useMoveConversation(workspaceId);
   const dismissTriage = useDismissConversationTriage(workspaceId);
   const deleteMessage = useDeleteSupportMessage(workspaceId, conversationId);
   const markConversationRead = useMarkConversationRead(workspaceId);
   const { data: access } = useWorkspaceAccess(workspaceId);
-  const { data: wsSettings } = useWorkspaceSettings(workspaceId);
-  const updatePreferences = useUpdateSupportTaskPreferences(workspaceId);
   const currentUser = useAuthStore((s) => s.user);
   const isThreadLoading = !!conversationId && (!conversationFetched || isLoading);
 
   const [editingNote, setEditingNote] = useState<SupportMessage | null>(null);
-  useEffect(() => { setEditingNote(null); }, [workspaceId, conversationId]);
+  // Switching conversation or workspace drops the note being edited.
+  const editingNoteScope = `${workspaceId}:${conversationId ?? ''}`;
+  const [editingNoteScopeSeen, setEditingNoteScopeSeen] = useState(editingNoteScope);
+  if (editingNoteScopeSeen !== editingNoteScope) {
+    setEditingNoteScopeSeen(editingNoteScope);
+    setEditingNote(null);
+  }
+  // Opening a conversation puts the celebration away.
+  useEffect(() => {
+    if (conversationId) useSupportInboxCelebrationStore.getState().dismissCelebration();
+  }, [conversationId]);
   const startEditingNote = useCallback((message: SupportMessage) => {
     if (editingNote) { toast.info('Finish editing the current note first'); return; }
     setEditingNote(message);
   }, [editingNote]);
 
   const [showCreateTaskDialog, setShowCreateTaskDialog] = useState(false);
-  const [taskReview, setTaskReview] = useState<{ conversationId: string; view: TriageView | null; error?: string } | null>(null);
-  const [analyzingTask, setAnalyzingTask] = useState(false);
-  const taskReviewSourceRef = useRef(`${workspaceId}:${conversationId}`);
-  taskReviewSourceRef.current = `${workspaceId}:${conversationId}`;
 
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
   const [floatingDate, setFloatingDate] = useState<{ conversationId: string | null; label: string; phase: 'visible' | 'handoff' | 'hidden' }>({ conversationId: null, label: '', phase: 'hidden' });
@@ -387,23 +351,6 @@ export function MessageThread({
   const lastOpenThreadReadMessageIdRef = useRef<string | null>(null);
   const assignedAgentId = conversation?.assigned_agent_id ?? null;
   const memberNameByUserId = useMemo(() => new Map(members.map(member => [member.user_id, member.full_name])), [members]);
-  const memberAvatarByUserId = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const member of members) {
-      const avatarSrc = resolveTeamMemberAvatarSrc({
-        avatarUrl: member.avatar_url,
-        avatarStyle: member.avatar_style,
-        avatarSeed: member.avatar_seed,
-        avatarBackgroundMode: member.avatar_background_mode,
-        avatarBackgroundColor: member.avatar_background_color,
-        fallbackSeed: member.full_name ?? member.email,
-      });
-      if (member.user_id && avatarSrc) {
-        map.set(member.user_id, avatarSrc);
-      }
-    }
-    return map;
-  }, [members]);
 
   const moveOptions = useMemo(() => {
     return [inboxScopes?.shared_inbox, ...(inboxScopes?.mailboxes ?? [])].filter(Boolean);
@@ -453,19 +400,16 @@ export function MessageThread({
     return null;
   }, [conversation, inboxScopes]);
 
+  // Opening another conversation fades the thread in.
+  if (transitionConversationId !== conversationId) {
+    setTransitionConversationId(conversationId);
+    setIsThreadTransitioning(Boolean(conversationId));
+  }
   useEffect(() => {
-    if (previousConversationIdRef.current === conversationId) {
-      return undefined;
-    }
-    previousConversationIdRef.current = conversationId;
-    if (!conversationId) {
-      setIsThreadTransitioning(false);
-      return undefined;
-    }
-    setIsThreadTransitioning(true);
+    if (!isThreadTransitioning) return undefined;
     const timer = window.setTimeout(() => setIsThreadTransitioning(false), THREAD_SELECTION_FADE_MS);
     return () => window.clearTimeout(timer);
-  }, [conversationId]);
+  }, [isThreadTransitioning, conversationId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -561,6 +505,16 @@ export function MessageThread({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [conversationId, currentUser?.id, deleteMessage, messages]);
 
+  // Command+E (Ctrl+E outside Apple devices) resolves the open conversation.
+  useEffect(() => onSupportShortcut((detail) => {
+    if (presentation !== 'panel' || !conversation || detail.conversationId !== conversation.id) return;
+    if (detail.action !== 'resolve') return;
+    detail.handled = true;
+    if (conversation.merged_into_id || !access?.permissions?.includes('support.edit')) return;
+    if (conversation.status === 'resolved' || conversation.status === 'spam' || updateStatus.isPending) return;
+    updateStatus.mutate({ conversationId: conversation.id, status: 'resolved' as ConversationStatus }, { onSuccess: () => toast.success('Conversation resolved') });
+  }), [access?.permissions, conversation, presentation, updateStatus]);
+
   useEffect(() => {
     // MessageThread mounts with Support, even before a conversation is selected.
     // Download the editor alongside the API requests; importing does not mount it.
@@ -584,96 +538,21 @@ export function MessageThread({
     );
   };
 
-  const handleCreateTask = async () => {
-    if (!conversationId || !workspaceSlug || analyzingTask) return;
-    const sourceKey = `${workspaceId}:${conversationId}`;
-    setAnalyzingTask(true);
-    try {
-      const view = unwrapRequired(await pmTriageService.analyze(workspaceId, 'support_conversation', conversationId), 'Task matching');
-      if (taskReviewSourceRef.current !== sourceKey) return;
-      if (view.status !== 'disabled' && view.status !== 'shadow') {
-        setTaskReview({ conversationId, view });
-        return;
-      }
-    } catch (error) {
-      if (taskReviewSourceRef.current === sourceKey) setTaskReview({ conversationId, view: null, error: error instanceof Error ? error.message : 'Task matching is unavailable.' });
-      return;
-    } finally { setAnalyzingTask(false); }
-
-    const dismissed = access?.membership?.support_task_dialog_dismissed;
-    const savedTeamId = access?.membership?.support_default_team_id;
-
-    if (!dismissed || !savedTeamId) {
-      setShowCreateTaskDialog(true);
-      return;
-    }
-
-    const created = await createTaskFromConversation.mutateAsync({
-      conversationId,
-      teamId: savedTeamId,
-    });
-    toast.success(`Created ${created.task_key ?? 'task'}`, {
-      description: created.summary || created.task_name,
-    });
-    openTaskRoute(navigate as never, location as never, workspaceSlug, created.task_id);
-  };
-
-  const handleCreateTaskConfirm = async (teamId: string, dismissDialog: boolean) => {
-    if (!conversationId || !workspaceSlug) return;
-
-    // Create task first — only persist preferences after success
-    const created = await createTaskFromConversation.mutateAsync({
-      conversationId,
-      teamId,
-    });
-
-    // Task succeeded — now save team preference and dismissal
-    await updatePreferences.mutateAsync({
-      support_default_team_id: teamId,
-      support_task_dialog_dismissed: dismissDialog,
-    });
-
-    setShowCreateTaskDialog(false);
-    toast.success(`Created ${created.task_key ?? 'task'}`, {
-      description: created.summary || created.task_name,
-    });
-    openTaskRoute(navigate as never, location as never, workspaceSlug, created.task_id);
-  };
-
-  const handleReviewedTaskCreate = async (teamId: string, draft: SupportTaskDraft) => {
-    if (!conversationId || !workspaceSlug) return;
-    const created = await createTaskFromConversation.mutateAsync({ conversationId, teamId, draft: { ...draft, reviewed_draft: true } });
-    setTaskReview(null);
-    try { await updatePreferences.mutateAsync({ support_default_team_id: teamId }); }
-    catch { toast.error('Task created, but the default team preference could not be saved.'); }
-    toast.success(`Created ${created.task_key ?? 'task'}`, { description: created.summary || created.task_name });
-    openTaskRoute(navigate as never, location as never, workspaceSlug, created.task_id);
-  };
-
-  // Group messages with day separators and consecutive sender detection
-  // Find the last outbound reply message (for read receipt display)
-  const receiptMessageId = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (!msg.is_internal && msg.sender_type !== 'customer' && (!msg.message_type || msg.message_type === 'reply')) {
-        return msg.id;
-      }
-    }
-    return null;
-  }, [messages]);
-
-  // Derive delivered/read status from conversation's contact_last_seen_at cursor
-  const receiptStatus = useMemo<SupportReceiptStatus>(() => {
-    if (!receiptMessageId || !conversation) return null;
-    const msg = messages.find((m) => m.id === receiptMessageId);
-    if (!msg) return null;
-    return getSupportReceiptStatus(msg, conversation);
-  }, [receiptMessageId, conversation, messages]);
+  const handleCreateTask = () => { if (conversationId) setShowCreateTaskDialog(true); };
+  const canCreateTasks = !!access?.permissions?.includes('pm.edit');
+  // A code-check card asks for the same create-task window as the header button.
+  useEffect(() => {
+    const openCreateTask = (event: Event) => {
+      if ((event as CustomEvent<{ conversationId?: string }>).detail?.conversationId !== conversationId) return;
+      if (canCreateTasks) setShowCreateTaskDialog(true);
+      else toast.error('You need project access to create tasks.');
+    };
+    window.addEventListener(CREATE_SUPPORT_TASK_EVENT, openCreateTask);
+    return () => window.removeEventListener(CREATE_SUPPORT_TASK_EVENT, openCreateTask);
+  }, [conversationId, canCreateTasks]);
 
   const { data: mergeHistory } = useConversationMerges(workspaceId, conversationId);
-  const groupedMessages = useMemo(() => groupSupportTimeline(messages, mergeHistory ?? []), [messages, mergeHistory]);
-
-  const visibleGroupedMessages = groupedMessages;
+  const codeCheckRunning = useMemo(() => messages.some((message) => getSupportCodeCheck(message)?.status === 'running'), [messages]);
 
   const followUpStage = conversation ? getSupportFollowUpStage(conversation, latestPublicMessage) : null;
   const followUpStageKey = followUpStage ? `${conversation?.ai_follow_up?.id}:${followUpStage.kind}:${followUpStage.deadline ?? ''}` : null;
@@ -781,7 +660,7 @@ export function MessageThread({
       frames.forEach((frame) => window.cancelAnimationFrame(frame));
       timeouts.forEach((timeout) => window.clearTimeout(timeout));
     };
-  }, [conversationId, initialScrollTargetMessageId, lastMessageId, messages.length, visibleGroupedMessages.length]);
+  }, [conversationId, initialScrollTargetMessageId, lastMessageId, messages.length, mergeHistory?.length]);
 
   useLayoutEffect(() => {
     // A new schedule can arrive without a new message. Keep it visible only
@@ -873,13 +752,17 @@ export function MessageThread({
       viewport.removeEventListener('scroll', onScroll);
       window.clearTimeout(hideTimer);
     };
-  }, [conversationId, fetchNextPage, hasNextPage, isFetchNextPageError, isFetchingNextPage, visibleGroupedMessages]);
+  }, [conversationId, fetchNextPage, hasNextPage, isFetchNextPageError, isFetchingNextPage, messages, mergeHistory]);
 
   // Treat a stale conversation id (e.g., previous selection that no longer
   // matches the active filter, or a deleted conversation) the same as no
   // selection. Wait until the fetch settled so we don't flash during load.
   const noSelection = !conversationId || (conversationFetched && !conversation);
   if (noSelection) {
+    if (celebration && celebration.scopeKey === clearScopeKey && !isMobileSheet) {
+      return <InboxClearedCelebration celebration={celebration} />;
+    }
+
     if (inboxEmptyState === 'onboarding' && onWidgetSettingsClick && onCreateConversationClick) {
       return (
         <SupportInboxOnboarding
@@ -942,7 +825,7 @@ export function MessageThread({
     <div
       data-support-message-thread
       data-transitioning={isThreadTransitioning ? 'true' : undefined}
-      className={`flex min-h-0 min-w-0 flex-1 flex-col bg-background transition-opacity duration-150 ease-out dark:bg-sidebar ${isThreadTransitioning ? 'opacity-85' : 'opacity-100'}`}
+      className={`flex min-h-0 min-w-0 flex-1 flex-col bg-background transition-opacity duration-150 ease-out dark:bg-sidebar ${isHandingOff ? 'opacity-60' : isThreadTransitioning ? 'opacity-85' : 'opacity-100'}`}
     >
       {/* Topbar with subtle bottom shadow (Crisp-style) */}
       {conversation && (isMobileSheet ? (
@@ -974,12 +857,12 @@ export function MessageThread({
             variant="ghost"
             size="icon"
             className="h-11 w-11 shrink-0"
-            disabled={!!conversation.merged_into_id || createTaskFromConversation.isPending || analyzingTask || !access?.permissions?.includes('pm.edit')}
+            disabled={!!conversation.merged_into_id || !access?.permissions?.includes('pm.edit')}
             onClick={handleCreateTask}
             aria-label="Create task"
             title="Create task"
           >
-            {createTaskFromConversation.isPending || analyzingTask ? <Loading01Icon className="h-4 w-4 animate-spin" /> : <ClipboardIcon className="h-4 w-4" />}
+            <PlusSignIcon className="h-4 w-4" />
           </Button>
 
 
@@ -1027,6 +910,7 @@ export function MessageThread({
                 <span>{conversation.subject}</span>
               </h2>
             </div>
+            <SupportSLABadge sla={conversation.sla} />
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
@@ -1034,13 +918,15 @@ export function MessageThread({
               size="sm"
               variant="outline"
               className="h-7 gap-1 text-xs"
-              disabled={!!conversation.merged_into_id || createTaskFromConversation.isPending || analyzingTask || !access?.permissions?.includes('pm.edit')}
+              disabled={!!conversation.merged_into_id || !access?.permissions?.includes('pm.edit')}
               onClick={handleCreateTask}
             >
-              {createTaskFromConversation.isPending || analyzingTask ? <Loading01Icon className="h-3 w-3 animate-spin" /> : <CheckmarkCircle02Icon className="h-3.5 w-3.5" />}
+              <CheckmarkCircle02Icon className="h-3.5 w-3.5" />
               Create Task
             </Button>
 
+
+            <ConversationSnoozeControl workspaceId={workspaceId} conversation={conversation} disabled={!access?.permissions?.includes('support.edit')} />
 
             {/* Resolve / Unresolve */}
             {!conversation.merged_into_id && (conversation.status === 'resolved' ? (
@@ -1059,6 +945,7 @@ export function MessageThread({
                 variant="default"
                 className="h-7 gap-1 bg-emerald-600 text-white hover:bg-emerald-700 dark:bg-emerald-600 dark:hover:bg-emerald-700"
                 onClick={() => updateStatus.mutate({ conversationId: conversation.id, status: 'resolved' as ConversationStatus })}
+                title={`Resolve (${supportShortcutLabel('resolve')})`}
               >
                 <CheckmarkCircle02Icon className="h-3.5 w-3.5" />
                 Resolve
@@ -1211,53 +1098,23 @@ export function MessageThread({
               subtitle="Start the conversation using the reply below."
             />
           )}
-          {visibleGroupedMessages.map((item, idx) => {
-            if (item.type === 'merge') return conversation ? <ConversationMergeHistoryEvent key={item.id} workspaceId={workspaceId} conversation={conversation} merges={item.merges} restored={item.restored} canUnmerge={!!access?.permissions.includes('support.merge')} /> : null;
-            if (item.type === 'separator') {
-              return (
-                <DaySeparator
-                  key={`sep-${idx}`}
-                  label={item.label}
-                  separatorRef={(node) => {
-                    if (node) {
-                      separatorRefs.current.set(idx, node);
-                    } else {
-                      separatorRefs.current.delete(idx);
-                    }
-                  }}
-                />
-              );
-            }
-            return (
-              <div
-                key={supportMessageRenderKey(item.message)}
-                className="support-thread-message w-full min-w-0 max-w-full"
-                data-support-message-id={item.message.id}
-                data-support-message-key={supportMessageRenderKey(item.message)}
-              >
-                <TranslatedMessageBubble
-                  workspaceId={workspaceId}
-                  readOnly={!!conversation?.merged_into_id || !!conversation?.anonymized_at || !!editingNote}
-                  onEditNote={access?.permissions?.includes('support.edit') ? startEditingNote : undefined}
-                  message={item.message}
-                  cachedTranslation={translationMap.get(item.message.id)}
-                  isConsecutive={item.isConsecutive}
-                  isLastInGroup={item.isLastInGroup}
-                  source={conversation?.source}
-                  contactLastSeenAt={conversation?.contact_last_seen_at}
-                  receiptStatus={item.message.id === receiptMessageId ? receiptStatus : undefined}
-                  teammateDisplayName={item.message.sender_user_id ? memberNameByUserId.get(item.message.sender_user_id) : undefined}
-                  customerDisplayName={conversation?.customer_name || conversation?.customer_email}
-                  customerEmail={conversation?.customer_email}
-                  workspaceSlug={workspaceSlug}
-                  linkedTaskId={conversation?.linked_task_id}
-                  fallbackAvatarUrl={
-                    item.message.sender_user_id ? memberAvatarByUserId.get(item.message.sender_user_id) : undefined
-                  }
-                />
-              </div>
-            );
-          })}
+          <SupportThreadMessages
+            workspaceId={workspaceId}
+            conversationId={conversationId || ''}
+            conversation={conversation}
+            messages={messages}
+            merges={mergeHistory ?? EMPTY_MERGES}
+            readOnly={!!conversation?.merged_into_id || !!conversation?.anonymized_at || !!editingNote}
+            canUnmerge={!!access?.permissions.includes('support.merge')}
+            onEditNote={access?.permissions?.includes('support.edit') ? startEditingNote : undefined}
+            separatorRef={(idx, node) => {
+              if (node) {
+                separatorRefs.current.set(idx, node);
+              } else {
+                separatorRefs.current.delete(idx);
+              }
+            }}
+          />
           {!isThreadLoading && conversation?.id === conversationId && (
             <SupportFollowUpStatus
               key={conversation.id}
@@ -1269,6 +1126,7 @@ export function MessageThread({
           )}
           <TypingIndicatorBar conversationId={conversationId} />
           <AgentTypingBubble conversationId={conversationId} workspaceId={workspaceId} />
+          <AIThinkingBubble conversationId={conversationId} hidden={codeCheckRunning} />
           <div ref={messagesEndRef} />
         </div>
       </ScrollArea>
@@ -1284,8 +1142,6 @@ export function MessageThread({
       {/* Soft gradient fade between thread and composer */}
       <div className="pointer-events-none h-3 -mt-3 relative z-10 bg-gradient-to-t from-background to-transparent" />
 
-      {!!conversation?.merge_participants?.length && !conversation.merged_into_id && <p className="truncate border-t px-4 py-2 text-xs text-muted-foreground" title={conversation.merge_participants.join(', ')}>Replies shared with {conversation.merge_participants.join(', ')}</p>}
-
       {/* Reserve the editor's space immediately. Its key isolates drafts and
           attachments when switching between already cached conversations. */}
       {conversationId && (conversation?.id === conversationId && !isThreadLoading ? (conversation.merged_into_id ? <MergedConversationContinuation conversation={conversation} /> : conversation.anonymized_at ? (
@@ -1293,7 +1149,7 @@ export function MessageThread({
           This customer was deleted. Messages and comments are retained; this conversation is read-only.
         </div>
       ) : (
-        <Suspense fallback={<ReplyComposerLoading />}>
+        <AppLoadBoundary><Suspense fallback={<ReplyComposerLoading />}>
           <LazyReplyComposer
             key={`${workspaceId}:${conversationId}`}
             workspaceId={workspaceId}
@@ -1303,37 +1159,10 @@ export function MessageThread({
             emailDeliveryEnabled={installation?.settings.email_fallback_enabled}
             onUpgradeRequired={setUpgradeDialogReason}
           />
-        </Suspense>
+        </Suspense></AppLoadBoundary>
       )) : <ReplyComposerLoading />)}
 
-      {taskReview && taskReview.conversationId === conversationId ? (
-        <Suspense fallback={null}><LazySupportTaskTriageDialog
-          key={`${workspaceId}:${conversationId}`}
-          workspaceId={workspaceId}
-          workspaceSlug={workspaceSlug}
-          conversationId={taskReview.conversationId}
-          initialView={taskReview.view}
-          initialError={taskReview.error}
-          teams={wsSettings?.teams ?? []}
-          defaultTeamId={access?.membership?.support_default_team_id ?? access?.team_memberships?.[0]?.team_id}
-          isCreating={createTaskFromConversation.isPending}
-          onOpenChange={(open) => { if (!open) setTaskReview(null); }}
-          onCreate={handleReviewedTaskCreate}
-          onLinked={() => { setTaskReview(null); toast.success('Conversation linked to existing task'); }}
-        /></Suspense>
-      ) : null}
-      {showCreateTaskDialog ? (
-        <Suspense fallback={null}>
-          <LazyCreateTaskDialog
-            open={showCreateTaskDialog}
-            onOpenChange={setShowCreateTaskDialog}
-            teams={wsSettings?.teams ?? []}
-            defaultTeamId={access?.membership?.support_default_team_id ?? access?.team_memberships?.[0]?.team_id}
-            isPending={createTaskFromConversation.isPending}
-            onConfirm={handleCreateTaskConfirm}
-          />
-        </Suspense>
-      ) : null}
+      {showCreateTaskDialog && conversationId && <SupportCreateTaskModal key={`${workspaceId}:${conversationId}`} workspaceId={workspaceId} workspaceSlug={workspaceSlug} conversationId={conversationId} onOpenChange={setShowCreateTaskDialog} />}
       <UpgradeRequiredDialog
         open={upgradeDialogReason !== null}
         onOpenChange={(open) => {

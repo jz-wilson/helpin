@@ -29,6 +29,7 @@ export const queryKeys = {
   },
 
   dock: {
+    pins: (wsId: string | undefined, userId: string | undefined) => ['dock', wsId, 'pins', userId] as const,
     aiDefaults: (wsId: string) => ['dock', wsId, 'ai-defaults'] as const,
     root: (wsId: string) => ['dock', wsId] as const,
     runs: (wsId: string) => ['dock', wsId, 'runs'] as const,
@@ -220,15 +221,31 @@ export const queryKeys = {
     githubAppStatus: (wsId: string) => ['git', wsId, 'github-app-status'] as const,
   },
 
+  customFields: {
+    requestTypes: (wsId: string) => ['custom-fields', wsId, 'request-types'] as const,
+    all: (wsId: string, objectType: string) => ['custom-fields', wsId, objectType] as const,
+    list: (wsId: string, objectType: string, options: { archived?: boolean; usage?: boolean }) =>
+      ['custom-fields', wsId, objectType, options] as const,
+  },
   support: {
     ...supportQueryKeys,
     conversationAssignees: (wsId: string, id: string) => ['support', wsId, 'conversations', id, 'assignees'] as const,
     conversationAssociations: (wsId: string, id: string) =>
       ['support', wsId, 'conversations', id, 'associations'] as const,
+    /** Nested under the messages key so every message refresh also refreshes it. */
+    conversationSharedItems: (wsId: string, id: string) =>
+      ['support', wsId, 'conversations', id, 'messages', 'shared-items'] as const,
     messageEmail: (wsId: string, messageId: string) => ['support', wsId, 'messages', messageId, 'email'] as const,
     messageInfo: (wsId: string, conversationId: string, messageId: string) =>
       ['support', wsId, 'conversations', conversationId, 'messages', messageId, 'info'] as const,
     installation: (wsId: string) => ['support', wsId, 'installation'] as const,
+    portalAccess: (wsId: string) => ['support', wsId, 'portal-access'] as const,
+    /** The public team-reply page behind the link in AI emails. */
+    teamReply: (token: string) => ['support', 'team-reply', token] as const,
+    attachmentPolicy: (wsId: string) => ['support', wsId, 'attachment-policy'] as const,
+    portalContactAccess: (wsId: string, contactId: string) => ['support', wsId, 'portal-access', 'contact', contactId] as const,
+    portalCompanyAccess: (wsId: string, companyId: string) => ['support', wsId, 'portal-access', 'company', companyId] as const,
+    portalContext: (wsId: string, conversationId: string) => ['support', wsId, 'portal-access', 'conversation', conversationId] as const,
     routingUsage: (wsId: string) => ['support', wsId, 'routing-usage'] as const,
     inboxViews: (wsId: string) => ['support', wsId, 'inbox-views'] as const,
     inboxViewCounts: (wsId: string) => ['support', wsId, 'inbox-view-counts'] as const,
@@ -243,6 +260,16 @@ export const queryKeys = {
       ['support', wsId, 'canned-responses', 'search', query] as const,
     search: (wsId: string, filters: unknown) => ['support', wsId, 'search', filters] as const,
     tags: (wsId: string) => ['support', wsId, 'tags'] as const,
+    reportOverview: (wsId: string, params: unknown) => ['support', wsId, 'reports', 'overview', params] as const,
+    reportSLAConversations: (wsId: string, params: unknown, metric: string, outcome: string) =>
+      ['support', wsId, 'reports', 'sla-conversations', params, metric, outcome] as const,
+    slaPolicies: (wsId: string) => ['support', wsId, 'sla-policies'] as const,
+    slaTiers: (wsId: string) => ['support', wsId, 'sla-tiers'] as const,
+    slaTeammates: (wsId: string) => ['support', wsId, 'sla-teammates'] as const,
+    companySLAAll: (wsId: string) => ['support', wsId, 'company-sla'] as const,
+    companySLA: (wsId: string, companyId: string) => ['support', wsId, 'company-sla', companyId] as const,
+    webhooks: (wsId: string) => ['support', wsId, 'webhooks'] as const,
+    webhookDeliveries: (wsId: string, webhookId: string) => ['support', wsId, 'webhooks', webhookId, 'deliveries'] as const,
   },
 
   docs: {

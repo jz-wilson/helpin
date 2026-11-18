@@ -37,7 +37,8 @@ export interface SpaceNodeHeaderProps {
   // Navigation
   /** Passed the target collection id, or null to reset to space root. */
   onNavigateToCollection: (collectionId: string | null) => void
-  onNavigateToSpaces: () => void
+  /** Opens the All spaces page, the level above every space. */
+  onNavigateToAllSpaces: () => void
 
   // Create actions
   onCreateDocument: () => void
@@ -70,7 +71,7 @@ export function SpaceNodeHeader({
   view,
   canEdit,
   onNavigateToCollection,
-  onNavigateToSpaces,
+  onNavigateToAllSpaces,
   onCreateDocument,
   onCreateChildCollection,
   onEditSpace,
@@ -81,16 +82,19 @@ export function SpaceNodeHeader({
   // ── Ancestors (rendered inline, left of the title) ─────────────────
   // The current node is NOT in this list — it's the big title to the
   // right of the last arrow. That keeps the "you are here" signal
-  // compact and keeps the page hierarchy visible.
+  // compact and keeps the page hierarchy visible. Every space sits
+  // under All spaces, so the trail starts there, even at the space root.
   const ancestors: AncestorLink[] = (() => {
-    if (view.kind === 'space_root' || view.kind === 'loading') return []
+    if (view.kind === 'loading') return []
     const items: AncestorLink[] = [
-      {
-        id: 'space',
-        label: space.name,
-        onClick: () => onNavigateToCollection(null),
-      },
+      { id: 'all-spaces', label: 'All spaces', onClick: onNavigateToAllSpaces },
     ]
+    if (view.kind === 'space_root') return items
+    items.push({
+      id: 'space',
+      label: space.name,
+      onClick: () => onNavigateToCollection(null),
+    })
     if (view.kind === 'collection') {
       for (const ancestor of view.ancestors) {
         items.push({
@@ -142,20 +146,20 @@ export function SpaceNodeHeader({
     ((view.kind === 'space_root') ||
       (view.kind === 'collection' && (onEditCollection || onDeleteCollection)))
 
-  const breadcrumbItems = [
-    { id: 'all-docs', label: 'All Docs', onClick: onNavigateToSpaces },
-    ...ancestors,
-  ]
+  const parent = ancestors[ancestors.length - 1]
 
   return (
     <QuietDetailHeader
-      breadcrumbs={(
+      // While loading there is no breadcrumb row: keep the loaded header's
+      // height and centre the title so content does not jump.
+      className={parent ? undefined : 'flex min-h-[4.5rem] flex-col justify-center'}
+      breadcrumbs={parent ? (
         <QuietBreadcrumbs
-          items={breadcrumbItems}
-          onBack={breadcrumbItems[breadcrumbItems.length - 1].onClick}
-          backLabel={breadcrumbItems.length === 1 ? 'Back to All Docs' : `Back to ${breadcrumbItems[breadcrumbItems.length - 1].label}`}
+          items={ancestors}
+          onBack={parent.onClick}
+          backLabel={`Back to ${parent.label}`}
         />
-      )}
+      ) : undefined}
       title={(
         <span className="flex min-w-0 items-center gap-2">
           {titleIcon}

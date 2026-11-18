@@ -150,6 +150,9 @@ func (s *SupportInboxService) GetVisitorConversations(ctx context.Context, works
 		c.UpdatedAt = active.UpdatedAt
 	}
 	s.enrichWidgetConversationOwners(ctx, workspaceID, conversations)
+	if err := s.hydrateConversationCSAT(ctx, workspaceID, conversations); err != nil {
+		slog.ErrorContext(ctx, "hydrate widget conversation csat", "error", err, "workspace_id", workspaceID)
+	}
 	return conversations, nil
 }
 
@@ -178,6 +181,12 @@ func (s *SupportInboxService) UpgradeWidgetSession(ctx context.Context, sessionT
 	}
 
 	resolved := resolveWidgetIdentityPayload(identity)
+	if resolved.email != "" {
+		address, err := mail.ParseAddress(resolved.email)
+		if err != nil || address.Address != resolved.email {
+			return fmt.Errorf("invalid email address")
+		}
+	}
 
 	// Run all state changes in a single transaction
 	var contactID *string
@@ -272,6 +281,9 @@ func (s *SupportInboxService) UpgradeWidgetSession(ctx context.Context, sessionT
 
 	// Broadcast WebSocket events AFTER commit for each affected conversation
 	for _, convID := range updatedConvIDs {
+		if resolved.source == "widget_prechat" && resolved.email != "" {
+			publishEmailCollectionStatus(ctx, repository.NewSupportMessageRepository(db), s.wsPublisher, session.WorkspaceID, convID, model.SystemEventVisitorEmailProvided)
+		}
 		s.wsPublisher.Publish(websocket.Event{
 			Action:      "updated",
 			Entity:      "support_conversation",
@@ -307,6 +319,12 @@ func (s *SupportInboxService) IdentifyByAnonymousID(ctx context.Context, widgetK
 
 	workspaceID := inst.WorkspaceID
 	resolved := resolveWidgetIdentityPayload(identity)
+	if resolved.email != "" {
+		address, err := mail.ParseAddress(resolved.email)
+		if err != nil || address.Address != resolved.email {
+			return fmt.Errorf("invalid email address")
+		}
+	}
 
 	var contactID *string
 	var updatedConvIDs []string
@@ -387,6 +405,9 @@ func (s *SupportInboxService) IdentifyByAnonymousID(ctx context.Context, widgetK
 
 	// Broadcast after commit
 	for _, convID := range updatedConvIDs {
+		if resolved.source == "widget_prechat" && resolved.email != "" {
+			publishEmailCollectionStatus(ctx, repository.NewSupportMessageRepository(db), s.wsPublisher, inst.WorkspaceID, convID, model.SystemEventVisitorEmailProvided)
+		}
 		s.wsPublisher.Publish(websocket.Event{
 			Action:      "updated",
 			Entity:      "support_conversation",
@@ -693,6 +714,11 @@ func (s *SupportInboxService) WidgetCreateMessage(ctx context.Context, sessionTo
 	if err != nil {
 		return nil, err
 	}
+	if session.ConversationID != nil {
+		if err := s.checkWidgetEmailRequirement(ctx, session.WorkspaceID, *session.ConversationID, derefString(session.CustomerEmail), false); err != nil {
+			return nil, err
+		}
+	}
 	initialConversationID := session.ConversationID
 	if s.attachmentService != nil && len(attachmentIDs) > 0 {
 		if err := s.attachmentService.ValidateWidgetAttachments(
@@ -959,20 +985,12 @@ func (s *SupportInboxService) enrichWidgetConversationOwners(ctx context.Context
 	}
 
 	owners := make(map[string]model.WidgetActiveTeammate, len(ownerIDs))
-	statusByUserID := make(map[string]string, len(ownerIDs))
-	statuses, err := resolveSupportTeammatePresenceStatuses(
-		ctx,
-		s.workspaceRepo,
-		s.presence,
-		s.statusOverrideRepo,
-		workspaceID,
-		time.Now(),
-	)
-	if err == nil {
-		for _, status := range statuses {
-			statusByUserID[status.UserID] = status.Status
-		}
+	now := time.Now()
+	settings, _, err := loadSupportAvailability(ctx, s.installationRepo, workspaceID, now)
+	if err != nil {
+		slog.WarnContext(ctx, "load support settings for widget conversation owners", "error", err, "workspace_id", workspaceID)
 	}
+	statusByUserID := s.customerTeammates(ctx, workspaceID, settings.BusinessHoursTimezone, now).statusByUserID()
 	if s.workspaceRepo != nil {
 		if members, err := s.workspaceRepo.ListMembers(ctx, workspaceID); err == nil {
 			for _, member := range members {
@@ -1038,15 +1056,21 @@ func supportTeammateStatusRank(status string) int {
 	}
 }
 
-// hasOnlineSupportTeammate reports whether at least one support-accessible
-// teammate is currently online (presence-based). It drives the widget's
-// pre-chat IsOnline flag so availability reflects real presence, not just
-// business hours.
-func (s *SupportInboxService) hasOnlineSupportTeammate(ctx context.Context, workspaceID string, now time.Time) bool {
-	return anySupportTeammateOnline(ctx, s.workspaceRepo, s.presence, s.statusOverrideRepo, workspaceID, now)
+// customerTeammates resolves what customers are told about support teammates.
+// If that fails nobody is available, so customers are never promised a reply
+// that may not come.
+func (s *SupportInboxService) customerTeammates(ctx context.Context, workspaceID, timezone string, now time.Time) supportCustomerTeammates {
+	teammates, err := resolveSupportCustomerTeammates(ctx, s.workspaceRepo, s.presence, s.statusOverrideRepo, s.responderDirectory, workspaceID, timezone, now)
+	if err != nil {
+		slog.WarnContext(ctx, "resolve teammates available to customers failed; treating as unavailable", "error", err, "workspace_id", workspaceID)
+	}
+	return teammates
 }
 
-func (s *SupportInboxService) listWidgetTeammates(ctx context.Context, workspaceID string, limit int) []model.WidgetActiveTeammate {
+// listWidgetTeammates returns the support team the widget shows customers:
+// the teammates who answer customers, or everyone with support access while
+// the workspace has no reply history yet.
+func (s *SupportInboxService) listWidgetTeammates(ctx context.Context, workspaceID string, customerTeammates supportCustomerTeammates, limit int) []model.WidgetActiveTeammate {
 	if s.workspaceRepo == nil {
 		return []model.WidgetActiveTeammate{}
 	}
@@ -1055,25 +1079,16 @@ func (s *SupportInboxService) listWidgetTeammates(ctx context.Context, workspace
 	if err != nil || len(supportUserIDs) == 0 {
 		return []model.WidgetActiveTeammate{}
 	}
+	responderIDs := customerTeammates.responderUserIDs()
 	supportUserIDSet := make(map[string]struct{}, len(supportUserIDs))
 	for _, userID := range supportUserIDs {
+		if _, ok := responderIDs[userID]; responderIDs != nil && !ok {
+			continue
+		}
 		supportUserIDSet[userID] = struct{}{}
 	}
 
-	statusByUserID := map[string]string{}
-	statuses, err := resolveSupportTeammatePresenceStatuses(
-		ctx,
-		s.workspaceRepo,
-		s.presence,
-		s.statusOverrideRepo,
-		workspaceID,
-		time.Now(),
-	)
-	if err == nil {
-		for _, status := range statuses {
-			statusByUserID[status.UserID] = status.Status
-		}
-	}
+	statusByUserID := customerTeammates.statusByUserID()
 
 	members, err := s.workspaceRepo.ListMembers(ctx, workspaceID)
 	if err != nil {
@@ -1160,16 +1175,20 @@ func (s *SupportInboxService) buildWidgetConfigResponse(ctx context.Context, ins
 		return nil, err
 	}
 
+	s.applyHelpCenterWidgetBranding(ctx, inst.WorkspaceID, &settings)
+
 	now := time.Now()
-	hasOnlineAgent := s.hasOnlineSupportTeammate(ctx, inst.WorkspaceID, now)
+	customerTeammates := s.customerTeammates(ctx, inst.WorkspaceID, settings.BusinessHoursTimezone, now)
 
 	return &model.WidgetConfigResponse{
+		AIDisplayName: settings.AIDisplayName,
 		PrivacyNotice: model.WidgetConfigPrivacyNotice{Enabled: settings.PrivacyNoticeEnabled, PolicyURL: settings.PrivacyPolicyURL, Text: settings.PrivacyNoticeText},
 		WorkspaceID:   inst.WorkspaceID,
 		WorkspaceName: settings.WidgetName,
 		Branding: model.WidgetConfigBranding{
 			PrimaryColor:    primaryColor,
 			LogoURL:         settings.LogoURL,
+			AvatarURL:       settings.WidgetAvatarURL,
 			WelcomeMessage:  settings.WelcomeMessage,
 			WidgetPosition:  position,
 			ShowBranding:    settings.ShowBranding,
@@ -1179,20 +1198,56 @@ func (s *SupportInboxService) buildWidgetConfigResponse(ctx context.Context, ins
 			ButtonIconColor: settings.ButtonIconColor,
 		},
 		Features: model.WidgetConfigFeatures{
-			AIEnabled:         settings.AIEnabled,
-			AIFirst:           settings.AIEnabled && settings.AIResponseMode == "ai_first",
-			ShowTalkToHuman:   settings.ShowTalkToHuman,
-			EscalationMessage: settings.EscalationMessage,
-			FileUploads:       settings.FileUploadsEnabled,
-			PreChatForm:       settings.RequireEmailBeforeChat,
-			RequirePhone:      settings.RequirePhoneAfterEmail,
-			CSATRating:        settings.CSATEnabled,
-			ForceIdentify:     settings.ForceVisitorIdentity,
+			AIEnabled:          settings.AIEnabled,
+			AIFirst:            settings.AIEnabled && settings.AIResponseMode == "ai_first",
+			ShowTalkToHuman:    settings.ShowTalkToHuman,
+			EscalationMessage:  settings.EscalationMessage,
+			FileUploads:        settings.FileUploadsEnabled,
+			EmailCaptureTiming: settings.EmailCaptureTiming,
+			PreChatForm:        settings.EmailCaptureTiming != "never",
+			RequirePhone:       settings.RequirePhoneAfterEmail,
+			CSATRating:         settings.CSATEnabled,
+			ForceIdentify:      settings.ForceVisitorIdentity,
 		},
-		Availability:       buildWidgetAvailability(settings, now, hasOnlineAgent),
-		AvailableTeammates: s.listWidgetTeammates(ctx, inst.WorkspaceID, 5),
+		Availability:       buildWidgetAvailability(settings, now, customerTeammates.anyAvailable()),
+		AvailableTeammates: s.listWidgetTeammates(ctx, inst.WorkspaceID, customerTeammates, 5),
 		HelpSpaces:         helpSpaces,
 	}, nil
+}
+
+// applyHelpCenterWidgetBranding fills an unset widget name, logo, and avatar
+// from the workspace's published help center, so a widget nobody has styled
+// yet carries the brand instead of the generic "Support" label. Values an
+// admin saved always win, and nothing is written back.
+func (s *SupportInboxService) applyHelpCenterWidgetBranding(ctx context.Context, workspaceID string, settings *model.SupportInboxSettings) {
+	if s.docsHelpcenterRepo == nil || settings == nil {
+		return
+	}
+	if settings.WidgetName != "" && settings.LogoURL != "" && settings.WidgetAvatarURL != "" {
+		return
+	}
+	cfg, err := s.docsHelpcenterRepo.GetConfig(ctx, workspaceID)
+	if err != nil {
+		slog.WarnContext(ctx, "read help center branding for widget", "error", err, "workspace_id", workspaceID)
+		return
+	}
+	if cfg == nil || !cfg.IsPublished {
+		return
+	}
+	if settings.WidgetName == "" {
+		settings.WidgetName = strings.TrimSpace(cfg.BrandName)
+	}
+	// The favicon is the square mark; a wordmark logo is the fallback.
+	mark := stringPtrTrimmed(cfg.FaviconURL)
+	if mark == "" {
+		mark = stringPtrTrimmed(cfg.BrandLogoURL)
+	}
+	if settings.LogoURL == "" {
+		settings.LogoURL = mark
+	}
+	if settings.WidgetAvatarURL == "" {
+		settings.WidgetAvatarURL = mark
+	}
 }
 
 func (s *SupportInboxService) resolveWidgetHelpSpaces(ctx context.Context, workspaceID string, configuredIDs []string) ([]model.WidgetHelpSpace, error) {
@@ -1210,7 +1265,8 @@ func (s *SupportInboxService) resolveWidgetHelpSpaces(ctx context.Context, works
 
 	byID := make(map[string]model.DocsSpace, len(spaces))
 	for _, space := range spaces {
-		if space.Type == model.SpaceTypeExternalCapable {
+		// Spaces for signed-in portal customers never reach the widget.
+		if space.Type == model.SpaceTypeExternalCapable && space.HelpcenterAudience == model.HelpcenterAudiencePublic {
 			byID[space.ID] = space
 		}
 	}
@@ -1400,39 +1456,34 @@ func (s *SupportInboxService) SearchWidgetHelpArticles(ctx context.Context, widg
 		limit = 8
 	}
 
+	found, err := s.searchWidgetHelp(ctx, "widget_help", inst.WorkspaceID, locale, query, allowedSpaces, limit)
+	if err != nil {
+		return nil, err
+	}
 	results := make([]model.WidgetHelpSearchResult, 0, limit)
 	seen := make(map[string]struct{})
-	for _, space := range allowedSpaces {
+	for _, result := range found {
 		if len(results) >= limit {
 			break
 		}
-		spaceResults, err := s.docsSearchRepo.PublicSearch(ctx, inst.WorkspaceID, locale, query, space.Slug, limit)
-		if err != nil {
-			return nil, err
+		articleKey := buildDocsHelpcenterArticleKey(result.Slug, result.PublicID)
+		if articleKey == "" {
+			articleKey = result.ID
 		}
-		for _, result := range spaceResults {
-			if len(results) >= limit {
-				break
-			}
-			articleKey := buildDocsHelpcenterArticleKey(result.Slug, result.PublicID)
-			if articleKey == "" {
-				articleKey = result.ID
-			}
-			if _, ok := seen[articleKey]; ok {
-				continue
-			}
-			seen[articleKey] = struct{}{}
-			results = append(results, model.WidgetHelpSearchResult{
-				ID:             result.ID,
-				Title:          result.Title,
-				Slug:           result.Slug,
-				PublicID:       result.PublicID,
-				ArticleKey:     articleKey,
-				Excerpt:        result.Excerpt,
-				CollectionName: result.CollectionName,
-				SpaceName:      result.SpaceName,
-			})
+		if _, ok := seen[articleKey]; ok {
+			continue
 		}
+		seen[articleKey] = struct{}{}
+		results = append(results, model.WidgetHelpSearchResult{
+			ID:             result.ID,
+			Title:          result.Title,
+			Slug:           result.Slug,
+			PublicID:       result.PublicID,
+			ArticleKey:     articleKey,
+			Excerpt:        result.Excerpt,
+			CollectionName: result.CollectionName,
+			SpaceName:      result.SpaceName,
+		})
 	}
 
 	searchSourceSignal := model.SupportCoverageSourceSelfService
@@ -1456,6 +1507,57 @@ func (s *SupportInboxService) SearchWidgetHelpArticles(ctx context.Context, widg
 	})
 
 	return results, nil
+}
+
+// searchWidgetHelp searches the help spaces chosen for customers, which the
+// Messenger help tab and portal suggestions share, with the shared knowledge
+// search. Per-space full text remains the floor: it runs when the shared
+// search is not connected or finds nothing in those spaces, so results never
+// regress. surface names the caller for metering.
+func (s *SupportInboxService) searchWidgetHelp(ctx context.Context, surface, workspaceID, locale, query string, spaces []model.WidgetHelpSpace, limit int) ([]model.PublicSearchResultResponse, error) {
+	if s.knowledgeSearch != nil {
+		allowed := make(map[string]bool, len(spaces))
+		for _, space := range spaces {
+			allowed[space.Slug] = true
+		}
+		// Ask for the most results, since some may be in spaces the widget hides.
+		found, err := s.knowledgeSearch.Search(WithKnowledgeSurface(ctx, surface), workspaceID, locale, "", query, "", 20)
+		if err != nil {
+			return nil, err
+		}
+		results := make([]model.PublicSearchResultResponse, 0, len(found))
+		for _, result := range found {
+			if allowed[result.SpaceSlug] {
+				results = append(results, result)
+			}
+		}
+		if len(results) > 0 {
+			return results, nil
+		}
+	}
+	var results []model.PublicSearchResultResponse
+	for _, space := range spaces {
+		spaceResults, err := s.docsSearchRepo.PublicSearch(ctx, workspaceID, locale, query, space.Slug, limit)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, spaceResults...)
+	}
+	return results, nil
+}
+
+// publicKnowledgeSearch searches published help center articles; it is
+// implemented by HelpcenterAISearchService.
+type publicKnowledgeSearch interface {
+	Search(ctx context.Context, workspaceID, locale, fallbackLocale, query, spaceSlug string, limit int) ([]model.PublicSearchResultResponse, error)
+}
+
+// SetKnowledgeSearch connects the shared public knowledge search used by the
+// widget's help tab.
+func (s *SupportInboxService) SetKnowledgeSearch(search *HelpcenterAISearchService) {
+	if search != nil {
+		s.knowledgeSearch = search
+	}
 }
 
 // GetWidgetHelpArticle returns a widget-visible article with rendered HTML content.

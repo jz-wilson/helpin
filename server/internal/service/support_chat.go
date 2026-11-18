@@ -29,17 +29,18 @@ const (
 
 // SupportChatService owns the conversation↔chat-run lifecycle.
 type SupportChatService struct {
-	conversationRepo *repository.SupportConversationRepository
-	messageRepo      *repository.SupportMessageRepository
-	processingRepo   *repository.AIMessageProcessingRepository
-	runRepo          *repository.AgentRunRepository
-	planRepo         *repository.CommandBarPlanRepository
-	agentService     *AgentService
-	runCloser        supportChatRunCloser
-	supportAIService *SupportAIService
-	evidenceRepo     *repository.SupportRunEvidenceRepository
-	followUpService  *SupportFollowUpService
-	jev              *SupportJevService
+	investigationRepo *repository.SupportInvestigationRepository
+	conversationRepo  *repository.SupportConversationRepository
+	messageRepo       *repository.SupportMessageRepository
+	processingRepo    *repository.AIMessageProcessingRepository
+	runRepo           *repository.AgentRunRepository
+	planRepo          *repository.CommandBarPlanRepository
+	agentService      *AgentService
+	runCloser         supportChatRunCloser
+	supportAIService  *SupportAIService
+	evidenceRepo      *repository.SupportRunEvidenceRepository
+	followUpService   *SupportFollowUpService
+	jev               *SupportJevService
 }
 
 // SetResearchEvidenceDependencies wires the store used to turn completed
@@ -68,7 +69,7 @@ func NewSupportChatService(
 	if supportAIService != nil {
 		supportAIService.runCloser = agentService
 	}
-	return &SupportChatService{
+	svc := &SupportChatService{
 		conversationRepo: conversationRepo,
 		messageRepo:      messageRepo,
 		processingRepo:   processingRepo,
@@ -78,13 +79,17 @@ func NewSupportChatService(
 		runCloser:        agentService,
 		supportAIService: supportAIService,
 	}
+	if supportAIService != nil && supportAIService.db != nil {
+		svc.investigationRepo = repository.NewSupportInvestigationRepository(supportAIService.db)
+	}
+	return svc
 }
 
 // HandleVisitorMessage is the consumer entry point for one visitor message:
 // deterministic pre-gates, then start / resume / defer the conversation's
 // chat run. Errors bubble to the NATS consumer for retry; exhausted retries
 // escalate to a human (the caller's responsibility).
-func (s *SupportChatService) HandleVisitorMessage(ctx context.Context, workspaceID, conversationID string, msg *model.SupportMessage) error {
+func (s *SupportChatService) HandleVisitorMessage(ctx context.Context, workspaceID, conversationID string, msg *model.SupportMessage) (retErr error) {
 	if !supportAIMessageEligible(msg) {
 		return nil
 	}
@@ -93,17 +98,41 @@ func (s *SupportChatService) HandleVisitorMessage(ctx context.Context, workspace
 	if err != nil {
 		return fmt.Errorf("load support settings: %w", err)
 	}
-	if !shouldAutomaticallyProcessSupportAI(*settings) {
-		return nil
-	}
-	agentID := strings.TrimSpace(derefString(settings.AIAgentID))
-	if agentID == "" {
+	portalMessage := msg.ViaChannel != nil && strings.EqualFold(*msg.ViaChannel, "portal")
+	if !portalMessage && !shouldAutomaticallyProcessSupportAI(*settings) {
 		return nil
 	}
 
 	conv, err := s.conversationRepo.GetByID(ctx, workspaceID, conversationID, "", model.RoleOwner)
 	if err != nil {
 		return fmt.Errorf("get conversation: %w", err)
+	}
+	*settings = effectiveSupportAISettings(*settings, conv)
+	if !shouldAutomaticallyProcessSupportAI(*settings) {
+		if conv != nil && conv.Channel == "portal" {
+			supportAI.stopPortalAITurn(ctx, workspaceID, conversationID)
+		}
+		return nil
+	}
+	if conv != nil && conv.Channel == "portal" {
+		var dispatch struct{ ModeAtEnqueue string }
+		if err := s.conversationRepo.DB().WithContext(ctx).Table("support_portal_ai_dispatches").
+			Select("mode_at_enqueue").Where("workspace_id = ? AND conversation_id = ? AND source_message_id = ?", workspaceID, conversationID, msg.ID).
+			Take(&dispatch).Error; err != nil {
+			return nil
+		}
+		contacts, err := repository.NewCustomerPortalRepository(s.conversationRepo.DB()).ContactsForEmail(ctx, workspaceID, derefString(conv.CustomerEmail))
+		if err != nil {
+			return fmt.Errorf("check portal AI customer access: %w", err)
+		}
+		if !evaluatePortalEligibility(settings.EffectivePortalAccessMode(), contacts).Eligible {
+			supportAI.stopPortalAITurn(ctx, workspaceID, conversationID)
+			return nil
+		}
+	}
+	agentID := strings.TrimSpace(derefString(settings.AIAgentID))
+	if agentID == "" {
+		return nil
 	}
 	if !supportAIConversationSupported(conv) || !model.SupportAIReplyAllowed(*settings, conv, msg) {
 		return nil
@@ -132,10 +161,24 @@ func (s *SupportChatService) HandleVisitorMessage(ctx context.Context, workspace
 	}
 
 	// Idempotency: one turn per source message, ever.
-	processing, ok := s.processingRepo.BeginAttempt(ctx, workspaceID, msg.ID, conversationID)
+	processing, ok, err := s.processingRepo.BeginAttempt(ctx, workspaceID, msg.ID, conversationID)
+	if err != nil {
+		return fmt.Errorf("claim support message: %w", err)
+	}
 	if !ok {
 		return nil
 	}
+
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := s.processingRepo.FailAttempt(cleanupCtx, processing); err != nil {
+			slog.ErrorContext(cleanupCtx, "support chat: release failed attempt", "workspace_id", workspaceID, "conversation_id", conversationID, "message_id", msg.ID, "error", err)
+		}
+	}()
 
 	// Per-conversation serialization.
 	lockKey := "support:ai:lock:" + conversationID
@@ -146,15 +189,6 @@ func (s *SupportChatService) HandleVisitorMessage(ctx context.Context, workspace
 		return nil
 	}
 	defer supportAI.releaseLock(ctx, lockKey)
-
-	// Hard escalation phrases bypass the agent entirely.
-	if reason := checkHardEscalation(msg.Content); reason != "" {
-		if err := supportAI.EscalateToHumanForMessage(ctx, workspaceID, conversationID, msg.ID, reason); err != nil {
-			return fmt.Errorf("hard escalation: %w", err)
-		}
-		_ = s.processingRepo.MarkCompleted(ctx, processing.ID, nil, 0)
-		return nil
-	}
 
 	// Turn caps.
 	history, err := s.messageRepo.ListForSupportAI(ctx, workspaceID, conversationID, false)
@@ -181,7 +215,7 @@ func (s *SupportChatService) HandleVisitorMessage(ctx context.Context, workspace
 	}
 
 	commonRoute := ""
-	if err == nil {
+	if err == nil && conv.Channel != "portal" {
 		commonRoute = classifySupportCommonMessage(conv, msg, history)
 	}
 	if commonRoute == "" && s.jev != nil && err == nil {
@@ -329,7 +363,7 @@ func (s *SupportChatService) startSupportChatRun(ctx context.Context, conv *mode
 		slog.WarnContext(ctx, "support chat: child evidence persistence failed before successor launch",
 			"workspace_id", workspaceID, "run_id", run.ID)
 	}
-	bound, bindErr := s.conversationRepo.BindAIRun(ctx, conv, run.ID)
+	bound, bindErr := s.conversationRepo.BindAIRun(ctx, conv, run.ID, agent.ID)
 	if bindErr != nil || !bound {
 		s.supportAIService.cancelControlledRun(ctx, workspaceID, conv.ID, run.ID)
 		if bindErr != nil {
@@ -338,6 +372,9 @@ func (s *SupportChatService) startSupportChatRun(ctx context.Context, conv *mode
 		return nil
 	}
 	conv.AIActiveRunID = &run.ID
+	if conv.Channel == "portal" {
+		conv.AssignedAgentID = &agent.ID
+	}
 	s.agentService.publishRunEvent(run, "")
 	return nil
 }
@@ -388,20 +425,20 @@ func supportAIMessageEligible(message *model.SupportMessage) bool {
 		return false
 	}
 	channel := strings.ToLower(strings.TrimSpace(derefString(message.ViaChannel)))
-	return (channel == "" || channel == "widget" || channel == "chat" || channel == "email") && (channel != "email" || !model.SupportEmailSuppressesAI(message))
+	return model.SupportAIChannelSupported(channel) && (channel != "email" || !model.SupportEmailSuppressesAI(message))
 }
 
 func supportAIConversationSupported(conversation *model.SupportConversation) bool {
 	if conversation == nil {
 		return false
 	}
-	channel := strings.ToLower(strings.TrimSpace(conversation.Channel))
-	return channel == "" || channel == "widget" || channel == "chat" || channel == "email"
+	return model.SupportAIChannelSupported(strings.ToLower(strings.TrimSpace(conversation.Channel)))
 }
 
 // Recheck the saved choice when queued or child work is resumed. The pending
 // source preserves email continuations of widget conversations.
 func (s *SupportChatService) channelAllowsPendingTurn(ctx context.Context, settings model.SupportInboxSettings, conv *model.SupportConversation) (bool, error) {
+	settings = effectiveSupportAISettings(settings, conv)
 	if !shouldAutomaticallyProcessSupportAI(settings) || model.SupportAIConversationBlocked(conv) {
 		return false, nil
 	}

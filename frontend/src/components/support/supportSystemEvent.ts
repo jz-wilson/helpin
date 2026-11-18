@@ -62,9 +62,11 @@ export function getSupportSystemEventText(
 export interface SystemEventSegment {
   text: string;
   bold?: boolean;
+  /** A tag or Cc address taken off the conversation; shown struck through. */
+  removed?: boolean;
 }
 
-type Range = [start: number, end: number];
+type Range = [start: number, end: number, removed?: boolean];
 
 /** Events whose content starts with an actor's name (a person we should emphasize). */
 const ACTOR_LED_EVENTS = new Set([
@@ -78,14 +80,16 @@ const ACTOR_LED_EVENTS = new Set([
   'reopened',
   'closed',
   'task_created',
+  'task_linked',
+  'task_unlinked',
 ]);
 
 /** Verbs that follow the leading actor name across the event phrasings. */
-const ACTOR_VERB = /^(.+?)\s+(?:joined|assigned|took|moved|resolved|reopened|closed|created)\b/;
+const ACTOR_VERB = /^(.+?)\s+(?:joined|assigned|took|moved|resolved|reopened|closed|created|linked|unlinked)\b/;
 
-function pushGroup(ranges: Range[], match: RegExpMatchArray | null, group: number): void {
+function pushGroup(ranges: Range[], match: RegExpMatchArray | null, group: number, removed = false): void {
   const indices = match?.indices?.[group];
-  if (indices) ranges.push([indices[0], indices[1]]);
+  if (indices) ranges.push([indices[0], indices[1], removed]);
 }
 
 /** Turns a content string + a set of emphasis ranges into ordered plain/bold segments. */
@@ -96,15 +100,17 @@ function rangesToSegments(content: string, ranges: Range[]): SystemEventSegment[
   const merged: Range[] = [];
   for (const range of valid) {
     const last = merged[merged.length - 1];
-    if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
-    else merged.push([range[0], range[1]]);
+    if (last && range[0] <= last[1]) {
+      last[1] = Math.max(last[1], range[1]);
+      last[2] = last[2] && range[2];
+    } else merged.push([range[0], range[1], range[2]]);
   }
 
   const segments: SystemEventSegment[] = [];
   let pos = 0;
-  for (const [start, end] of merged) {
+  for (const [start, end, removed] of merged) {
     if (start > pos) segments.push({ text: content.slice(pos, start) });
-    segments.push({ text: content.slice(start, end), bold: true });
+    segments.push(removed ? { text: content.slice(start, end), bold: true, removed: true } : { text: content.slice(start, end), bold: true });
     pos = end;
   }
   if (pos < content.length) segments.push({ text: content.slice(pos) });
@@ -164,12 +170,12 @@ export function toSupportSystemEventSegments(
 
   // Tags: "added/removed tag VIP.".
   if (eventType === 'tag_added' || eventType === 'tag_removed') {
-    pushGroup(ranges, content.match(/\b(?:added|removed) tag\s+([^.]+?)\s*\.?\s*$/d), 1);
+    pushGroup(ranges, content.match(/\b(?:added|removed) tag\s+([^.]+?)\s*\.?\s*$/d), 1, eventType === 'tag_removed');
   }
 
-  // Task: "created task #KEY: Name.".
-  if (eventType === 'task_created') {
-    const task = content.match(/\bcreated task\s+(#[^:\s]+)(?::\s+(.+?))?\s*\.?\s*$/d);
+  // Task: "created/linked/unlinked task #KEY: Name.".
+  if (eventType === 'task_created' || eventType === 'task_linked' || eventType === 'task_unlinked') {
+    const task = content.match(/\b(?:created|linked|unlinked) task\s+(#[^:\s]+)(?::\s+(.+?))?\s*\.?\s*$/d);
     pushGroup(ranges, task, 1);
     pushGroup(ranges, task, 2);
   }
@@ -181,7 +187,7 @@ export function toSupportSystemEventSegments(
     for (const match of content.matchAll(
       /\b(?:made|added|removed)\s+(\S+@\S+?)(?=\s+(?:the primary recipient|to Cc|from Cc))/dg,
     )) {
-      pushGroup(ranges, match, 1);
+      pushGroup(ranges, match, 1, match[0].startsWith('removed'));
     }
   }
 

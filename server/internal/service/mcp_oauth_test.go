@@ -24,7 +24,7 @@ func TestMCPAuthorizationRequestedWritesAndWorkspaceRestrictions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, statement := range []string{
-		`CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, slug TEXT, owner_id TEXT, organization_id TEXT, description TEXT, website_url TEXT, logo_url TEXT, timezone TEXT, created_at DATETIME, updated_at DATETIME)`,
+		`CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, slug TEXT, owner_id TEXT, organization_id TEXT, description TEXT, website_url TEXT, logo_url TEXT, timezone TEXT, link_previews_enabled BOOLEAN NOT NULL DEFAULT true, created_at DATETIME, updated_at DATETIME)`,
 		`CREATE TABLE workspace_members (workspace_id TEXT, user_id TEXT, role TEXT, status TEXT)`,
 		`CREATE TABLE workspace_billing (workspace_id TEXT)`,
 		`CREATE TABLE mcp_client_registrations (id TEXT PRIMARY KEY, client_id TEXT, redirect_uris TEXT)`,
@@ -279,8 +279,8 @@ func TestPublicMCPToolCatalogIsBoundedAndExcludesDeferredActions(t *testing.T) {
 	commands := NewInternalCommandService(nil, nil, nil, nil, nil, nil, nil, nil)
 	service := &MCPService{commands: commands}
 	catalog := service.buildToolCatalog()
-	if len(catalog) != 112 {
-		t.Fatalf("buildToolCatalog() returned %d tools, want 112", len(catalog))
+	if len(catalog) != 126 {
+		t.Fatalf("buildToolCatalog() returned %d tools, want 126", len(catalog))
 	}
 	expectedTools := map[string]struct {
 		toolset  string
@@ -298,6 +298,9 @@ func TestPublicMCPToolCatalogIsBoundedAndExcludesDeferredActions(t *testing.T) {
 		"link_document_to_object":            {MCPToolsetDocs, true},
 		"insert_document_block":              {MCPToolsetDocs, true},
 		"create_crm_deal":                    {MCPToolsetCRM, true},
+		"get_crm_company":                    {MCPToolsetCRM, false},
+		"describe_crm_fields":                {MCPToolsetCRM, false},
+		"upsert_crm_records":                 {MCPToolsetCRM, true},
 		"update_task":                        {MCPToolsetPM, true},
 		"create_epic":                        {MCPToolsetPM, true},
 		"create_task_batch":                  {MCPToolsetPM, true},

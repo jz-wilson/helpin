@@ -63,6 +63,9 @@ type Config struct {
 	AgentRuntimeAppID         string
 	AgentRuntimeEventProtocol string
 	AgentRuntimeLaunchEnabled bool
+	// CommandBarRunGroupsEnabled puts new pipeline and DAG command-bar plans
+	// on Agent Runtime run groups when the runtime offers them to the app.
+	CommandBarRunGroupsEnabled bool
 
 	// S3 / object storage (optional — attachments disabled if not set)
 	AWSAccessKeyID        string
@@ -91,6 +94,8 @@ type Config struct {
 	JevTagThreshold             float64
 	JevRoutingMode              string
 	JevTagsMode                 string
+	JevPriorityMode             string
+	JevPriorityThreshold        float64
 	JevTimeoutMS                int
 	JevWorkspaceIDs             string
 	JevDailyLimit               int
@@ -153,28 +158,45 @@ type Config struct {
 	PostmarkRouteInboundWebhookSecret string
 	SupportEmailRouteDomain           string
 	AppBaseURL                        string
-	MobileAppBaseURL                  string
-	CLIEnabled                        bool
-	CLIModelGatewayEnabled            bool
-	CLIPublicBaseURL                  string
-	MCPServerEnabled                  bool
-	MCPOAuthEnabled                   bool
-	MCPServiceTokensEnabled           bool
-	MCPPMWriteEnabled                 bool
-	MCPDocsWriteEnabled               bool
-	MCPAgentRunEnabled                bool
-	MCPCRMEnabled                     bool
-	MCPSupportEnabled                 bool
-	MCPPublicBaseURL                  string
+	// AppIndexURL is the fixed SPA shell used by the Community metadata proxy.
+	// Empty uses APP_BASE_URL/index.html; it must not point to a rewritten app route.
+	AppIndexURL string
+	// HelpcenterHostedDomain is the hosted help center root, such as
+	// helpin.center. When set, customer portals are served on each workspace's
+	// help center at /requests. Empty keeps them at {AppBaseURL}/portal/{slug}.
+	HelpcenterHostedDomain string
+	// HelpcenterCustomDomainTarget is where help center custom domains CNAME
+	// to (the custom domain ingress). It defaults to HelpcenterHostedDomain;
+	// empty turns custom domain verification off.
+	HelpcenterCustomDomainTarget string
+	MobileAppBaseURL             string
+	CLIEnabled                   bool
+	CLIModelGatewayEnabled       bool
+	CLIPublicBaseURL             string
+	MCPServerEnabled             bool
+	MCPOAuthEnabled              bool
+	MCPServiceTokensEnabled      bool
+	MCPPMWriteEnabled            bool
+	MCPDocsWriteEnabled          bool
+	MCPAgentRunEnabled           bool
+	MCPCRMEnabled                bool
+	MCPSupportEnabled            bool
+	MCPPublicBaseURL             string
 	// PublicAPIEnabled mounts the public REST API; it still requires MCP service tokens.
 	PublicAPIEnabled bool
 	// PublicAPIBaseURL is the externally reachable API origin advertised in the OpenAPI document.
-	PublicAPIBaseURL                  string
-	AIConnectionEncryptionKey         string
-	ChatGPTConnectionsEnabled         bool
-	ChatGPTClientID                   string
-	ExternalMCPEnabled                bool
-	ExternalMCPEncryptionKey          string
+	PublicAPIBaseURL          string
+	AIConnectionEncryptionKey string
+	ChatGPTConnectionsEnabled bool
+	ChatGPTClientID           string
+	ExternalMCPEnabled        bool
+	ExternalMCPEncryptionKey  string
+	// WebhookEncryptionKey encrypts webhook signing secrets; CRM_ENCRYPTION_KEY is the fallback.
+	WebhookEncryptionKey string
+	// WebhooksAllowPrivateNetworks lets webhooks reach private addresses and plain HTTP (self-hosted only).
+	WebhooksAllowPrivateNetworks bool
+	// IntercomAPIBaseURL overrides the Intercom API host for imports (proxies and testing).
+	IntercomAPIBaseURL                string
 	ExternalMCPAllowedHosts           []string
 	ExternalMCPOAuthRedirectURL       string
 	ExternalMCPOAuthClientID          string
@@ -192,11 +214,26 @@ type Config struct {
 	// ServerAdminEmails (HELPIN_ADMIN_EMAILS) designates self-hosted server
 	// admins by email (Community only).
 	ServerAdminEmails []string
+	// OpsAlertEmails (OPS_ALERT_EMAILS) receive operational alerts by email,
+	// such as incoming support email stuck in processing. Empty sends none.
+	OpsAlertEmails []string
 
 	// Google account sign-in (optional — Google button disabled if unset)
 	GoogleAuthClientID     string
 	GoogleAuthClientSecret string
 	GoogleAuthRedirectURL  string
+
+	// Generic OpenID Connect sign-in (optional — SSO button disabled unless
+	// issuer, client ID, client secret and redirect URL are all set).
+	OIDCIssuerURL    string
+	OIDCClientID     string
+	OIDCClientSecret string
+	OIDCRedirectURL  string
+	OIDCProviderName string
+	OIDCScopes       []string
+	// AuthLocalLoginDisabled turns off password, passkey and password-reset
+	// sign-in. Requires a fully configured OIDC provider.
+	AuthLocalLoginDisabled bool
 
 	// CRM encryption & Gmail OAuth (optional — Gmail sync disabled if not set)
 	TOTPEncryptionKey     string
@@ -411,7 +448,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Config{
+	oidcScopes := strings.Fields(strings.ReplaceAll(os.Getenv("OIDC_SCOPES"), ",", " "))
+	if len(oidcScopes) == 0 {
+		oidcScopes = []string{"openid", "email", "profile"}
+	}
+	cfg := &Config{
 		AuthenticatedRateLimit:                 authenticatedRateLimit,
 		ExpensiveRateLimit:                     expensiveRateLimit,
 		DatabaseURL:                            dbURL,
@@ -439,6 +480,7 @@ func Load() (*Config, error) {
 		AgentRuntimeAppID:                      strings.TrimSpace(firstNonEmpty(os.Getenv("AGENT_RUNTIME_APP_ID"), "helpin")),
 		AgentRuntimeEventProtocol:              strings.ToLower(strings.TrimSpace(firstNonEmpty(os.Getenv("AGENT_RUNTIME_EVENT_PROTOCOL"), "v1"))),
 		AgentRuntimeLaunchEnabled:              parseBoolEnv(os.Getenv("AGENT_RUNTIME_LAUNCH_ENABLED")),
+		CommandBarRunGroupsEnabled:             parseBoolEnv(os.Getenv("COMMAND_BAR_RUN_GROUPS_ENABLED")),
 		AWSAccessKeyID:                         os.Getenv("AWS_ACCESS_KEY_ID"),
 		AWSSecretAccessKey:                     os.Getenv("AWS_SECRET_ACCESS_KEY"),
 		AWSPresignEndpointURL:                  strings.TrimSpace(os.Getenv("AWS_S3_PRESIGN_ENDPOINT_URL")),
@@ -466,6 +508,8 @@ func Load() (*Config, error) {
 		JevFollowUpThreshold:                   parseJevProbability(os.Getenv("JEV_FOLLOW_UP_THRESHOLD"), .95),
 		JevRoutingMode:                         strings.TrimSpace(os.Getenv("JEV_ROUTING_MODE")),
 		JevTagsMode:                            strings.TrimSpace(os.Getenv("JEV_TAGS_MODE")),
+		JevPriorityMode:                        strings.TrimSpace(os.Getenv("JEV_PRIORITY_MODE")),
+		JevPriorityThreshold:                   parseJevProbability(os.Getenv("JEV_PRIORITY_THRESHOLD"), .95),
 		JevTimeoutMS:                           parsePositiveIntEnv(os.Getenv("JEV_TIMEOUT_MS"), 1000),
 		JevWorkspaceIDs:                        os.Getenv("JEV_WORKSPACE_IDS"),
 		JevDailyLimit:                          parsePositiveIntEnv(os.Getenv("JEV_DAILY_LIMIT"), 1000),
@@ -516,6 +560,9 @@ func Load() (*Config, error) {
 		PostmarkRouteInboundWebhookSecret:      strings.TrimSpace(firstNonEmpty(os.Getenv("POSTMARK_ROUTE_INBOUND_WEBHOOK_SECRET"), os.Getenv("POSTMARK_INBOUND_WEBHOOK_SECRET"))),
 		SupportEmailRouteDomain:                strings.TrimSpace(firstNonEmpty(os.Getenv("SUPPORT_EMAIL_ROUTE_DOMAIN"), os.Getenv("SUPPORT_EMAIL_REPLY_DOMAIN"), deployment.DefaultRouteDomain)),
 		AppBaseURL:                             appBaseURL,
+		AppIndexURL:                            strings.TrimSpace(os.Getenv("APP_INDEX_URL")),
+		HelpcenterHostedDomain:                 normalizeHostedDomain(os.Getenv("HELPCENTER_HOSTED_DOMAIN")),
+		HelpcenterCustomDomainTarget:           normalizeHostedDomain(firstNonEmpty(os.Getenv("HELPCENTER_CUSTOM_DOMAIN_TARGET"), os.Getenv("HELPCENTER_HOSTED_DOMAIN"))),
 		MobileAppBaseURL:                       strings.TrimRight(strings.TrimSpace(os.Getenv("MOBILE_APP_BASE_URL")), "/"),
 		CLIEnabled:                             parseBoolEnv(os.Getenv("CLI_ENABLED")),
 		CLIModelGatewayEnabled:                 parseBoolEnv(os.Getenv("CLI_MODEL_GATEWAY_ENABLED")),
@@ -536,6 +583,9 @@ func Load() (*Config, error) {
 		ChatGPTClientID:                        strings.TrimSpace(os.Getenv("CHATGPT_OAUTH_CLIENT_ID")),
 		ExternalMCPEnabled:                     parseBoolEnv(os.Getenv("EXTERNAL_MCP_ENABLED")),
 		ExternalMCPEncryptionKey:               strings.TrimSpace(os.Getenv("EXTERNAL_MCP_ENCRYPTION_KEY")),
+		WebhookEncryptionKey:                   strings.TrimSpace(os.Getenv("WEBHOOK_ENCRYPTION_KEY")),
+		WebhooksAllowPrivateNetworks:           parseBoolEnv(os.Getenv("WEBHOOKS_ALLOW_PRIVATE_NETWORKS")),
+		IntercomAPIBaseURL:                     strings.TrimRight(strings.TrimSpace(os.Getenv("INTERCOM_API_BASE_URL")), "/"),
 		ExternalMCPAllowedHosts:                parseCSV(firstNonEmpty(os.Getenv("EXTERNAL_MCP_ALLOWED_HOSTS"), "*") + "," + os.Getenv("EXTERNAL_MCP_ADDITIONAL_ALLOWED_HOSTS")),
 		ExternalMCPOAuthRedirectURL:            strings.TrimSpace(os.Getenv("EXTERNAL_MCP_OAUTH_REDIRECT_URL")),
 		ExternalMCPOAuthClientID:               strings.TrimSpace(os.Getenv("EXTERNAL_MCP_OAUTH_CLIENT_ID")),
@@ -548,9 +598,17 @@ func Load() (*Config, error) {
 		WebAuthnRPOrigins:                      webAuthnRPOrigins,
 		PlatformAdminEmails:                    parseCSV(os.Getenv("PLATFORM_ADMIN_EMAILS")),
 		ServerAdminEmails:                      parseCSV(os.Getenv("HELPIN_ADMIN_EMAILS")),
+		OpsAlertEmails:                         parseCSV(os.Getenv("OPS_ALERT_EMAILS")),
 		GoogleAuthClientID:                     strings.TrimSpace(os.Getenv("GOOGLE_AUTH_CLIENT_ID")),
 		GoogleAuthClientSecret:                 strings.TrimSpace(os.Getenv("GOOGLE_AUTH_CLIENT_SECRET")),
 		GoogleAuthRedirectURL:                  strings.TrimSpace(os.Getenv("GOOGLE_AUTH_REDIRECT_URL")),
+		OIDCIssuerURL:                          strings.TrimSpace(os.Getenv("OIDC_ISSUER_URL")),
+		OIDCClientID:                           strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")),
+		OIDCClientSecret:                       strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET")),
+		OIDCRedirectURL:                        strings.TrimSpace(os.Getenv("OIDC_REDIRECT_URL")),
+		OIDCProviderName:                       firstNonEmpty(strings.TrimSpace(os.Getenv("OIDC_PROVIDER_NAME")), "Single sign-on"),
+		OIDCScopes:                             oidcScopes,
+		AuthLocalLoginDisabled:                 parseBoolEnv(os.Getenv("AUTH_LOCAL_LOGIN_DISABLED")),
 		TOTPEncryptionKey:                      strings.TrimSpace(os.Getenv("TOTP_ENCRYPTION_KEY")),
 		CRMEncryptionKey:                       os.Getenv("CRM_ENCRYPTION_KEY"),
 		PMImportEncryptionKey:                  strings.TrimSpace(os.Getenv("PM_IMPORT_ENCRYPTION_KEY")),
@@ -606,7 +664,30 @@ func Load() (*Config, error) {
 		AgentPreviewDebug:                      parseBoolEnv(os.Getenv("AGENT_PREVIEW_DEBUG")),
 		DocsOrderingUseSortKey:                 parseBoolEnv(os.Getenv("DOCS_ORDERING_USE_SORT_KEY")),
 		TLSAskExtraAllowedDomains:              parseCSV(os.Getenv("TLS_ASK_EXTRA_ALLOWED_DOMAINS")),
-	}, nil
+	}
+	if err := validateOIDCRedirectURL(cfg.OIDCRedirectURL); err != nil {
+		return nil, err
+	}
+	if cfg.AuthLocalLoginDisabled && !cfg.OIDCConfigured() {
+		return nil, fmt.Errorf("AUTH_LOCAL_LOGIN_DISABLED requires OIDC_ISSUER_URL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET and OIDC_REDIRECT_URL to be set")
+	}
+	return cfg, nil
+}
+
+// oidcCallbackPath is the API route that completes OpenID Connect sign-in.
+const oidcCallbackPath = "/api/auth/oidc/callback"
+
+// validateOIDCRedirectURL rejects a redirect URL that does not point at the API
+// callback route, which would send people to a page that cannot finish sign-in.
+func validateOIDCRedirectURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Path != oidcCallbackPath {
+		return fmt.Errorf("OIDC_REDIRECT_URL must be an absolute http(s) URL whose path is %s, for example <APP_BASE_URL>%s", oidcCallbackPath, oidcCallbackPath)
+	}
+	return nil
 }
 
 func validateOptionalLLMRouteEnv(providerName, provider, modelName, model string) error {
@@ -638,6 +719,12 @@ func validateOpenRouterProviderEnv(name, openRouterProvider, routeProvider, defa
 func gmailOAuthRedirectURL(appBaseURL string) string {
 	return firstNonEmpty(os.Getenv("GMAIL_OAUTH_REDIRECT_URL"),
 		strings.TrimRight(strings.TrimSpace(appBaseURL), "/")+"/api/crm/email/oauth/callback")
+}
+
+// OIDCConfigured reports whether every setting needed for OpenID Connect
+// sign-in is present.
+func (c *Config) OIDCConfigured() bool {
+	return c.OIDCIssuerURL != "" && c.OIDCClientID != "" && c.OIDCClientSecret != "" && c.OIDCRedirectURL != ""
 }
 
 func firstNonEmpty(values ...string) string {
@@ -704,6 +791,17 @@ func parseOptionalOrigins(value string) []string {
 		}
 	}
 	return origins
+}
+
+// normalizeHostedDomain reduces a URL or hostname such as
+// "https://helpin.center/" to a bare lowercase hostname.
+func normalizeHostedDomain(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(strings.TrimPrefix(value, "https://"), "http://")
+	if i := strings.IndexAny(value, "/:"); i >= 0 {
+		value = value[:i]
+	}
+	return strings.Trim(value, ".")
 }
 
 func parseCSV(value string) []string {

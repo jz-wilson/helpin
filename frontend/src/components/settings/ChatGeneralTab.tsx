@@ -7,7 +7,7 @@ import { WidgetOriginSettings } from './chat-widget/WidgetOriginSettings';
 import { brandingDescription } from '@edition';
 import { AIReplyChannelsSelect, getAIReplyChannels, type AIReplyChannels } from './chat-widget/AIReplyChannelsSelect';
 import { AIFollowUpSettings } from './chat-widget/AIFollowUpSettings';
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { useSettingsAutosave } from '@/hooks/useSettingsAutosave';
 import { SettingsAutosaveGuard } from './SettingsAutosaveGuard';
 import { SettingsSaveBar } from './SettingsSaveBar';
@@ -15,14 +15,17 @@ import { SettingsSaveStatus } from './SettingsSaveStatus';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { TimezoneSelector } from './TimezoneSelector';
 import { Switch } from '@/components/ui/switch';
+import { HelpSpacesPicker } from './HelpSpacesPicker';
+import { toggleHelpSpaceId } from './helpSpaces';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { DEFAULT_PRIVACY_NOTICE_TEXT, getPrivacyPolicyURL, formatReplyTimeCopy, SPECIAL_NOTICE_MAX_LENGTH } from '@helpin-ai/shared';
 import { toast } from 'sonner';
-import { Shield01Icon, Copy01Icon, CodeIcon, Message01Icon, HelpCircleIcon, Image01Icon, Key01Icon, BotIcon, ArrowDown01Icon, StarIcon } from '@/lib/icons';
+import { Shield01Icon, Copy01Icon, CodeIcon, Message01Icon, HelpCircleIcon, Image01Icon, Key01Icon, BotIcon, ArrowDown01Icon, StarIcon, GlobeIcon } from '@/lib/icons';
 import { useChatSettings, useUpdateChatSettings, useRegenerateWidgetKey, useDocsSpaces } from '@/hooks/queries';
 import { useWorkspaceBilling } from '@edition';
 import { useSupportAgents, useSupportMailboxes } from '@/hooks/queries/useSupport';
@@ -34,11 +37,12 @@ import { useAuthStore } from '@/stores/authStore';
 import { useWorkspaceStore } from '@/stores/workspaceStore';
 import { cn } from '@/lib/utils';
 import type { BusinessHoursDay } from '@/lib/pmTypes';
-import { canRemoveHelpinBranding, COLOR_SCHEME_OPTIONS, COMMON_TIMEZONES, DAYS, DEFAULT_EMAIL_FALLBACK_DELAY_SECS, ICON_OPTIONS, NO_AGENT_VALUE } from './chat-widget/constants';
+import { canRemoveHelpinBranding, COLOR_SCHEME_OPTIONS, DEFAULT_EMAIL_FALLBACK_DELAY_SECS, ICON_OPTIONS, NO_AGENT_VALUE } from './chat-widget/constants';
 import { PreviewLayout } from './chat-widget/PreviewLayout';
+import { BusinessHoursEditor } from './chat-widget/BusinessHoursEditor';
+import { businessHoursDayIssue } from './chat-widget/businessHours';
 import {
   buildPreviewAvailability,
-  normalizeBusinessHoursDay,
   normalizeBusinessHoursSchedule,
   previewEscalationMessage,
   sortHelpSpaceIds,
@@ -46,6 +50,8 @@ import {
 } from './chat-widget/utils';
 import { DelayedTeamReplySettings } from './chat-widget/DelayedTeamReplySettings';
 import { DEFAULT_DELAYED_TEAM_REPLY_MINUTES, DEFAULT_DELAYED_TEAM_REPLY_MESSAGE, DEFAULT_DELAYED_TEAM_REPLY_MESSAGE_NO_EMAIL } from './chat-widget/delayedTeamReply';
+import { EmailHandoffSettings } from './chat-widget/EmailHandoffSettings';
+import { DEFAULT_EMAIL_HANDOFF_MESSAGE, DEFAULT_EMAIL_HANDOFF_MESSAGE_AFTER_HOURS } from './chat-widget/emailHandoff';
 import { CHAT_WIDGET_ESCALATION_TABS } from './chat-widget/escalationTabs';
 import {
   CHAT_WIDGET_AI_RESPONSE_MODES,
@@ -93,7 +99,7 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
   const [previewInitialView, setPreviewInitialView] = useState<'home' | 'conversation'>('home');
 
   // Identity state
-  const [requireEmail, setRequireEmail] = useState(true);
+  const [emailCaptureTiming, setEmailCaptureTiming] = useState<'after_ai_reply' | 'before_handoff' | 'never'>('after_ai_reply');
   const [requirePhone, setRequirePhone] = useState(false);
   const [welcomeMessage, setWelcomeMessage] = useState('');
   const [privacyNoticeEnabled, setPrivacyNoticeEnabled] = useState(false);
@@ -109,6 +115,7 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
   const [buttonColor, setButtonColor] = useState('#000000');
   const [buttonIconColor, setButtonIconColor] = useState('#FFFFFF');
   const [logoUrl, setLogoUrl] = useState('');
+  const [aiDisplayName, setAIDisplayName] = useState('');
   const [widgetName, setWidgetName] = useState('');
   const [widgetAvatarUrl, setWidgetAvatarUrl] = useState('');
   const [widgetHelpSpaceIds, setWidgetHelpSpaceIds] = useState<string[]>([]);
@@ -122,6 +129,7 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
   const [aiReplyChannels, setAiReplyChannels] = useState<AIReplyChannels>('chat');
   const [aiResponseMode, setAiResponseMode] = useState(DEFAULT_CHAT_WIDGET_AI_RESPONSE_MODE);
   const [aiFollowUpEnabled, setAiFollowUpEnabled] = useState(true);
+  const [aiEmailCodeCheck, setAiEmailCodeCheck] = useState(false);
   const [aiFollowUpDelay, setAiFollowUpDelay] = useState(24);
   const [aiFollowUpClose, setAiFollowUpClose] = useState(1);
   const [aiFollowUpSecondDelay, setAiFollowUpSecondDelay] = useState(24);
@@ -130,6 +138,8 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
   const [escalationMessage, setEscalationMessage] = useState('Let me connect you with a team member who can help further.');
   const [escalationMessageBusy, setEscalationMessageBusy] = useState('');
   const [escalationMessageAfterHours, setEscalationMessageAfterHours] = useState('');
+  const [emailHandoffMessage, setEmailHandoffMessage] = useState(DEFAULT_EMAIL_HANDOFF_MESSAGE);
+  const [emailHandoffMessageAfterHours, setEmailHandoffMessageAfterHours] = useState(DEFAULT_EMAIL_HANDOFF_MESSAGE_AFTER_HOURS);
   const [delayedTeamReplyMinutes, setDelayedTeamReplyMinutes] = useState(DEFAULT_DELAYED_TEAM_REPLY_MINUTES);
   const [delayedTeamReplyMessage, setDelayedTeamReplyMessage] = useState(DEFAULT_DELAYED_TEAM_REPLY_MESSAGE);
   const [delayedTeamReplyMessageNoEmail, setDelayedTeamReplyMessageNoEmail] = useState(DEFAULT_DELAYED_TEAM_REPLY_MESSAGE_NO_EMAIL);
@@ -151,9 +161,7 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
   const [forceVisitorIdentity, setForceVisitorIdentity] = useState(false);
 
   // Accordion state
-  const [expandedSections, setExpandedSections] = useState<Set<string>>(
-    () => new Set(['widget-settings']),
-  );
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(() => new Set());
 
   const logoInputRef = useRef<HTMLInputElement>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
@@ -163,66 +171,73 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
 
   const [hydrated, setHydrated] = useState(false);
 
-  useEffect(() => {
-    if (data?.settings && !billingLoading && !hydrated) {
-      const s = data.settings;
-      const normalizedSchedule = normalizeBusinessHoursSchedule(s.business_hours_schedule);
-      const sortedHelpSpaceIds = sortHelpSpaceIds(s.widget_help_space_ids);
+  // Load the saved settings into the form once, before the first paint.
+  if (data?.settings && !billingLoading && !hydrated) {
+    const s = data.settings;
+    const normalizedSchedule = normalizeBusinessHoursSchedule(s.business_hours_schedule);
+    const sortedHelpSpaceIds = sortHelpSpaceIds(s.widget_help_space_ids);
 
-      setHydrated(true);
-
-      setRequireEmail(s.require_email_before_chat);
-      setRequirePhone(s.require_phone_after_email);
-      setWelcomeMessage(s.welcome_message);
-      setPrivacyNoticeEnabled(s.privacy_notice_enabled ?? false);
-      setPrivacyPolicyUrl(s.privacy_policy_url ?? '');
-      setPrivacyNoticeText(s.privacy_notice_text || DEFAULT_PRIVACY_NOTICE_TEXT);
-      setBrandColor(s.brand_color);
-      setShowBranding(canRemoveBranding ? s.show_branding : true);
-      setLauncherPosition(s.launcher_position);
-      setLauncherIcon(s.launcher_icon);
-      setColorScheme(s.color_scheme || 'light');
-      setButtonColor(s.button_color || '#000000');
-      setButtonIconColor(s.button_icon_color || '#FFFFFF');
-      setLogoUrl(s.logo_url || '');
-      setWidgetName(s.widget_name || '');
-      setWidgetAvatarUrl(s.widget_avatar_url || '');
-      setWidgetHelpSpaceIds(sortedHelpSpaceIds);
-      setAiEnabled(s.ai_enabled && isChatWidgetAIResponseModeActive(s.ai_response_mode));
-      setAiAgentId(s.ai_agent_id ?? NO_AGENT_VALUE);
-      setConfidenceThreshold(String(s.ai_confidence_threshold));
-      setAiResponseMode(getChatWidgetAIResponseModeForUI(s.ai_response_mode));
-      setAiReplyChannels(getAIReplyChannels(s.ai_reply_channels));
-      setAiFollowUpEnabled(s.ai_follow_up_enabled ?? true);
-      setAiFollowUpDelay(s.ai_follow_up_delay_hours ?? 24);
-      setAiFollowUpClose(s.ai_follow_up_close_hours ?? 1);
-      setAiFollowUpSecondDelay(s.ai_follow_up_second_delay_hours ?? 24);
-      setAiMaxFollowups(s.ai_max_followups ?? DEFAULT_AI_HANDOFF_FOLLOWUPS);
-      setShowTalkToHuman(s.show_talk_to_human);
-      setEscalationMessage(s.escalation_message || 'Let me connect you with a team member who can help further.');
-      setEscalationMessageBusy(s.escalation_message_busy ?? '');
-      setEscalationMessageAfterHours(s.escalation_message_after_hours ?? '');
-      setDelayedTeamReplyMinutes(s.delayed_team_reply_minutes ?? DEFAULT_DELAYED_TEAM_REPLY_MINUTES);
-      setDelayedTeamReplyMessage(s.delayed_team_reply_message ?? DEFAULT_DELAYED_TEAM_REPLY_MESSAGE);
-      setDelayedTeamReplyMessageNoEmail(s.delayed_team_reply_message_no_email ?? DEFAULT_DELAYED_TEAM_REPLY_MESSAGE_NO_EMAIL);
-      setHandoffBehavior(s.handoff_behavior);
-      setHandoffTeamId(s.handoff_team_id);
-      setAiHandoffMailboxId(s.ai_handoff_mailbox_id);
-      setBusinessHoursEnabled(s.business_hours_enabled);
-      setTimezone(s.business_hours_timezone);
-      setSchedule(normalizedSchedule);
-      setOutsideMessage(s.outside_hours_message);
-      setReplyTimePreset(s.reply_time_preset ?? 'few_minutes');
-      setReplyTimeCustomMinutes(s.reply_time_custom_minutes ?? null);
-      setSpecialNoticeText(s.special_notice_text ?? '');
-      setEmailFallbackDelaySecs(s.email_fallback_delay_secs ?? DEFAULT_EMAIL_FALLBACK_DELAY_SECS);
-      setEmailFallbackFromName(s.email_fallback_from_name ?? '');
-      setEmailFallbackMaxDeliveryAgeMins(Math.round((s.email_fallback_max_delivery_age_secs ?? 600) / 60));
-      setCsatEnabled(s.csat_enabled);
-      setFileUploadsEnabled(s.file_uploads_enabled ?? true);
-      setForceVisitorIdentity(s.force_visitor_identity ?? false);
+    setHydrated(true);
+    // A widget with no allowed websites cannot connect, so open that section.
+    if (!data.allowed_origins?.length) {
+      setExpandedSections(prev => new Set(prev).add('allowed-origins'));
     }
-  }, [data, billingLoading, canRemoveBranding, hydrated]);
+
+    setEmailCaptureTiming(s.email_capture_timing ?? (s.require_email_before_chat ? 'before_handoff' : 'never'));
+    setRequirePhone(s.require_phone_after_email);
+    setWelcomeMessage(s.welcome_message);
+    setPrivacyNoticeEnabled(s.privacy_notice_enabled ?? false);
+    setPrivacyPolicyUrl(s.privacy_policy_url ?? '');
+    setPrivacyNoticeText(s.privacy_notice_text || DEFAULT_PRIVACY_NOTICE_TEXT);
+    setBrandColor(s.brand_color);
+    setShowBranding(canRemoveBranding ? s.show_branding : true);
+    setLauncherPosition(s.launcher_position);
+    setLauncherIcon(s.launcher_icon);
+    setColorScheme(s.color_scheme || 'light');
+    setButtonColor(s.button_color || '#000000');
+    setButtonIconColor(s.button_icon_color || '#FFFFFF');
+    setLogoUrl(s.logo_url || '');
+    setWidgetName(s.widget_name || '');
+    setAIDisplayName(s.ai_display_name || '');
+    setWidgetAvatarUrl(s.widget_avatar_url || '');
+    setWidgetHelpSpaceIds(sortedHelpSpaceIds);
+    setAiEnabled(s.ai_enabled && isChatWidgetAIResponseModeActive(s.ai_response_mode));
+    setAiAgentId(s.ai_agent_id ?? NO_AGENT_VALUE);
+    setConfidenceThreshold(String(s.ai_confidence_threshold));
+    setAiResponseMode(getChatWidgetAIResponseModeForUI(s.ai_response_mode));
+    setAiReplyChannels(getAIReplyChannels(s.ai_reply_channels));
+    setAiFollowUpEnabled(s.ai_follow_up_enabled ?? true);
+    setAiEmailCodeCheck(s.ai_email_code_check_enabled ?? false);
+    setAiFollowUpDelay(s.ai_follow_up_delay_hours ?? 24);
+    setAiFollowUpClose(s.ai_follow_up_close_hours ?? 1);
+    setAiFollowUpSecondDelay(s.ai_follow_up_second_delay_hours ?? 24);
+    setAiMaxFollowups(s.ai_max_followups ?? DEFAULT_AI_HANDOFF_FOLLOWUPS);
+    setShowTalkToHuman(s.show_talk_to_human);
+    setEscalationMessage(s.escalation_message || 'Let me connect you with a team member who can help further.');
+    setEscalationMessageBusy(s.escalation_message_busy ?? '');
+    setEscalationMessageAfterHours(s.escalation_message_after_hours ?? '');
+    setEmailHandoffMessage(s.email_handoff_message || DEFAULT_EMAIL_HANDOFF_MESSAGE);
+    setEmailHandoffMessageAfterHours(s.email_handoff_message_after_hours || DEFAULT_EMAIL_HANDOFF_MESSAGE_AFTER_HOURS);
+    setDelayedTeamReplyMinutes(s.delayed_team_reply_minutes ?? DEFAULT_DELAYED_TEAM_REPLY_MINUTES);
+    setDelayedTeamReplyMessage(s.delayed_team_reply_message ?? DEFAULT_DELAYED_TEAM_REPLY_MESSAGE);
+    setDelayedTeamReplyMessageNoEmail(s.delayed_team_reply_message_no_email ?? DEFAULT_DELAYED_TEAM_REPLY_MESSAGE_NO_EMAIL);
+    setHandoffBehavior(s.handoff_behavior);
+    setHandoffTeamId(s.handoff_team_id);
+    setAiHandoffMailboxId(s.ai_handoff_mailbox_id);
+    setBusinessHoursEnabled(s.business_hours_enabled);
+    setTimezone(s.business_hours_timezone);
+    setSchedule(normalizedSchedule);
+    setOutsideMessage(s.outside_hours_message);
+    setReplyTimePreset(s.reply_time_preset ?? 'few_minutes');
+    setReplyTimeCustomMinutes(s.reply_time_custom_minutes ?? null);
+    setSpecialNoticeText(s.special_notice_text ?? '');
+    setEmailFallbackDelaySecs(s.email_fallback_delay_secs ?? DEFAULT_EMAIL_FALLBACK_DELAY_SECS);
+    setEmailFallbackFromName(s.email_fallback_from_name ?? '');
+    setEmailFallbackMaxDeliveryAgeMins(Math.round((s.email_fallback_max_delivery_age_secs ?? 600) / 60));
+    setCsatEnabled(s.csat_enabled);
+    setFileUploadsEnabled(s.file_uploads_enabled ?? true);
+    setForceVisitorIdentity(s.force_visitor_identity ?? false);
+  }
 
   const aiAssistantEnableBlocker = getChatWidgetAIAssistantEnableBlocker({
     aiAgentId,
@@ -230,19 +245,24 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
   });
   const showAIAssistantEnableBlocker = Boolean(aiAssistantEnableBlocker && (aiEnableAttempted || aiEnabled));
 
+  const businessHoursSchedule = normalizeBusinessHoursSchedule(schedule);
+  // Days whose times cannot be saved show their own message; saving waits until they are fixed.
+  const scheduleHasIssue = businessHoursEnabled && Object.values(businessHoursSchedule).some((day) => businessHoursDayIssue(day) !== null);
   const privacyNoticeError = privacyNoticeEnabled && !getPrivacyPolicyURL(privacyPolicyUrl)
     ? 'Enter a valid Privacy Policy URL to save your changes.'
     : privacyNoticeEnabled && !privacyNoticeText.trim()
       ? 'Enter notice text to save your changes.'
       : undefined;
   const settingsDraft: ChatSettingsDraft = {
-    require_email_before_chat: requireEmail,
+    email_capture_timing: emailCaptureTiming,
+    require_email_before_chat: emailCaptureTiming !== 'never',
     require_phone_after_email: requirePhone,
     welcome_message: welcomeMessage,
     privacy_notice_enabled: privacyNoticeEnabled,
     privacy_policy_url: privacyPolicyUrl.trim(),
     privacy_notice_text: privacyNoticeText.trim(),
     widget_name: widgetName,
+    ai_display_name: aiDisplayName,
     widget_avatar_url: widgetAvatarUrl,
     widget_help_space_ids: sortHelpSpaceIds(widgetHelpSpaceIds),
     brand_color: brandColor,
@@ -260,6 +280,7 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
     ai_reply_channels: aiReplyChannels,
     ai_max_followups: aiMaxFollowups,
     ai_follow_up_enabled: aiFollowUpEnabled,
+    ai_email_code_check_enabled: aiEmailCodeCheck,
     ai_follow_up_delay_hours: aiFollowUpDelay,
     ai_follow_up_close_hours: aiFollowUpClose,
     ai_follow_up_second_delay_hours: aiFollowUpSecondDelay,
@@ -269,6 +290,8 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
     escalation_message: escalationMessage,
     escalation_message_busy: escalationMessageBusy || undefined,
     escalation_message_after_hours: escalationMessageAfterHours || undefined,
+    email_handoff_message: emailHandoffMessage,
+    email_handoff_message_after_hours: emailHandoffMessageAfterHours,
     delayed_team_reply_minutes: delayedTeamReplyMinutes,
     delayed_team_reply_message: delayedTeamReplyMessage,
     delayed_team_reply_message_no_email: delayedTeamReplyMessageNoEmail,
@@ -278,7 +301,7 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
     ai_handoff_mailbox_id: aiHandoffMailboxId,
     business_hours_enabled: businessHoursEnabled,
     business_hours_timezone: timezone,
-    business_hours_schedule: normalizeBusinessHoursSchedule(schedule),
+    business_hours_schedule: businessHoursSchedule,
     outside_hours_message: outsideMessage,
     reply_time_preset: replyTimePreset,
     reply_time_custom_minutes: replyTimePreset === 'custom' ? replyTimeCustomMinutes : null,
@@ -299,7 +322,7 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
   };
   const autosave = useSettingsAutosave({
     scopeKey: workspaceId,
-    enabled: hydrated && !billingLoading && !privacyNoticeError,
+    enabled: hydrated && !billingLoading && !privacyNoticeError && !scheduleHasIssue,
     value: settingsDraft,
     // The hook captures this baseline only once after the form is hydrated.
     // Later query refreshes must not replace edits made while a save is pending.
@@ -307,13 +330,6 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
     save: (draft: ChatSettingsDraft) => updateMutation.mutateAsync(draft),
     delayMs: 800,
   });
-
-  const updateDay = (dayKey: string, patch: Partial<BusinessHoursDay>) => {
-    setSchedule(prev => ({
-      ...prev,
-      [dayKey]: { ...normalizeBusinessHoursDay(prev[dayKey]), ...patch },
-    }));
-  };
 
   const toggleSection = (key: string) => {
     setExpandedSections(prev => {
@@ -351,14 +367,9 @@ function ChatGeneralSettings({ workspaceId, mode, canManageSigningSecret }: { wo
     }
   };
 
-  const externalDocsSpaces = docsSpaces.filter((space) => space.type === 'external_capable');
 
   const toggleHelpSpace = (spaceId: string, enabled: boolean) => {
-    setWidgetHelpSpaceIds((current) => (
-      enabled
-        ? current.includes(spaceId) ? current : [...current, spaceId]
-        : current.filter((id) => id !== spaceId)
-    ));
+    setWidgetHelpSpaceIds((current) => toggleHelpSpaceId(current, spaceId, enabled));
   };
 
 
@@ -677,6 +688,8 @@ function Dashboard() {
       privacyNotice={{ enabled: privacyNoticeEnabled, policyUrl: privacyPolicyUrl, text: privacyNoticeText }}
       initialView={isExpanded('privacy') ? 'conversation' : previewInitialView}
       workspaceName={widgetName || workspace?.name}
+      aiDisplayName={aiDisplayName}
+      avatarUrl={widgetAvatarUrl}
       workspaceLogoUrl={widgetAvatarUrl || workspace?.logo_url}
       colorScheme={colorScheme}
       buttonColor={buttonColor}
@@ -777,6 +790,15 @@ function Dashboard() {
               <p id="ai-confidence-help" className="text-xs text-quiet-text-secondary">Higher confidence means fewer AI answers and more human handoffs.</p>
             </div>
           </div>
+          {aiReplyChannels !== 'chat' && (
+            <div className="flex items-start justify-between gap-4 border-t border-quiet-divider pt-5">
+              <div className="space-y-2">
+                <Label htmlFor="ai-email-code-check">Check the code before replying by email</Label>
+                <p id="ai-email-code-check-help" className="text-xs text-quiet-text-secondary">When help articles don't explain how something works, the AI checks your connected repository and answers only what it confirms. Otherwise it hands off with what it found.</p>
+              </div>
+              <Switch id="ai-email-code-check" aria-describedby="ai-email-code-check-help" checked={aiEmailCodeCheck} onCheckedChange={setAiEmailCodeCheck} />
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -799,7 +821,7 @@ function Dashboard() {
             <div className="flex items-start justify-between gap-4">
               <div className="space-y-2">
                 <Label htmlFor="ai-talk-to-human">Show “Talk to Human”</Label>
-                <p className="text-xs text-quiet-text-secondary">Let customers request a teammate from the chat widget.</p>
+                <p className="text-xs text-quiet-text-secondary">Let customers ask for a teammate from the chat widget and from AI emails.</p>
               </div>
               <Switch id="ai-talk-to-human" checked={showTalkToHuman} onCheckedChange={setShowTalkToHuman} />
             </div>
@@ -815,6 +837,14 @@ function Dashboard() {
                     </TabsTrigger>
                   ))}
                 </TabsList>
+                <TabsContent value="email" className="mt-0">
+                  <EmailHandoffSettings
+                    message={emailHandoffMessage}
+                    messageAfterHours={emailHandoffMessageAfterHours}
+                    onMessageChange={setEmailHandoffMessage}
+                    onMessageAfterHoursChange={setEmailHandoffMessageAfterHours}
+                  />
+                </TabsContent>
                 <TabsContent value="delayed_team_reply" className="mt-0">
                   <DelayedTeamReplySettings
                     minutes={delayedTeamReplyMinutes}
@@ -910,9 +940,9 @@ function Dashboard() {
             <BotIcon className="h-4 w-4" />
           </div>
           <div className="min-w-0">
-            <p className="text-sm font-medium">AI Assistant</p>
+            <p className="text-sm font-medium">AI assistant</p>
             <p className="mt-0.5 text-sm text-muted-foreground">
-              AI replies, internal notes, confidence, and handoff settings now live in AI Assistant.
+              AI replies, internal notes, confidence, and handoff settings now live in AI assistant.
             </p>
             <p className="mt-2 text-xs text-muted-foreground">
               Current mode: {aiEnabled && !aiAssistantEnableBlocker ? (aiResponseMode === 'ai_first' ? 'Reply directly' : 'Add internal note') : 'Off'}
@@ -967,19 +997,46 @@ function Dashboard() {
       <div className="flex flex-1 flex-col overflow-auto">
         <div className="flex-1 space-y-3 p-4">
         {saveIndicator}
-        {data && <WidgetOriginSettings key={workspaceId} workspaceId={workspaceId} installation={data} canManageSigningSecret={canManageSigningSecret} />}
+        {/* Allowed websites */}
+        {data && (
+          <div className={supportSectionClass}>
+            <button
+              type="button"
+              onClick={() => toggleSection('allowed-origins')}
+              aria-expanded={isExpanded('allowed-origins')}
+              className="flex w-full items-center gap-4 px-4 py-4 text-left transition-colors hover:bg-muted/40"
+            >
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                <GlobeIcon className="h-4 w-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium">Allowed websites</p>
+                <p className="text-sm text-muted-foreground">Where the widget can load, and how visitors are verified</p>
+              </div>
+              <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('allowed-origins') && 'rotate-180')} />
+            </button>
+            <div className="accordion-animate" data-open={isExpanded('allowed-origins')}>
+              <div>
+                <div className="border-t border-border px-6 py-6">
+                  <WidgetOriginSettings key={workspaceId} workspaceId={workspaceId} installation={data} canManageSigningSecret={canManageSigningSecret} />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         {/* Widget Installation */}
         <div className={supportSectionClass}>
           <button
             type="button"
             onClick={() => toggleSection('widget-installation')}
+            aria-expanded={isExpanded('widget-installation')}
             className="flex w-full items-center gap-4 px-4 py-4 text-left transition-colors hover:bg-muted/40"
           >
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
               <CodeIcon className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium">2. Install the widget</p>
+              <p className="text-sm font-medium">Install the widget</p>
               <p className="text-sm text-muted-foreground">Embed the chat widget on your website</p>
             </div>
             <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('widget-installation') && 'rotate-180')} />
@@ -987,6 +1044,11 @@ function Dashboard() {
           <div className="accordion-animate" data-open={isExpanded('widget-installation')}>
             <div>
             <div className="border-t border-border px-6 py-6 space-y-4">
+              {data && !data.allowed_origins?.length && (
+                <p role="status" className="text-sm text-quiet-accent">
+                  Add your website under Allowed websites first, or the widget can't connect.
+                </p>
+              )}
               {!widgetKey ? (
                 <div className="flex flex-col items-center gap-3 py-6 text-center">
                   <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted">
@@ -1096,93 +1158,6 @@ function Dashboard() {
           </div>
         </div>
 
-        {/* Identity Capture */}
-        <div className={supportSectionClass}>
-          <button
-            type="button"
-            onClick={() => toggleSection('identity-capture')}
-            className="flex w-full items-center gap-4 px-4 py-4 text-left transition-colors hover:bg-muted/40"
-          >
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-              <Message01Icon className="h-4 w-4" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium">Contact details</p>
-              <p className="text-sm text-muted-foreground">Choose which contact details to ask for when visitors request human support.</p>
-            </div>
-            <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('identity-capture') && 'rotate-180')} />
-          </button>
-          <div className="accordion-animate" data-open={isExpanded('identity-capture')}>
-            <div>
-            <div className="border-t border-border px-6 py-6 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <Label className="text-sm">Ask for email before human support</Label>
-                  <p className="text-xs text-muted-foreground">Show an email prompt when visitors request a teammate. Visitors whose email is already known are not asked again.</p>
-                </div>
-                <Switch checked={requireEmail} onCheckedChange={setRequireEmail} />
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div>
-                  <Label className="text-sm">Also ask for a phone number</Label>
-                  <p className="text-xs text-muted-foreground">Show an optional phone number prompt after the email step.</p>
-                </div>
-                <Switch checked={requirePhone} onCheckedChange={setRequirePhone} disabled={!requireEmail} />
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div>
-                  <Label className="text-sm">Make email required</Label>
-                  <p className="text-xs text-muted-foreground">Visitors cannot skip the email step. When off, they can continue without email. Phone number remains optional.</p>
-                </div>
-                <Switch checked={forceVisitorIdentity} onCheckedChange={setForceVisitorIdentity} disabled={!requireEmail} />
-              </div>
-
-              <WelcomeMessageSettings
-                value={welcomeMessage}
-                aiFirst={aiFirst}
-                onChange={setWelcomeMessage}
-                onFocus={() => setPreviewInitialView('conversation')}
-              />
-            </div>
-            </div>
-          </div>
-        </div>
-
-        <div className={supportSectionClass}>
-          <button
-            type="button"
-            onClick={() => toggleSection('privacy')}
-            aria-expanded={isExpanded('privacy')}
-            className="flex w-full items-center gap-4 px-4 py-4 text-left transition-colors hover:bg-muted/40"
-          >
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-              <Shield01Icon className="h-4 w-4" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium">Privacy notice</p>
-              <p className="text-sm text-muted-foreground">Link your privacy policy before visitors start chatting.</p>
-            </div>
-            <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('privacy') && 'rotate-180')} />
-          </button>
-          <div className="accordion-animate" data-open={isExpanded('privacy')}>
-            <div>
-              <div className="border-t border-border px-6 py-6">
-                <PrivacyNoticeSettings
-                  enabled={privacyNoticeEnabled}
-                  policyUrl={privacyPolicyUrl}
-                  text={privacyNoticeText}
-                  error={privacyNoticeError}
-                  onEnabledChange={setPrivacyNoticeEnabled}
-                  onPolicyUrlChange={setPrivacyPolicyUrl}
-                  onTextChange={setPrivacyNoticeText}
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-
         {/* Appearance */}
         <div className={supportSectionClass}>
           <button
@@ -1276,6 +1251,11 @@ function Dashboard() {
                 </div>
               </div>
 
+              <div className="space-y-2">
+                <Label htmlFor="ai-display-name">AI assistant name</Label>
+                <Input id="ai-display-name" value={aiDisplayName} maxLength={80} onChange={(e) => setAIDisplayName(e.target.value)} placeholder="Helpin AI" />
+                <p className="text-xs text-muted-foreground">Visitors will still see that the assistant is AI.</p>
+              </div>
               {/* Logo */}
               <div className="space-y-3">
                 <div>
@@ -1440,6 +1420,96 @@ function Dashboard() {
           </div>
         </div>
 
+        {/* Identity Capture */}
+        <div className={supportSectionClass}>
+          <button
+            type="button"
+            onClick={() => toggleSection('identity-capture')}
+            className="flex w-full items-center gap-4 px-4 py-4 text-left transition-colors hover:bg-muted/40"
+          >
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+              <Message01Icon className="h-4 w-4" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium">Contact details</p>
+              <p className="text-sm text-muted-foreground">Choose when visitors are asked for their contact details.</p>
+            </div>
+            <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('identity-capture') && 'rotate-180')} />
+          </button>
+          <div className="accordion-animate" data-open={isExpanded('identity-capture')}>
+            <div>
+            <div className="border-t border-border px-6 py-6 space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="email-capture-timing">Ask for email</Label>
+                <Select value={emailCaptureTiming} onValueChange={(value) => setEmailCaptureTiming(value as typeof emailCaptureTiming)}>
+                  <SelectTrigger id="email-capture-timing"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="after_ai_reply">After first AI reply</SelectItem>
+                    <SelectItem value="before_handoff">Before handoff to a teammate</SelectItem>
+                    <SelectItem value="never">Don’t ask</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {emailCaptureTiming !== 'never' && (
+                <>
+                  <div className="flex items-center justify-between gap-4">
+                    <Label htmlFor="email-capture-required">Require email to continue</Label>
+                    <Switch id="email-capture-required" checked={forceVisitorIdentity} onCheckedChange={setForceVisitorIdentity} />
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <Label htmlFor="email-capture-phone">Also ask for a phone number</Label>
+                      <p className="text-xs text-muted-foreground">Optional, after the email step.</p>
+                    </div>
+                    <Switch id="email-capture-phone" checked={requirePhone} onCheckedChange={setRequirePhone} />
+                  </div>
+                </>
+              )}
+
+              <WelcomeMessageSettings
+                value={welcomeMessage}
+                aiFirst={aiFirst}
+                onChange={setWelcomeMessage}
+                onFocus={() => setPreviewInitialView('conversation')}
+              />
+            </div>
+            </div>
+          </div>
+        </div>
+
+        <div className={supportSectionClass}>
+          <button
+            type="button"
+            onClick={() => toggleSection('privacy')}
+            aria-expanded={isExpanded('privacy')}
+            className="flex w-full items-center gap-4 px-4 py-4 text-left transition-colors hover:bg-muted/40"
+          >
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+              <Shield01Icon className="h-4 w-4" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium">Privacy notice</p>
+              <p className="text-sm text-muted-foreground">Link your privacy policy before visitors start chatting.</p>
+            </div>
+            <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('privacy') && 'rotate-180')} />
+          </button>
+          <div className="accordion-animate" data-open={isExpanded('privacy')}>
+            <div>
+              <div className="border-t border-border px-6 py-6">
+                <PrivacyNoticeSettings
+                  enabled={privacyNoticeEnabled}
+                  policyUrl={privacyPolicyUrl}
+                  text={privacyNoticeText}
+                  error={privacyNoticeError}
+                  onEnabledChange={setPrivacyNoticeEnabled}
+                  onPolicyUrlChange={setPrivacyPolicyUrl}
+                  onTextChange={setPrivacyNoticeText}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
         {/* Help Center */}
         <div className={supportSectionClass}>
           <button
@@ -1451,45 +1521,15 @@ function Dashboard() {
               <HelpCircleIcon className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium">Help Center</p>
-              <p className="text-sm text-muted-foreground">Select docs spaces for the widget Help tab</p>
+              <p className="text-sm font-medium">Help center</p>
+              <p className="text-sm text-muted-foreground">Select docs spaces for the widget Help tab and portal suggestions</p>
             </div>
             <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('help-center') && 'rotate-180')} />
           </button>
           <div className="accordion-animate" data-open={isExpanded('help-center')}>
             <div>
-            <div className="border-t border-border px-6 py-6 space-y-4">
-              {docsSpacesLoading && (
-                <p className="text-sm text-muted-foreground">Loading available spaces...</p>
-              )}
-
-              {!docsSpacesLoading && externalDocsSpaces.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  Create an external space in Docs to show articles in the widget.
-                </p>
-              )}
-
-              {!docsSpacesLoading && externalDocsSpaces.length > 0 && (
-                <div className="space-y-3">
-                  {externalDocsSpaces.map((space) => {
-                    const enabled = widgetHelpSpaceIds.includes(space.id);
-                    return (
-                      <div key={space.id} className="flex items-center justify-between gap-4 rounded-lg border p-4">
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium">{space.name}</p>
-                          <p className="text-xs text-muted-foreground">
-                            /{space.slug}
-                          </p>
-                        </div>
-                        <Switch
-                          checked={enabled}
-                          onCheckedChange={(checked) => toggleHelpSpace(space.id, checked)}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
+            <div className="border-t border-border px-6 py-6">
+              <HelpSpacesPicker spaces={docsSpaces} loading={docsSpacesLoading} selectedIds={widgetHelpSpaceIds} onToggle={toggleHelpSpace} />
             </div>
             </div>
           </div>
@@ -1526,52 +1566,13 @@ function Dashboard() {
                 {businessHoursEnabled && (
                   <>
                     <div className="space-y-2">
-                      <Label className="text-sm">Timezone</Label>
-                      <Select value={timezone} onValueChange={setTimezone}>
-                        <SelectTrigger className="w-64">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {COMMON_TIMEZONES.map(tz => (
-                            <SelectItem key={tz} value={tz}>{tz.replace(/_/g, ' ')}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      <Label htmlFor="support-timezone" className="text-sm">Timezone</Label>
+                      <TimezoneSelector id="support-timezone" value={timezone} onChange={setTimezone} className="max-w-sm" />
                     </div>
 
                     <div className="space-y-2">
                       <Label className="text-sm">Schedule</Label>
-                      <div className="space-y-1.5">
-                        {DAYS.map(({ key, label }) => {
-                          const day = normalizeBusinessHoursDay(schedule[key]);
-                          return (
-                            <div key={key} className="flex items-center gap-3">
-                              <div className="w-24">
-                                <Switch
-                                  checked={day.enabled}
-                                  onCheckedChange={(v) => updateDay(key, { enabled: v })}
-                                />
-                                <span className="ml-2 text-sm">{label.slice(0, 3)}</span>
-                              </div>
-                              <Input
-                                type="time"
-                                value={day.start}
-                                onChange={(e) => updateDay(key, { start: e.target.value })}
-                                disabled={!day.enabled}
-                                className="w-28 h-8 text-sm"
-                              />
-                              <span className="text-xs text-muted-foreground">to</span>
-                              <Input
-                                type="time"
-                                value={day.end}
-                                onChange={(e) => updateDay(key, { end: e.target.value })}
-                                disabled={!day.enabled}
-                                className="w-28 h-8 text-sm"
-                              />
-                            </div>
-                          );
-                        })}
-                      </div>
+                      <BusinessHoursEditor schedule={businessHoursSchedule} onChange={setSchedule} />
                     </div>
 
                     <div className="space-y-2">
@@ -1674,7 +1675,7 @@ function Dashboard() {
                 <StarIcon className="h-4 w-4" />
               </div>
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium">Chat Features</p>
+                <p className="text-sm font-medium">Chat features</p>
                 <p className="text-sm text-muted-foreground">File uploads, satisfaction surveys, and fallback emails</p>
               </div>
               <ArrowDown01Icon className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200', isExpanded('chat-features') && 'rotate-180')} />
@@ -1690,17 +1691,12 @@ function Dashboard() {
                   <Switch checked={fileUploadsEnabled} onCheckedChange={setFileUploadsEnabled} />
                 </div>
 
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-4">
                   <div>
-                    <div className="flex items-center gap-2">
-                      <Label className="text-sm">CSAT surveys</Label>
-                      <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
-                        Coming soon
-                      </span>
-                    </div>
-                    <p className="text-xs text-muted-foreground">Satisfaction surveys after conversation resolution will be available soon.</p>
+                    <Label htmlFor="chat-csat-enabled" className="text-sm">CSAT surveys</Label>
+                    <p className="text-xs text-muted-foreground">Ask customers to rate resolved conversations in the chat widget and customer portal. Ratings appear in the conversation and in Reports.</p>
                   </div>
-                  <Switch checked={csatEnabled} onCheckedChange={setCsatEnabled} disabled />
+                  <Switch id="chat-csat-enabled" checked={csatEnabled} onCheckedChange={setCsatEnabled} />
                 </div>
 
                 <div className="border-t border-border pt-4 space-y-4">

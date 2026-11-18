@@ -289,19 +289,26 @@ var setupTestSchema = []string{
 	`CREATE TABLE support_widget_installations (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT 1, settings TEXT NOT NULL DEFAULT '{}')`,
 	`CREATE TABLE support_widget_sessions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`,
 	`CREATE TABLE support_email_routes (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT 1)`,
-	`CREATE TABLE support_conversations (
+	`CREATE TABLE support_conversations (snoozed_until DATETIME, snoozed_by_user_id TEXT, 
             merged_into_id TEXT, merge_revision INTEGER NOT NULL DEFAULT 0,id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, status TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'internal', source TEXT NOT NULL DEFAULT 'internal', ai_state TEXT, flow_state TEXT, linked_task_id TEXT, resolved_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)`,
 	`CREATE TABLE support_messages (
             origin_conversation_id TEXT, merge_revision INTEGER NOT NULL DEFAULT 0,id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, conversation_id TEXT NOT NULL, sender_type TEXT NOT NULL, message_type TEXT NOT NULL DEFAULT 'reply', sender_user_id TEXT, is_internal BOOLEAN NOT NULL DEFAULT 0, metadata TEXT NOT NULL DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, deleted_at DATETIME)`,
 	`CREATE TABLE support_coverage_recommendations (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, status TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)`,
 	`CREATE TABLE agent_knowledge_sources (id TEXT PRIMARY KEY, agent_id TEXT, space_id TEXT, workspace_id TEXT NOT NULL, sync_status TEXT NOT NULL DEFAULT 'queued', indexed_documents INTEGER NOT NULL DEFAULT 0, indexed_chunks INTEGER NOT NULL DEFAULT 0)`,
 	`CREATE TABLE support_content_sources (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, sync_status TEXT NOT NULL DEFAULT 'queued', indexed_pages INTEGER NOT NULL DEFAULT 0, indexed_chunks INTEGER NOT NULL DEFAULT 0)`,
-	`CREATE TABLE docs_spaces (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, type TEXT NOT NULL, is_system BOOLEAN NOT NULL DEFAULT 0, deleted_at DATETIME)`,
+	`CREATE TABLE docs_spaces (
+			helpcenter_audience TEXT NOT NULL DEFAULT 'public',
+			id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, type TEXT NOT NULL, is_system BOOLEAN NOT NULL DEFAULT 0, deleted_at DATETIME)`,
 	`CREATE TABLE docs_documents (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, space_id TEXT, status TEXT, published_at DATETIME, owner_id TEXT, next_review_at DATETIME, deleted_at DATETIME)`,
 	`CREATE TABLE docs_contents (document_id TEXT PRIMARY KEY, content_text TEXT, word_count INTEGER NOT NULL DEFAULT 0)`,
-	`CREATE TABLE docs_helpcenter_articles (id TEXT PRIMARY KEY, document_id TEXT NOT NULL, public_published_at DATETIME)`,
-	`CREATE TABLE docs_helpcenter_configs (workspace_id TEXT PRIMARY KEY, is_published BOOLEAN NOT NULL DEFAULT 0)`,
-	`CREATE TABLE support_mailboxes (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT 1, triage_eligible BOOLEAN NOT NULL DEFAULT 1, routing_prompt TEXT, description TEXT)`,
+	`CREATE TABLE docs_helpcenter_articles (
+			customer_published_at DATETIME,
+			id TEXT PRIMARY KEY, document_id TEXT NOT NULL, public_published_at DATETIME)`,
+	`CREATE TABLE docs_helpcenter_configs (
+ demo_mode BOOLEAN NOT NULL DEFAULT 0,
+ search_indexing_enabled BOOLEAN NOT NULL DEFAULT 1,
+ official_docs_url TEXT NOT NULL DEFAULT '',workspace_id TEXT PRIMARY KEY, is_published BOOLEAN NOT NULL DEFAULT 0)`,
+	`CREATE TABLE support_mailboxes (ai_replies_disabled BOOLEAN NOT NULL DEFAULT false, id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT 1, triage_eligible BOOLEAN NOT NULL DEFAULT 1, routing_prompt TEXT, description TEXT)`,
 	`CREATE TABLE support_triage_rules (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT 1, target_mailbox_id TEXT NOT NULL)`,
 	`CREATE TABLE crm_contacts (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL)`,
 	`CREATE TABLE crm_companies (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL)`,

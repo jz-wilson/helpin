@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/helpin-ai/helpin/server/internal/model"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ import (
 func newTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
-	dbName := fmt.Sprintf("file:testdb-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	dbName := fmt.Sprintf("file:testdb-%s?mode=memory&cache=shared", uuid.NewString())
 	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite db: %v", err)
@@ -88,6 +89,14 @@ func newTestDB(t *testing.T) *gorm.DB {
 			created_at DATETIME,
 			updated_at DATETIME
 		)`,
+		`CREATE TABLE user_oidc_identities (
+			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+			user_id TEXT NOT NULL,
+			issuer TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			created_at DATETIME,
+			UNIQUE(issuer, subject)
+		)`,
 		`CREATE TABLE organizations (
 			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			name TEXT NOT NULL,
@@ -118,6 +127,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 			website_url TEXT,
 			logo_url TEXT,
 			timezone TEXT NOT NULL DEFAULT 'UTC',
+			link_previews_enabled BOOLEAN NOT NULL DEFAULT true,
 			created_at DATETIME,
 			updated_at DATETIME
 		)`,
@@ -140,6 +150,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 			invited_at DATETIME,
 			accepted_at DATETIME,
 			support_default_team_id TEXT,
+			support_task_team_by_inbox TEXT NOT NULL DEFAULT '{}',
 			support_task_dialog_dismissed BOOLEAN NOT NULL DEFAULT 0,
 			created_at DATETIME,
 			updated_at DATETIME
@@ -741,7 +752,8 @@ func newTestDB(t *testing.T) *gorm.DB {
 			created_at DATETIME,
 			updated_at DATETIME
 		)`,
-		`CREATE TABLE support_conversations (
+		`CREATE TABLE support_conversations (snoozed_until DATETIME, snoozed_by_user_id TEXT, crm_company_changed_at DATETIME,
+            custom_fields TEXT NOT NULL DEFAULT '{}', request_type_id TEXT,
             merged_into_id TEXT, merge_revision INTEGER NOT NULL DEFAULT 0,
             anonymized_at DATETIME,
 			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -792,6 +804,8 @@ func newTestDB(t *testing.T) *gorm.DB {
 			visitor_country_code TEXT,
 			visitor_country_name TEXT,
 			view_search_document TEXT,
+			portal_visible BOOLEAN NOT NULL DEFAULT 0,
+			portal_visibility_changed_at DATETIME,
 			ai_state TEXT,
 			ai_resolved_at DATETIME,
 			ai_escalated_at DATETIME,
@@ -820,7 +834,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 			updated_at DATETIME,
 			PRIMARY KEY (conversation_id, user_id)
 		)`,
-		`CREATE TABLE support_mailboxes (
+		`CREATE TABLE support_mailboxes (ai_replies_disabled BOOLEAN NOT NULL DEFAULT false,
 			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			workspace_id TEXT NOT NULL,
 			name TEXT NOT NULL,
@@ -940,6 +954,80 @@ func newTestDB(t *testing.T) *gorm.DB {
 			created_at DATETIME,
 			updated_at DATETIME
 		)`,
+		`CREATE TABLE support_csat_responses (
+			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+			workspace_id TEXT NOT NULL,
+			conversation_id TEXT NOT NULL UNIQUE,
+			rating INTEGER NOT NULL,
+			comment TEXT,
+			channel TEXT NOT NULL,
+			resolved_by TEXT NOT NULL,
+			assigned_user_id TEXT,
+			submitted_at DATETIME NOT NULL,
+			created_at DATETIME,
+			updated_at DATETIME
+		)`,
+		`CREATE TABLE support_sla_policies (
+			id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, name TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT 1,
+			position INTEGER NOT NULL DEFAULT 0, priorities TEXT NOT NULL DEFAULT '{}', mailbox_ids TEXT NOT NULL DEFAULT '{}',
+			channels TEXT NOT NULL DEFAULT '{}', company_tier_ids TEXT NOT NULL DEFAULT '{}', company_ids TEXT NOT NULL DEFAULT '{}',
+			request_type_ids TEXT NOT NULL DEFAULT '{}', first_response_minutes INTEGER, next_response_minutes INTEGER,
+			resolution_minutes INTEGER, business_hours BOOLEAN NOT NULL DEFAULT 0, pause_while_waiting BOOLEAN NOT NULL DEFAULT 1,
+			warn_before_minutes INTEGER, notify_user_ids TEXT NOT NULL DEFAULT '{}', notify_cs_owner BOOLEAN NOT NULL DEFAULT 0, assign_unassigned_user_id TEXT,
+			active_since DATETIME NOT NULL, conditions_changed_at DATETIME, created_by_id TEXT, created_at DATETIME, updated_at DATETIME
+		)`,
+		`CREATE TABLE support_conversation_slas (
+			conversation_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, policy_id TEXT, policy_name TEXT NOT NULL DEFAULT '',
+			policy_applied_at DATETIME, detached_at DATETIME, target_first_response_minutes INTEGER,
+			target_next_response_minutes INTEGER, target_resolution_minutes INTEGER,
+			target_business_hours BOOLEAN NOT NULL DEFAULT 0, target_pause_while_waiting BOOLEAN NOT NULL DEFAULT 1,
+			ai_involved BOOLEAN NOT NULL DEFAULT 0, human_since DATETIME, ai_holding_since DATETIME, targets_from DATETIME, next_response_carried_breaches INTEGER NOT NULL DEFAULT 0,
+			company_key TEXT NOT NULL DEFAULT '',
+			first_response_warned_for DATETIME, next_response_warned_for DATETIME, resolution_warned_for DATETIME,
+			first_response_paused_seconds INTEGER NOT NULL DEFAULT 0,
+			first_response_state TEXT NOT NULL DEFAULT '', first_response_due_at DATETIME, first_response_achieved_at DATETIME,
+			first_response_breached_at DATETIME, next_response_state TEXT NOT NULL DEFAULT '', next_response_due_at DATETIME,
+			next_response_breached_at DATETIME, next_response_breaches INTEGER NOT NULL DEFAULT 0,
+			resolution_state TEXT NOT NULL DEFAULT '', resolution_due_at DATETIME, resolution_achieved_at DATETIME,
+			resolution_breached_at DATETIME, paused_since DATETIME, paused_seconds INTEGER NOT NULL DEFAULT 0,
+			next_due_at DATETIME, wake_at DATETIME, breached BOOLEAN NOT NULL DEFAULT 0, updated_at DATETIME
+		)`,
+		`CREATE TABLE support_sla_work (conversation_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, enqueued_at DATETIME NOT NULL)`,
+		`CREATE TABLE support_sla_tiers (
+			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), workspace_id TEXT NOT NULL, name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, created_at DATETIME, updated_at DATETIME
+		)`,
+		`CREATE UNIQUE INDEX idx_support_sla_tiers_workspace_name ON support_sla_tiers (workspace_id, lower(name))`,
+		`CREATE TABLE custom_field_definitions (
+			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), workspace_id TEXT NOT NULL, object_type TEXT NOT NULL,
+			key TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '', field_type TEXT NOT NULL,
+			options TEXT NOT NULL DEFAULT '[]', position INTEGER NOT NULL DEFAULT 0, archived_at DATETIME, created_by_id TEXT,
+			created_at DATETIME, updated_at DATETIME
+		)`,
+		`CREATE TABLE support_request_types (
+			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), workspace_id TEXT NOT NULL, name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '', fields TEXT NOT NULL DEFAULT '[]', default_priority TEXT, mailbox_id TEXT,
+			enabled BOOLEAN NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at DATETIME, updated_at DATETIME
+		)`,
+		`CREATE UNIQUE INDEX idx_support_request_types_workspace_name ON support_request_types (workspace_id, lower(name))`,
+		`CREATE UNIQUE INDEX idx_custom_field_definitions_key ON custom_field_definitions (workspace_id, object_type, key)`,
+		`CREATE TABLE webhook_endpoints (
+			id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, url TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+			events TEXT NOT NULL DEFAULT '{}', mailbox_ids TEXT NOT NULL DEFAULT '{}', encrypted_secret TEXT NOT NULL,
+			secret_hint TEXT NOT NULL DEFAULT '', enabled BOOLEAN NOT NULL DEFAULT 1, disabled_reason TEXT NOT NULL DEFAULT '',
+			failure_count INTEGER NOT NULL DEFAULT 0, failing_since DATETIME, last_success_at DATETIME, last_failure_at DATETIME, created_by_id TEXT,
+			created_at DATETIME, updated_at DATETIME
+		)`,
+		`CREATE TABLE webhook_events (
+			id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, event_type TEXT NOT NULL, conversation_id TEXT, message_id TEXT,
+			data TEXT NOT NULL DEFAULT '{}', available_at DATETIME NOT NULL, created_at DATETIME NOT NULL
+		)`,
+		`CREATE TABLE webhook_deliveries (
+			id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, endpoint_id TEXT NOT NULL, event_id TEXT NOT NULL, event_type TEXT NOT NULL, conversation_id TEXT,
+			payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at DATETIME NOT NULL, last_status_code INTEGER, last_error TEXT NOT NULL DEFAULT '', last_attempt_at DATETIME,
+			duration_ms INTEGER, delivered_at DATETIME, created_at DATETIME NOT NULL
+		)`,
 		`CREATE TABLE agent_handoffs (
 			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			workspace_id TEXT NOT NULL,
@@ -962,6 +1050,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 				short_code TEXT NOT NULL,
 				content TEXT NOT NULL,
 				tag TEXT NOT NULL DEFAULT 'General',
+				actions TEXT NOT NULL DEFAULT '{}',
 				created_by_id TEXT,
 			created_at DATETIME,
 			updated_at DATETIME
@@ -1183,6 +1272,8 @@ func newTestDB(t *testing.T) *gorm.DB {
 			x_url TEXT,
 			lifecycle_stage TEXT NOT NULL DEFAULT 'subscriber',
 			lead_status TEXT NOT NULL DEFAULT 'new',
+			portal_access TEXT,
+			portal_role TEXT,
 			owner_member_id TEXT,
 			avatar_url TEXT,
 			source TEXT,
@@ -1210,9 +1301,19 @@ func newTestDB(t *testing.T) *gorm.DB {
 			owner_member_id TEXT,
 			customer_success_owner_member_id TEXT,
 			custom_properties TEXT NOT NULL DEFAULT '{}',
+			portal_default_role TEXT,
+			portal_admin_invites BOOLEAN NOT NULL DEFAULT 0,
+			portal_invite_any_domain BOOLEAN NOT NULL DEFAULT 0,
+			support_sla_tier_id TEXT,
+			support_sla_tier_changed_at DATETIME,
 			created_at DATETIME,
 			updated_at DATETIME
 		)`,
+		`CREATE TABLE support_portal_company_events (id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), workspace_id TEXT NOT NULL, crm_company_id TEXT NOT NULL, actor_identity_id TEXT, actor_user_id TEXT, subject_contact_id TEXT, subject_email TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, before_value TEXT, after_value TEXT, occurred_at DATETIME NOT NULL)`,
+		`CREATE TABLE support_portal_company_members (workspace_id TEXT NOT NULL, crm_company_id TEXT NOT NULL, crm_contact_id TEXT NOT NULL, added_by_user_id TEXT, role TEXT, created_at DATETIME, PRIMARY KEY (crm_company_id, crm_contact_id))`,
+		`CREATE TABLE IF NOT EXISTS help_assistant_sessions (id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), workspace_id TEXT NOT NULL, surface TEXT NOT NULL, audience TEXT NOT NULL, portal_identity_id TEXT, visitor_id TEXT NOT NULL, locale TEXT NOT NULL DEFAULT '', turn_count INTEGER NOT NULL DEFAULT 0, created_at DATETIME, updated_at DATETIME)`,
+		`CREATE TABLE IF NOT EXISTS help_assistant_messages (id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), session_id TEXT NOT NULL, workspace_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, progress_label TEXT, citations TEXT, page_article_id TEXT, run_id TEXT, helpful BOOLEAN, created_at DATETIME, updated_at DATETIME, completed_at DATETIME)`,
+		`CREATE TABLE support_portal_intake_events (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, intake_id TEXT NOT NULL, event_type TEXT NOT NULL, article_ids TEXT NOT NULL DEFAULT '[]', article_count INTEGER NOT NULL DEFAULT 0, search_completed BOOLEAN NOT NULL DEFAULT false, conversation_id TEXT, occurred_at DATETIME NOT NULL)`,
 		`CREATE TABLE crm_associations (
 			id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			workspace_id TEXT NOT NULL,

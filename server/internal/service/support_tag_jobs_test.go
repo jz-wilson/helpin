@@ -19,7 +19,7 @@ func queueSupportTagJob(t *testing.T, f *supportTriageTestFixture, msg *model.Su
 	if err := f.db.Create(&job).Error; err != nil {
 		t.Fatal(err)
 	}
-	return NewSupportTagJobService(repository.NewSupportTagJobRepository(f.db), f.messageRepo, f.conversationRepo, f.triageSvc.jev, nil)
+	return NewSupportTagJobService(repository.NewSupportTagJobRepository(f.db), f.messageRepo, f.conversationRepo, repository.NewSupportInboxInstallationRepository(f.db), f.triageSvc.jev, nil)
 }
 
 func runSupportTagJob(t *testing.T, f *supportTriageTestFixture, msg *model.SupportMessage) {
@@ -236,7 +236,7 @@ func TestSupportTagJobAuditFailureRollsBackAndReusesDecision(t *testing.T) {
 	mustExec(t, f.db, "DROP TRIGGER reject_tag_note")
 	mustExec(t, f.db, "UPDATE support_tag_jobs SET available_at = ?", time.Now().Add(-time.Second))
 	// A new worker has only persisted state, including the successful decision.
-	s = NewSupportTagJobService(repository.NewSupportTagJobRepository(f.db), f.messageRepo, f.conversationRepo, f.triageSvc.jev, nil)
+	s = NewSupportTagJobService(repository.NewSupportTagJobRepository(f.db), f.messageRepo, f.conversationRepo, repository.NewSupportInboxInstallationRepository(f.db), f.triageSvc.jev, nil)
 	if _, err := s.ProcessNext(f.ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -276,5 +276,18 @@ func TestSupportTagManualMutationAndAuditAreAtomic(t *testing.T) {
 				t.Fatalf("manual edit escaped rollback: %v %v", linked, err)
 			}
 		})
+	}
+}
+
+func TestSupportTagJobSkipsImportedMessages(t *testing.T) {
+	job := model.SupportTagJob{WorkspaceID: "ws", ConversationID: "c", MessageID: "m"}
+	conversation := &model.SupportConversation{ID: "c", WorkspaceID: "ws"}
+	message := &model.SupportMessage{ID: "m", WorkspaceID: "ws", ConversationID: "c", SenderType: "customer", MessageType: "reply", Content: "Refund please"}
+	if !supportTagJobEligible(job, conversation, message, nil) {
+		t.Fatal("a live customer message is not eligible")
+	}
+	message.Metadata = `{"imported_from":"intercom"}`
+	if supportTagJobEligible(job, conversation, message, nil) {
+		t.Fatal("an imported message is eligible for tagging")
 	}
 }

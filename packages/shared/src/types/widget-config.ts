@@ -24,6 +24,7 @@ export interface WidgetConfig {
   workspaceId: string;
   privacyNotice?: { enabled: boolean; policyUrl: string; text: string };
   workspaceName?: string;
+  aiDisplayName?: string;
   visitorName?: string;
   availableTeammates?: Array<{
     userId: string;
@@ -34,6 +35,7 @@ export interface WidgetConfig {
   branding: {
     primaryColor: string;
     logoUrl?: string;
+    avatarUrl?: string;
     welcomeMessage: string;
     widgetPosition: 'bottom-right' | 'bottom-left';
     showBranding: boolean;
@@ -49,6 +51,7 @@ export interface WidgetConfig {
     escalationMessage?: string;
     fileUploads: boolean;
     preChatForm: boolean;
+    emailCaptureTiming?: 'after_ai_reply' | 'before_handoff' | 'never';
     requirePhone: boolean;
     csatRating: boolean;
     forceIdentify: boolean;

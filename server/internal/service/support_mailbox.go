@@ -38,6 +38,21 @@ func (s *SupportInboxService) isMailboxAccessible(ctx context.Context, workspace
 		return true
 	}
 	actor := supportActorFromContext(ctx, workspaceID)
+	if scope := authorization.GetSupportAgentScope(ctx); scope != nil {
+		if scope.WorkspaceID != workspaceID || s.mailboxRepo == nil {
+			return false
+		}
+		mailboxes, err := s.mailboxRepo.ListAccessible(ctx, workspaceID, "", "", false)
+		if err != nil {
+			return false
+		}
+		for _, mailbox := range mailboxes {
+			if mailbox.ID == strings.TrimSpace(*mailboxID) {
+				return true
+			}
+		}
+		return false
+	}
 	if actor == nil {
 		return false
 	}
@@ -179,7 +194,11 @@ func (s *SupportInboxService) determineMailboxOwner(ctx context.Context, workspa
 func (s *SupportInboxService) ListInboxScopes(ctx context.Context, workspaceID string) (*model.SupportInboxScopeListResponse, error) {
 	actor := supportActorFromContext(ctx, workspaceID)
 	if actor == nil {
-		return nil, fmt.Errorf("authorization context missing")
+		scope := authorization.GetSupportAgentScope(ctx)
+		if scope == nil || scope.WorkspaceID != workspaceID {
+			return nil, fmt.Errorf("authorization context missing")
+		}
+		actor = &authorization.Actor{WorkspaceID: workspaceID}
 	}
 	if s.mailboxRepo == nil {
 		return nil, fmt.Errorf("support mailbox repository is unavailable")
@@ -356,6 +375,7 @@ func (s *SupportInboxService) CreateMailbox(ctx context.Context, workspaceID str
 		Description:         req.Description,
 		RoutingPrompt:       req.RoutingPrompt,
 		TriageEligible:      true,
+		AIRepliesDisabled:   req.AIRepliesDisabled,
 		LinkedTeamID:        req.LinkedTeamID,
 		VisibilityMode:      "members_only",
 		AssignmentMode:      req.AssignmentMode,
@@ -400,6 +420,9 @@ func (s *SupportInboxService) UpdateMailbox(ctx context.Context, workspaceID, ma
 		return nil, fmt.Errorf("mailbox not found")
 	}
 
+	if req.AIRepliesDisabled != nil {
+		mailbox.AIRepliesDisabled = *req.AIRepliesDisabled
+	}
 	previousAssignmentMode := mailbox.AssignmentMode
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
@@ -677,7 +700,7 @@ func shouldUseDefaultMailboxForChannel(settings *model.SupportInboxSettings, cha
 		return false
 	}
 	normalizedChannel := strings.ToLower(strings.TrimSpace(channel))
-	if normalizedChannel == "widget" {
+	if spec, ok := model.LookupSupportChannel(normalizedChannel); ok && spec.SkipsDefaultMailbox {
 		return false
 	}
 	if settings.TriageEnabled && triageChannelEnabled(*settings, normalizedChannel) && settings.TriageFallbackBehavior == "shared" {

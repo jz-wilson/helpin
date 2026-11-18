@@ -3,7 +3,9 @@ import type { BusinessHoursDay, SupportInboxSettings } from '@/lib/pmTypes';
 import type { WidgetConfig } from '@helpin-ai/widget-core';
 import { DEFAULT_PRIVACY_NOTICE_TEXT, formatReplyTimeCopy } from '@helpin-ai/shared';
 import { DEFAULT_DELAYED_TEAM_REPLY_MINUTES, DEFAULT_DELAYED_TEAM_REPLY_MESSAGE, DEFAULT_DELAYED_TEAM_REPLY_MESSAGE_NO_EMAIL } from './delayedTeamReply';
+import { DEFAULT_EMAIL_HANDOFF_MESSAGE, DEFAULT_EMAIL_HANDOFF_MESSAGE_AFTER_HOURS } from './emailHandoff';
 import { DAYS, DEFAULT_BUSINESS_HOURS_DAY } from './constants';
+import { DEFAULT_BUSINESS_HOURS_SLOT, daySlots, isOpenAt, withSlots } from './businessHours';
 import { getChatWidgetAIResponseModeForUI, isChatWidgetAIResponseModeActive } from './responseModes';
 
 export type ChatSettingsDraft = Omit<
@@ -20,14 +22,14 @@ export type ChatSettingsDraft = Omit<
   | 'triage_daily_budget'
   | 'triage_skip_spam_conversations'
   | 'triage_deduplicate_first_message'
+  | 'ai_priority_enabled'
+  | 'portal_enabled'
+  | 'portal_requests_only'
+  | 'portal_intake_enabled'
+  | 'portal_anonymous_intake_enabled'
 > & {
   ai_agent_id: string;
 };
-
-export function parseTimeToMinutes(value: string): number {
-  const [hours = '0', minutes = '0'] = value.split(':');
-  return Number(hours) * 60 + Number(minutes);
-}
 
 function weekdayKey(date: Date, timezone: string): string {
   const day = new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'short' }).format(date).toLowerCase();
@@ -79,13 +81,7 @@ export function buildPreviewAvailability(input: PreviewAvailabilityInput): Previ
 
   try {
     const now = new Date();
-    const day = schedule[weekdayKey(now, timezone)];
-    const nowMinutes = zonedMinutes(now, timezone);
-    const withinHours = Boolean(
-      day?.enabled
-      && nowMinutes >= parseTimeToMinutes(day.start)
-      && nowMinutes < parseTimeToMinutes(day.end),
-    );
+    const withinHours = isOpenAt(schedule[weekdayKey(now, timezone)], zonedMinutes(now, timezone));
 
     if (withinHours) return online;
 
@@ -102,11 +98,11 @@ export function buildPreviewAvailability(input: PreviewAvailabilityInput): Previ
 }
 
 export function normalizeBusinessHoursDay(day?: Partial<BusinessHoursDay> | null): BusinessHoursDay {
-  return {
-    start: day?.start ?? DEFAULT_BUSINESS_HOURS_DAY.start,
-    end: day?.end ?? DEFAULT_BUSINESS_HOURS_DAY.end,
-    enabled: day?.enabled ?? DEFAULT_BUSINESS_HOURS_DAY.enabled,
-  };
+  const slots = daySlots(day);
+  return withSlots(
+    { ...DEFAULT_BUSINESS_HOURS_DAY, enabled: day?.enabled ?? DEFAULT_BUSINESS_HOURS_DAY.enabled },
+    slots.length > 0 ? slots : [DEFAULT_BUSINESS_HOURS_SLOT],
+  );
 }
 
 export function normalizeBusinessHoursSchedule(
@@ -176,6 +172,11 @@ export function buildSettingsDraftFromServer(settings: SupportInboxSettings): Ch
     triage_daily_budget,
     triage_skip_spam_conversations,
     triage_deduplicate_first_message,
+    ai_priority_enabled,
+    portal_enabled,
+    portal_requests_only,
+    portal_intake_enabled,
+    portal_anonymous_intake_enabled,
     ...rest
   } = settings;
   void triage_enabled;
@@ -189,6 +190,11 @@ export function buildSettingsDraftFromServer(settings: SupportInboxSettings): Ch
   void triage_daily_budget;
   void triage_skip_spam_conversations;
   void triage_deduplicate_first_message;
+  void ai_priority_enabled;
+  void portal_enabled;
+  void portal_requests_only;
+  void portal_intake_enabled;
+  void portal_anonymous_intake_enabled;
 
   return {
     ...rest,
@@ -196,12 +202,15 @@ export function buildSettingsDraftFromServer(settings: SupportInboxSettings): Ch
     privacy_policy_url: rest.privacy_policy_url ?? '',
     privacy_notice_text: rest.privacy_notice_text || DEFAULT_PRIVACY_NOTICE_TEXT,
     ai_follow_up_enabled: rest.ai_follow_up_enabled ?? false,
+    ai_email_code_check_enabled: rest.ai_email_code_check_enabled ?? false,
     ai_follow_up_delay_hours: rest.ai_follow_up_delay_hours ?? 24,
     ai_follow_up_close_hours: rest.ai_follow_up_close_hours ?? 48,
     ai_follow_up_max_per_conversation: rest.ai_follow_up_max_per_conversation ?? 2,
     delayed_team_reply_minutes: rest.delayed_team_reply_minutes ?? DEFAULT_DELAYED_TEAM_REPLY_MINUTES,
     delayed_team_reply_message: rest.delayed_team_reply_message ?? DEFAULT_DELAYED_TEAM_REPLY_MESSAGE,
     delayed_team_reply_message_no_email: rest.delayed_team_reply_message_no_email ?? DEFAULT_DELAYED_TEAM_REPLY_MESSAGE_NO_EMAIL,
+    email_handoff_message: rest.email_handoff_message || DEFAULT_EMAIL_HANDOFF_MESSAGE,
+    email_handoff_message_after_hours: rest.email_handoff_message_after_hours || DEFAULT_EMAIL_HANDOFF_MESSAGE_AFTER_HOURS,
     ai_enabled: rest.ai_enabled && isChatWidgetAIResponseModeActive(rest.ai_response_mode),
     ai_response_mode: getChatWidgetAIResponseModeForUI(rest.ai_response_mode),
     ai_reply_channels: getAIReplyChannels(rest.ai_reply_channels),

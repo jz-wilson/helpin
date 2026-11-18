@@ -12,13 +12,18 @@ import (
 
 // SupportConversation represents a support conversation (renamed from SupportTicket).
 type SupportConversation struct {
-	MergeEmailRecipients           []string        `json:"merge_email_recipients,omitempty" gorm:"-"`
-	MergeHasWidget                 bool            `json:"merge_has_widget,omitempty" gorm:"-"`
-	MergeContinuationID            *string         `json:"merge_continuation_id,omitempty" gorm:"-"`
-	MergeParticipants              []string        `json:"merge_participants,omitempty" gorm:"-"`
-	MergedIntoID                   *string         `json:"merged_into_id,omitempty" gorm:"type:uuid;index"`
-	MergeRevision                  int64           `json:"merge_revision" gorm:"not null;default:0"`
-	AnonymizedAt                   *time.Time      `json:"anonymized_at,omitempty" gorm:"type:timestamptz"`
+	MailboxAIRepliesDisabled bool       `json:"-" gorm:"-"`
+	MergeEmailRecipients     []string   `json:"merge_email_recipients,omitempty" gorm:"-"`
+	MergeHasWidget           bool       `json:"merge_has_widget,omitempty" gorm:"-"`
+	MergeContinuationID      *string    `json:"merge_continuation_id,omitempty" gorm:"-"`
+	MergeParticipants        []string   `json:"merge_participants,omitempty" gorm:"-"`
+	MergedIntoID             *string    `json:"merged_into_id,omitempty" gorm:"type:uuid;index"`
+	MergeRevision            int64      `json:"merge_revision" gorm:"not null;default:0"`
+	AnonymizedAt             *time.Time `json:"anonymized_at,omitempty" gorm:"type:timestamptz"`
+	// RequestTypeID and CustomFields are read-only here: their own endpoints
+	// validate and write them, and inserts leave the column defaults.
+	RequestTypeID                  *string         `json:"request_type_id,omitempty" gorm:"type:uuid;->"`
+	CustomFields                   JSONB           `json:"custom_fields,omitempty" gorm:"type:jsonb;not null;default:'{}';->"`
 	ID                             string          `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID                    string          `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	MailboxID                      *string         `json:"mailbox_id" gorm:"type:uuid;index"`
@@ -67,6 +72,16 @@ type SupportConversation struct {
 	VisitorCountryCode             *string         `json:"visitor_country_code,omitempty"`
 	VisitorCountryName             *string         `json:"visitor_country_name,omitempty"`
 	ViewSearchDocument             *string         `json:"-"`
+	// PortalVisible opts this conversation into the customer portal. Portal
+	// requests remain projections of this record; they never create a ticket
+	// or a second thread.
+	PortalVisible             bool       `json:"portal_visible" gorm:"not null;default:false;index"`
+	PortalVisibilityChangedAt *time.Time `json:"portal_visibility_changed_at,omitempty" gorm:"type:timestamptz"`
+	// SnoozedUntil hides the conversation from the team's queues until this
+	// time, a customer reply, or a teammate wakes it. Customers still see
+	// an open conversation.
+	SnoozedUntil    *time.Time `json:"snoozed_until,omitempty" gorm:"type:timestamptz;index"`
+	SnoozedByUserID *string    `json:"snoozed_by_user_id,omitempty" gorm:"type:uuid"`
 
 	// AI State — separate from human Status. Null when AI is not involved.
 	AIState                  *string    `json:"ai_state" gorm:"index"` // null, "pending", "resolved", "escalated"
@@ -108,6 +123,8 @@ type SupportConversation struct {
 	Triage                       *SupportConversationTriage `json:"triage,omitempty" gorm:"-"`
 	Tags                         []SupportTag               `json:"tags,omitempty" gorm:"-"`
 	SystemTags                   []string                   `json:"system_tags,omitempty" gorm:"-"`
+	CSAT                         *SupportCSATSummary        `json:"csat,omitempty" gorm:"-"`
+	SLA                          *SupportConversationSLA    `json:"sla,omitempty" gorm:"-"`
 
 	// ListLastActivityAt is derived from timeline entries, including notes and system events.
 	// It must not replace message timestamps used for previews, unread state, or reply tracking.
@@ -143,12 +160,20 @@ const (
 	HandoffStateAfterHours = "after_hours"
 )
 
+// Default email handoff messages. Email customers expect a reply later, so the
+// message says who will reply rather than who is online right now.
+const (
+	DefaultEmailHandoffMessage           = "Thanks for getting in touch. I've passed your message to our support team, and someone from the team will reply to this email as soon as they can.\n\nIf there's anything you'd like to add in the meantime, just reply here."
+	DefaultEmailHandoffMessageAfterHours = "Thanks for getting in touch. I've passed your message to our support team.\n\nThe team is away right now and back {next_open}. Someone will reply to this email once they're back.\n\nIf there's anything you'd like to add in the meantime, just reply here."
+)
+
 const (
 	SupportConversationListFilterWaiting  = "waiting"
 	SupportConversationListFilterInbox    = "inbox"
 	SupportConversationListFilterMine     = "mine"
 	SupportConversationListFilterMentions = "mentions"
 	SupportConversationListFilterResolved = "resolved"
+	SupportConversationListFilterSnoozed  = "snoozed"
 )
 
 func NormalizeSupportConversationStatus(status string) string {
@@ -436,14 +461,16 @@ type SupportLinkSecurity struct {
 
 // SupportCannedResponse represents a canned response for quick replies.
 type SupportCannedResponse struct {
-	ID          string    `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID string    `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	ShortCode   string    `json:"short_code" gorm:"not null"` // e.g., "!greeting", "!thanks"
-	Content     string    `json:"content" gorm:"not null"`
-	Tag         string    `json:"tag" gorm:"not null;default:'General'"`
-	CreatedByID string    `json:"created_by_id" gorm:"type:uuid"`
-	CreatedAt   time.Time `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt   time.Time `json:"updated_at" gorm:"autoUpdateTime"`
+	ID          string `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID string `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ShortCode   string `json:"short_code" gorm:"not null"` // e.g., "!greeting", "!thanks"
+	Content     string `json:"content" gorm:"not null"`
+	Tag         string `json:"tag" gorm:"not null;default:'General'"`
+	// Actions run when the shortcut is used, turning it into a macro.
+	Actions     SupportConversationActions `json:"actions" gorm:"type:jsonb;not null;default:'{}'"`
+	CreatedByID string                     `json:"created_by_id" gorm:"type:uuid"`
+	CreatedAt   time.Time                  `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt   time.Time                  `json:"updated_at" gorm:"autoUpdateTime"`
 }
 
 func (SupportCannedResponse) TableName() string { return "support_canned_responses" }
@@ -585,17 +612,18 @@ type SupportWidgetSession struct {
 func (SupportWidgetSession) TableName() string { return "support_widget_sessions" }
 
 type SupportMailbox struct {
-	ID             string  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID    string  `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	Name           string  `json:"name" gorm:"not null"`
-	Handle         string  `json:"handle" gorm:"not null"`
-	Icon           string  `json:"icon" gorm:"not null;default:'inbox'"`
-	Description    *string `json:"description"`
-	RoutingPrompt  *string `json:"routing_prompt"`
-	TriageEligible bool    `json:"triage_eligible" gorm:"not null;default:true"`
-	LinkedTeamID   *string `json:"linked_team_id" gorm:"type:uuid"`
-	VisibilityMode string  `json:"visibility_mode" gorm:"not null;default:'members_only'"`
-	AssignmentMode string  `json:"assignment_mode" gorm:"not null;default:'manual'"`
+	AIRepliesDisabled bool    `json:"ai_replies_disabled" gorm:"not null;default:false"`
+	ID                string  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID       string  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	Name              string  `json:"name" gorm:"not null"`
+	Handle            string  `json:"handle" gorm:"not null"`
+	Icon              string  `json:"icon" gorm:"not null;default:'inbox'"`
+	Description       *string `json:"description"`
+	RoutingPrompt     *string `json:"routing_prompt"`
+	TriageEligible    bool    `json:"triage_eligible" gorm:"not null;default:true"`
+	LinkedTeamID      *string `json:"linked_team_id" gorm:"type:uuid"`
+	VisibilityMode    string  `json:"visibility_mode" gorm:"not null;default:'members_only'"`
+	AssignmentMode    string  `json:"assignment_mode" gorm:"not null;default:'manual'"`
 	// AssignmentMemberIDs stores workspace member IDs eligible for automatic assignment.
 	// Nil preserves legacy membership-based assignment; an empty list never means everyone.
 	AssignmentMemberIDs []string `json:"assignment_member_ids" gorm:"type:jsonb;serializer:json"`
@@ -872,9 +900,10 @@ type CreateSupportEmailSenderRequest struct {
 }
 
 type SetSupportEmailSenderDefaultRequest struct {
-	DefaultScope string   `json:"default_scope"`
-	MailboxID    *string  `json:"mailbox_id"`
-	MailboxIDs   []string `json:"mailbox_ids,omitempty"`
+	SingleMailbox bool     `json:"single_mailbox,omitempty"`
+	DefaultScope  string   `json:"default_scope"`
+	MailboxID     *string  `json:"mailbox_id"`
+	MailboxIDs    []string `json:"mailbox_ids,omitempty"`
 }
 
 type UpdateSupportEmailSenderRequest struct {
@@ -885,6 +914,7 @@ type UpdateSupportEmailSenderRequest struct {
 }
 
 type CreateSupportMailboxRequest struct {
+	AIRepliesDisabled   bool     `json:"ai_replies_disabled"`
 	Name                string   `json:"name"`
 	Handle              string   `json:"handle"`
 	Icon                string   `json:"icon"`
@@ -918,6 +948,7 @@ func (s *OptionalNullableString) UnmarshalJSON(data []byte) error {
 }
 
 type UpdateSupportMailboxRequest struct {
+	AIRepliesDisabled   *bool                  `json:"ai_replies_disabled,omitempty"`
 	Name                *string                `json:"name,omitempty"`
 	Handle              *string                `json:"handle,omitempty"`
 	Icon                *string                `json:"icon,omitempty"`
@@ -1025,6 +1056,9 @@ type LinkTaskRequest struct {
 
 // CreateTaskFromConversationRequest creates a PM task from the current support conversation.
 type CreateTaskFromConversationRequest struct {
+	OwnerMemberIDs    []string                     `json:"owner_member_ids,omitempty"`
+	AssignedAgentID   *string                      `json:"assigned_agent_id,omitempty"`
+	RunOnCreate       bool                         `json:"run_on_create,omitempty"`
 	ReviewedDraft     bool                         `json:"reviewed_draft,omitempty"`
 	SourceHash        string                       `json:"source_hash,omitempty"`
 	Name              *string                      `json:"name,omitempty"`
@@ -1056,14 +1090,15 @@ type CreateTaskFromConversationRequest struct {
 
 // CreateTaskFromConversationResponse summarizes the created PM task and copied associations.
 type CreateTaskFromConversationResponse struct {
-	TaskID                    string `json:"task_id"`
-	DisplayID                 int    `json:"display_id,omitempty"`
-	TaskKey                   string `json:"task_key,omitempty"`
-	TaskName                  string `json:"task_name"`
-	Summary                   string `json:"summary,omitempty"`
-	CopiedContactAssociations int    `json:"copied_contact_associations"`
-	CopiedCompanyAssociations int    `json:"copied_company_associations"`
-	CopiedDealAssociations    int    `json:"copied_deal_associations"`
+	AgentRunError             *string `json:"agent_run_error,omitempty"`
+	TaskID                    string  `json:"task_id"`
+	DisplayID                 int     `json:"display_id,omitempty"`
+	TaskKey                   string  `json:"task_key,omitempty"`
+	TaskName                  string  `json:"task_name"`
+	Summary                   string  `json:"summary,omitempty"`
+	CopiedContactAssociations int     `json:"copied_contact_associations"`
+	CopiedCompanyAssociations int     `json:"copied_company_associations"`
+	CopiedDealAssociations    int     `json:"copied_deal_associations"`
 }
 
 // AssignConversationAgentRequest assigns an agent to a conversation.
@@ -1274,9 +1309,10 @@ type WidgetMessageReceivedPayload struct {
 
 // CannedResponseRequest is the payload for CRUD operations on canned responses.
 type CannedResponseRequest struct {
-	ShortCode string  `json:"short_code"`
-	Content   string  `json:"content"`
-	Tag       *string `json:"tag,omitempty"`
+	ShortCode string                      `json:"short_code"`
+	Content   string                      `json:"content"`
+	Tag       *string                     `json:"tag,omitempty"`
+	Actions   *SupportConversationActions `json:"actions,omitempty"`
 }
 
 // TypingIndicatorRequest represents a typing indicator event.
@@ -1296,11 +1332,34 @@ type CsatSurveyRequest struct {
 	Feedback string `json:"feedback"`
 }
 
+// BusinessHoursSlot is one open time range in a day, as "HH:MM" in the
+// business-hours timezone. End may be "24:00" for midnight.
+type BusinessHoursSlot struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
 // BusinessHoursDay defines a single day's business hours.
 type BusinessHoursDay struct {
+	// Start and End mirror the first slot for clients that predate Slots.
 	Start   string `json:"start"` // "09:00"
 	End     string `json:"end"`   // "17:00"
 	Enabled bool   `json:"enabled"`
+	// Slots are the day's open time ranges in order. Settings saved before
+	// slots existed have only Start and End.
+	Slots []BusinessHoursSlot `json:"slots,omitempty"`
+}
+
+// OpenSlots returns the day's open time ranges, falling back to Start and End
+// for settings saved before slots existed.
+func (d BusinessHoursDay) OpenSlots() []BusinessHoursSlot {
+	if len(d.Slots) > 0 {
+		return d.Slots
+	}
+	if d.Start == "" && d.End == "" {
+		return nil
+	}
+	return []BusinessHoursSlot{{Start: d.Start, End: d.End}}
 }
 
 const (
@@ -1321,6 +1380,7 @@ type SupportInboxSettings struct {
 	TranslationEnabled          bool   `json:"translation_enabled"`
 	DefaultAgentLanguage        string `json:"default_agent_language"`
 	// Identity Capture
+	EmailCaptureTiming     string `json:"email_capture_timing"`
 	RequireEmailBeforeChat bool   `json:"require_email_before_chat"`
 	RequirePhoneAfterEmail bool   `json:"require_phone_after_email"`
 	WelcomeMessage         string `json:"welcome_message"`
@@ -1344,6 +1404,7 @@ type SupportInboxSettings struct {
 	AIPreRouterMode              string  `json:"ai_pre_router_mode"`      // "off" | "shadow" | "enabled"
 	AIMaxFollowups               int     `json:"ai_max_followups"`        // max stalled same-issue AI attempts before forced handoff (default: 5)
 	AIFollowUpEnabled            bool    `json:"ai_follow_up_enabled"`
+	AIEmailCodeCheckEnabled      bool    `json:"ai_email_code_check_enabled"` // check a connected repository before replying by email
 	AIFollowUpSecondDelayHours   int     `json:"ai_follow_up_second_delay_hours"`
 	AIFollowUpDelayHours         int     `json:"ai_follow_up_delay_hours"`
 	AIFollowUpCloseHours         int     `json:"ai_follow_up_close_hours"`
@@ -1358,6 +1419,10 @@ type SupportInboxSettings struct {
 	EscalationMessage              string `json:"escalation_message"`             // message shown when AI hands off to human (live)
 	EscalationMessageBusy          string `json:"escalation_message_busy"`        // message shown when AI hands off while team is busy
 	EscalationMessageAfterHours    string `json:"escalation_message_after_hours"` // message shown when AI hands off after hours
+	// Email handoffs go by business hours only. The greeting and sign-off are
+	// added around these messages when the email is sent.
+	EmailHandoffMessage           string `json:"email_handoff_message"`
+	EmailHandoffMessageAfterHours string `json:"email_handoff_message_after_hours"`
 
 	// Handoff Routing
 	HandoffBehavior    string  `json:"handoff_behavior"` // unassigned, assign_to_team, round_robin
@@ -1377,6 +1442,10 @@ type SupportInboxSettings struct {
 	TriageDailyBudget             int     `json:"triage_daily_budget"`
 	TriageSkipSpamConversations   bool    `json:"triage_skip_spam_conversations"`
 	TriageDeduplicateFirstMessage bool    `json:"triage_deduplicate_first_message"`
+
+	// AIPriorityEnabled lets Helpin AI raise a conversation's priority from
+	// what customers describe. It never lowers priority or overrides a teammate.
+	AIPriorityEnabled bool `json:"ai_priority_enabled"`
 
 	// Business Hours
 	BusinessHoursEnabled  bool                        `json:"business_hours_enabled"`
@@ -1405,6 +1474,7 @@ type SupportInboxSettings struct {
 	ForwardedEmailMinConfidence     int    `json:"forwarded_email_min_confidence"`
 
 	// Widget Identity
+	AIDisplayName      string   `json:"ai_display_name"`
 	WidgetName         string   `json:"widget_name"`           // display name in widget header (defaults to workspace name)
 	WidgetAvatarURL    string   `json:"widget_avatar_url"`     // custom avatar URL for the widget
 	WidgetHelpSpaceIDs []string `json:"widget_help_space_ids"` // selected external-capable docs spaces shown in widget help
@@ -1420,6 +1490,26 @@ type SupportInboxSettings struct {
 	// Launcher
 	LauncherPosition string `json:"launcher_position"` // bottom_right, bottom_left
 	LauncherIcon     string `json:"launcher_icon"`     // chat_bubble, question_mark, help
+
+	// Customer Portal
+	PortalEnabled                bool `json:"portal_enabled"`
+	PortalAnonymousIntakeEnabled bool `json:"portal_anonymous_intake_enabled"`
+	PortalIntakeEnabled          bool `json:"portal_intake_enabled"`
+	// PortalShowReplyBy shows customers when to expect the team's reply on
+	// their portal requests, from the running SLA target.
+	PortalShowReplyBy bool `json:"portal_show_reply_by"`
+	// PortalCCMode lets requesters copy people on their portal requests:
+	// "" (off), SupportPortalCCColleagues or SupportPortalCCAny.
+	PortalCCMode string `json:"portal_cc_mode"`
+	// HelpAssistantEnabled turns on the Ask AI help assistant on the help
+	// center and in the customer portal.
+	HelpAssistantEnabled bool `json:"help_assistant_enabled"`
+	// PortalAccessMode is SupportPortalAccessModeApprovedContacts or
+	// SupportPortalAccessModeAnyVerifiedEmail.
+	PortalAccessMode string `json:"portal_access_mode"`
+	// Portal AI is configured independently from chat and email AI.
+	PortalAIMode    string  `json:"portal_ai_mode"`
+	PortalAIAgentID *string `json:"portal_ai_agent_id,omitempty"`
 
 	// CSAT
 	CSATEnabled bool `json:"csat_enabled"`
@@ -1448,6 +1538,7 @@ func DefaultSupportInboxSettings() SupportInboxSettings {
 		TranslationOutgoingEnabled:     true,
 		TranslationEnabled:             true,
 		DefaultAgentLanguage:           "en",
+		EmailCaptureTiming:             "after_ai_reply",
 		RequireEmailBeforeChat:         true,
 		RequirePhoneAfterEmail:         false,
 		WelcomeMessage:                 "Hi there! How can we help you today?",
@@ -1474,6 +1565,8 @@ func DefaultSupportInboxSettings() SupportInboxSettings {
 		EscalationMessage:              "Let me connect you with a team member — they typically reply in {reply_time}.",
 		EscalationMessageBusy:          "I've notified the team. Everyone's helping other customers right now — expect a reply within {reply_time}.",
 		EscalationMessageAfterHours:    "I've passed this on to the team. We're away right now and back {next_open}.",
+		EmailHandoffMessage:            DefaultEmailHandoffMessage,
+		EmailHandoffMessageAfterHours:  DefaultEmailHandoffMessageAfterHours,
 		HandoffBehavior:                "unassigned",
 		HandoffTeamID:                  nil,
 		DefaultMailboxID:               nil,
@@ -1489,6 +1582,7 @@ func DefaultSupportInboxSettings() SupportInboxSettings {
 		TriageDailyBudget:              250,
 		TriageSkipSpamConversations:    true,
 		TriageDeduplicateFirstMessage:  true,
+		AIPriorityEnabled:              true,
 		BusinessHoursEnabled:           false,
 		BusinessHoursTimezone:          "America/New_York",
 		BusinessHoursSchedule: map[string]BusinessHoursDay{
@@ -1522,6 +1616,11 @@ func DefaultSupportInboxSettings() SupportInboxSettings {
 		LogoURL:                         "",
 		LauncherPosition:                "bottom_right",
 		LauncherIcon:                    "chat_bubble",
+		PortalEnabled:                   false,
+		PortalAnonymousIntakeEnabled:    false,
+		PortalIntakeEnabled:             false,
+		PortalAccessMode:                SupportPortalAccessModeApprovedContacts,
+		PortalAIMode:                    "off",
 		CSATEnabled:                     false,
 		FileUploadsEnabled:              true,
 		ForceVisitorIdentity:            false,
@@ -1541,6 +1640,7 @@ type UpdateInstallationSettingsRequest struct {
 	DefaultAgentLanguage            *string                     `json:"default_agent_language,omitempty"`
 	AllowedOrigins                  *[]string                   `json:"allowed_origins,omitempty"`
 	IdentityVerificationMode        *string                     `json:"identity_verification_mode,omitempty"`
+	EmailCaptureTiming              *string                     `json:"email_capture_timing,omitempty"`
 	RequireEmailBeforeChat          *bool                       `json:"require_email_before_chat,omitempty"`
 	RequirePhoneAfterEmail          *bool                       `json:"require_phone_after_email,omitempty"`
 	WelcomeMessage                  *string                     `json:"welcome_message,omitempty"`
@@ -1555,6 +1655,7 @@ type UpdateInstallationSettingsRequest struct {
 	AIPreRouterMode                 *string                     `json:"ai_pre_router_mode,omitempty"`
 	AIMaxFollowups                  *int                        `json:"ai_max_followups,omitempty"`
 	AIFollowUpEnabled               *bool                       `json:"ai_follow_up_enabled,omitempty"`
+	AIEmailCodeCheckEnabled         *bool                       `json:"ai_email_code_check_enabled,omitempty"`
 	AIFollowUpSecondDelayHours      *int                        `json:"ai_follow_up_second_delay_hours,omitempty"`
 	AIFollowUpDelayHours            *int                        `json:"ai_follow_up_delay_hours,omitempty"`
 	AIFollowUpCloseHours            *int                        `json:"ai_follow_up_close_hours,omitempty"`
@@ -1567,6 +1668,8 @@ type UpdateInstallationSettingsRequest struct {
 	EscalationMessage               *string                     `json:"escalation_message,omitempty"`
 	EscalationMessageBusy           *string                     `json:"escalation_message_busy,omitempty"`
 	EscalationMessageAfterHours     *string                     `json:"escalation_message_after_hours,omitempty"`
+	EmailHandoffMessage             *string                     `json:"email_handoff_message,omitempty"`
+	EmailHandoffMessageAfterHours   *string                     `json:"email_handoff_message_after_hours,omitempty"`
 	HandoffBehavior                 *string                     `json:"handoff_behavior,omitempty"`
 	HandoffTeamID                   *string                     `json:"handoff_team_id,omitempty"`
 	DefaultMailboxID                *string                     `json:"default_mailbox_id,omitempty"`
@@ -1582,6 +1685,7 @@ type UpdateInstallationSettingsRequest struct {
 	TriageDailyBudget               *int                        `json:"triage_daily_budget,omitempty"`
 	TriageSkipSpamConversations     *bool                       `json:"triage_skip_spam_conversations,omitempty"`
 	TriageDeduplicateFirstMessage   *bool                       `json:"triage_deduplicate_first_message,omitempty"`
+	AIPriorityEnabled               *bool                       `json:"ai_priority_enabled,omitempty"`
 	BusinessHoursEnabled            *bool                       `json:"business_hours_enabled,omitempty"`
 	BusinessHoursTimezone           *string                     `json:"business_hours_timezone,omitempty"`
 	BusinessHoursSchedule           map[string]BusinessHoursDay `json:"business_hours_schedule,omitempty"`
@@ -1598,6 +1702,16 @@ type UpdateInstallationSettingsRequest struct {
 	ForwardedEmailDetectionEnabled  *bool                       `json:"forwarded_email_detection_enabled,omitempty"`
 	ForwardedEmailDetectionMode     *string                     `json:"forwarded_email_detection_mode,omitempty"`
 	ForwardedEmailMinConfidence     *int                        `json:"forwarded_email_min_confidence,omitempty"`
+	PortalEnabled                   *bool                       `json:"portal_enabled,omitempty"`
+	PortalAnonymousIntakeEnabled    *bool                       `json:"portal_anonymous_intake_enabled,omitempty"`
+	PortalIntakeEnabled             *bool                       `json:"portal_intake_enabled,omitempty"`
+	PortalShowReplyBy               *bool                       `json:"portal_show_reply_by,omitempty"`
+	PortalCCMode                    *string                     `json:"portal_cc_mode,omitempty"`
+	HelpAssistantEnabled            *bool                       `json:"help_assistant_enabled,omitempty"`
+	PortalAccessMode                *string                     `json:"portal_access_mode,omitempty"`
+	PortalAIMode                    *string                     `json:"portal_ai_mode,omitempty"`
+	PortalAIAgentID                 *string                     `json:"portal_ai_agent_id,omitempty"`
+	AIDisplayName                   *string                     `json:"ai_display_name,omitempty"`
 	WidgetName                      *string                     `json:"widget_name,omitempty"`
 	WidgetAvatarURL                 *string                     `json:"widget_avatar_url,omitempty"`
 	WidgetHelpSpaceIDs              []string                    `json:"widget_help_space_ids,omitempty"`
@@ -1753,6 +1867,7 @@ type WidgetTokensResponse struct {
 type WidgetConfigBranding struct {
 	PrimaryColor    string `json:"primaryColor"`
 	LogoURL         string `json:"logoUrl,omitempty"`
+	AvatarURL       string `json:"avatarUrl,omitempty"`
 	WelcomeMessage  string `json:"welcomeMessage"`
 	WidgetPosition  string `json:"widgetPosition"`
 	ShowBranding    bool   `json:"showBranding"`
@@ -1764,15 +1879,16 @@ type WidgetConfigBranding struct {
 
 // WidgetConfigFeatures matches the widget-core WidgetConfig.features shape.
 type WidgetConfigFeatures struct {
-	AIEnabled         bool   `json:"aiEnabled"`
-	AIFirst           bool   `json:"aiFirst"`
-	ShowTalkToHuman   bool   `json:"showTalkToHuman"`
-	EscalationMessage string `json:"escalationMessage,omitempty"`
-	FileUploads       bool   `json:"fileUploads"`
-	PreChatForm       bool   `json:"preChatForm"`
-	RequirePhone      bool   `json:"requirePhone"`
-	CSATRating        bool   `json:"csatRating"`
-	ForceIdentify     bool   `json:"forceIdentify"`
+	AIEnabled          bool   `json:"aiEnabled"`
+	AIFirst            bool   `json:"aiFirst"`
+	ShowTalkToHuman    bool   `json:"showTalkToHuman"`
+	EscalationMessage  string `json:"escalationMessage,omitempty"`
+	FileUploads        bool   `json:"fileUploads"`
+	EmailCaptureTiming string `json:"emailCaptureTiming"`
+	PreChatForm        bool   `json:"preChatForm"`
+	RequirePhone       bool   `json:"requirePhone"`
+	CSATRating         bool   `json:"csatRating"`
+	ForceIdentify      bool   `json:"forceIdentify"`
 }
 
 // WidgetConfigAvailability matches the widget-core WidgetConfig.availability shape.
@@ -1867,6 +1983,7 @@ type WidgetConfigPrivacyNotice struct {
 // WidgetConfigResponse is the public-facing widget config matching the
 // TypeScript WidgetConfig interface in packages/shared/src/types/widget-config.ts.
 type WidgetConfigResponse struct {
+	AIDisplayName      string                    `json:"aiDisplayName,omitempty"`
 	PrivacyNotice      WidgetConfigPrivacyNotice `json:"privacyNotice"`
 	WorkspaceID        string                    `json:"workspaceId"`
 	WorkspaceName      string                    `json:"workspaceName,omitempty"`
@@ -1957,6 +2074,7 @@ type VisitorOtherConversation struct {
 
 // VisitorContextResponse assembles all visitor intelligence for a conversation.
 type VisitorContextResponse struct {
+	Channels             []string                    `json:"channels"`
 	Device               *VisitorDeviceInfo          `json:"device,omitempty"`
 	Location             *VisitorLocation            `json:"location,omitempty"`
 	Contact              *VisitorContactData         `json:"contact,omitempty"`
@@ -1972,10 +2090,13 @@ type VisitorContextResponse struct {
 
 // InstallationSettingsResponse wraps installation + parsed settings for the admin API.
 type InstallationSettingsResponse struct {
-	ID                       string   `json:"id"`
-	WorkspaceID              string   `json:"workspace_id"`
-	WidgetKey                string   `json:"widget_key"`
-	AllowedOrigins           []string `json:"allowed_origins"`
+	ID             string   `json:"id"`
+	WorkspaceID    string   `json:"workspace_id"`
+	WidgetKey      string   `json:"widget_key"`
+	AllowedOrigins []string `json:"allowed_origins"`
+	// SuggestedAllowedOrigins comes from the workspace website and is only set
+	// while AllowedOrigins is empty. It is never saved without an admin.
+	SuggestedAllowedOrigins  []string `json:"suggested_allowed_origins,omitempty"`
 	IdentityVerificationMode string   `json:"identity_verification_mode"`
 	// SigningSecretConfigured reports whether an identity signing secret exists.
 	// The secret itself is only returned by the audited reveal/rotate endpoints.
@@ -2004,4 +2125,35 @@ type SupportAIControlRequest struct {
 	Action              string `json:"action"`
 	ExpectedVersion     int64  `json:"expected_version"`
 	ConfirmHumanRequest bool   `json:"confirm_human_request"`
+}
+
+// Portal copy modes: who requesters may copy on a request.
+const (
+	// SupportPortalCCColleagues allows members of the requester's portal
+	// companies and addresses on those companies' domains.
+	SupportPortalCCColleagues = "colleagues"
+	// SupportPortalCCAny allows any email address.
+	SupportPortalCCAny = "any"
+)
+
+// EffectivePortalAccessMode returns the portal access mode, treating any
+// unknown value as the safer approved-contacts mode.
+func (s SupportInboxSettings) EffectivePortalAccessMode() string {
+	switch s.PortalAccessMode {
+	case SupportPortalAccessModeAnyVerifiedEmail, SupportPortalAccessModeCompanyMembers:
+		return s.PortalAccessMode
+	}
+	return SupportPortalAccessModeApprovedContacts
+}
+
+// IsImported reports whether the message was copied from another help desk.
+// Imported history stays out of live work such as tagging and translation.
+func (m SupportMessage) IsImported() bool {
+	if !strings.Contains(m.Metadata, "imported_from") {
+		return false
+	}
+	var meta struct {
+		ImportedFrom string `json:"imported_from"`
+	}
+	return json.Unmarshal([]byte(m.Metadata), &meta) == nil && meta.ImportedFrom != ""
 }

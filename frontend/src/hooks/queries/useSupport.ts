@@ -1,6 +1,6 @@
 import { SupportTranslationSendError } from '@/lib/supportTranslationError';
 import type { CreateTaskFromConversationRequest, UpdateSupportNoteRequest } from '@/lib/pmTypes';
-import type { WidgetOriginSettings } from '@/lib/pmTypes';
+import type { CustomerPortalCompanyRole, CustomerPortalContactAccessValue, CustomerPortalRole, WidgetOriginSettings } from '@/lib/pmTypes';
 import { useInfiniteQuery, useQuery, useMutation, useQueryClient, type QueryClient, type QueryKey } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { queryKeys } from '@/lib/queryKeys';
@@ -12,8 +12,10 @@ import { nextCursor, unwrap, unwrapRequired } from '@/lib/queryUtils';
 import { isUpgradeRequiredError } from '@edition/errors';
 import {
   extractConversationListConversations,
+  findCachedConversation,
   getNextConversationIdAfterRemoval,
   isSupportConversationListQueryKey,
+  patchCachedConversation,
   patchConversationDetailPersonalRead,
   patchConversationDetailStatus,
   patchConversationPersonalReadInCache,
@@ -29,6 +31,7 @@ import {
 } from '@/lib/supportMessagePages';
 import { useAuthStore } from '@/stores/authStore';
 import { useSupportInboxStore } from '@/stores/supportInboxStore';
+import { useSupportInboxCelebrationStore } from '@/stores/supportInboxCelebrationStore';
 import { useRealtimeFallbackPolling } from '@/hooks/useRealtimeFallbackPolling';
 import type {
   AgentKnowledgeSource,
@@ -46,6 +49,7 @@ import type {
   ConversationListResponse,
   SupportConversation,
   SupportMessagePage,
+  SupportSharedItem,
   SupportReplyDeliveryMode,
   VisitorContextResponse,
   SupportAIRewriteDraftRequest,
@@ -96,6 +100,7 @@ export type SupportConversationFilters = {
   sort?: string;
   tag_ids?: string;
   system_tags?: string;
+  sla?: string;
 };
 
 export type SupportConversationGlobalSearchFilters = SupportConversationSearchParams;
@@ -235,7 +240,7 @@ export function useSupportRoutingUsage(workspaceId: string) {
   });
 }
 
-export function useUpdateChatSettings(workspaceId: string) {
+function useUpdateInstallationSettings(workspaceId: string, label: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (settings: Partial<SupportInboxSettings & WidgetOriginSettings>) =>
@@ -250,7 +255,178 @@ export function useUpdateChatSettings(workspaceId: string) {
       ]);
     },
     onError: (error: Error) => {
-      toast.error('Failed to update chat settings', { description: error.message });
+      toast.error(`Failed to update ${label}`, { description: error.message });
+    },
+  });
+}
+
+export function useUpdateChatSettings(workspaceId: string) {
+  return useUpdateInstallationSettings(workspaceId, 'chat settings');
+}
+
+export function useUpdateCustomerPortalSettings(workspaceId: string) {
+  return useUpdateInstallationSettings(workspaceId, 'customer portal settings');
+}
+
+/** The server's attachment size and type rules; they change only on deploy. */
+export function useSupportAttachmentPolicy(workspaceId: string) {
+  return useQuery({
+    queryKey: queryKeys.support.attachmentPolicy(workspaceId),
+    queryFn: async () => unwrap(await supportService.getAttachmentPolicy(workspaceId)),
+    enabled: !!workspaceId,
+    staleTime: Infinity,
+  });
+}
+
+export function useCustomerPortalAccessSummary(workspaceId: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.support.portalAccess(workspaceId),
+    queryFn: async () => unwrap(await supportService.getPortalAccessSummary(workspaceId)),
+    enabled: !!workspaceId && enabled,
+    staleTime: 30_000,
+  });
+}
+
+export function useContactPortalAccess(workspaceId: string, contactId: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.support.portalContactAccess(workspaceId, contactId),
+    queryFn: async () => unwrap(await supportService.getContactPortalAccess(workspaceId, contactId)),
+    enabled: !!workspaceId && !!contactId && enabled,
+  });
+}
+
+export function useSetContactPortalAccess(workspaceId: string, contactId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (portalAccess: CustomerPortalContactAccessValue | null) =>
+      unwrap(await supportService.setContactPortalAccess(workspaceId, contactId, portalAccess)),
+    onSuccess: (access) => {
+      queryClient.setQueryData(queryKeys.support.portalContactAccess(workspaceId, contactId), access);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.support.portalAccess(workspaceId) });
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to update portal access', { description: error.message });
+    },
+  });
+}
+
+export function useSetContactPortalRole(workspaceId: string, contactId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (portalRole: CustomerPortalRole | null) =>
+      unwrap(await supportService.setContactPortalRole(workspaceId, contactId, portalRole)),
+    onSuccess: (access) => {
+      queryClient.setQueryData(queryKeys.support.portalContactAccess(workspaceId, contactId), access);
+      // Company tabs and conversation audiences show the contact's role.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.support.portalAccess(workspaceId) });
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to update portal role', { description: error.message });
+    },
+  });
+}
+
+export function useCompanyPortalAccess(workspaceId: string, companyId: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.support.portalCompanyAccess(workspaceId, companyId),
+    queryFn: async () => unwrap(await supportService.getCompanyPortalAccess(workspaceId, companyId)),
+    enabled: !!workspaceId && !!companyId && enabled,
+  });
+}
+
+export function useSetCompanyPortalRole(workspaceId: string, companyId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (defaultRole: CustomerPortalRole | null) =>
+      unwrap(await supportService.setCompanyPortalRole(workspaceId, companyId, defaultRole)),
+    onSuccess: (access) => {
+      queryClient.setQueryData(queryKeys.support.portalCompanyAccess(workspaceId, companyId), access);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.support.portalAccess(workspaceId) });
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to update company portal access', { description: error.message });
+    },
+  });
+}
+
+export function useSetCompanyMemberRole(workspaceId: string, companyId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ contactId, role }: { contactId: string; role: CustomerPortalCompanyRole | null }) =>
+      unwrap(await supportService.setCompanyMemberRole(workspaceId, companyId, contactId, role)),
+    onSuccess: (access) => {
+      queryClient.setQueryData(queryKeys.support.portalCompanyAccess(workspaceId, companyId), access);
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to change the company admin', { description: error.message });
+    },
+  });
+}
+
+export function useSetCompanyTeamSettings(workspaceId: string, companyId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (settings: { admin_invites: boolean; invite_any_domain: boolean }) =>
+      unwrap(await supportService.setCompanyTeamSettings(workspaceId, companyId, settings)),
+    onSuccess: (access) => {
+      queryClient.setQueryData(queryKeys.support.portalCompanyAccess(workspaceId, companyId), access);
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to update company admin settings', { description: error.message });
+    },
+  });
+}
+
+export function useAddCompanyPortalDomainMembers(workspaceId: string, companyId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => unwrap(await supportService.addCompanyPortalDomainMembers(workspaceId, companyId)),
+    onSuccess: ({ added, company }) => {
+      queryClient.setQueryData(queryKeys.support.portalCompanyAccess(workspaceId, companyId), company);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.support.portalAccess(workspaceId) });
+      toast.success(added === 1 ? '1 contact added' : `${added} contacts added`);
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to add contacts', { description: error.message });
+    },
+  });
+}
+
+export function useSetCompanyPortalMember(workspaceId: string, companyId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ contactId, member }: { contactId: string; member: boolean }) =>
+      unwrap(await supportService.setCompanyPortalMember(workspaceId, companyId, contactId, member)),
+    onSuccess: (company) => {
+      queryClient.setQueryData(queryKeys.support.portalCompanyAccess(workspaceId, companyId), company);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.support.portalAccess(workspaceId) });
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to change company access', { description: error.message });
+    },
+  });
+}
+
+export function useConversationPortalContext(workspaceId: string, conversationId: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.support.portalContext(workspaceId, conversationId),
+    queryFn: async () => unwrap(await supportService.getConversationPortalContext(workspaceId, conversationId)),
+    enabled: !!workspaceId && !!conversationId && enabled,
+    staleTime: 60_000,
+  });
+}
+
+export function useResendPortalConfirmation(workspaceId: string) {
+  return useMutation({
+    mutationFn: async (conversationId: string) => {
+      const { error } = await supportService.resendPortalConfirmation(workspaceId, conversationId);
+      if (error) throw new Error(error);
+    },
+    onSuccess: () => {
+      toast.success('Confirmation email sent');
+    },
+    onError: (error: Error) => {
+      toast.error('Could not send confirmation', { description: error.message });
     },
   });
 }
@@ -959,6 +1135,16 @@ export function useMessageInfo(workspaceId: string, conversationId: string, mess
   });
 }
 
+/** Help-center articles and files the team sent to the customer, newest first. */
+export function useConversationSharedItems(workspaceId: string, conversationId: string | null) {
+  return useQuery<SupportSharedItem[]>({
+    queryKey: queryKeys.support.conversationSharedItems(workspaceId, conversationId ?? ''),
+    queryFn: async () => unwrap(await supportService.listConversationSharedItems(workspaceId, conversationId!)),
+    enabled: !!workspaceId && !!conversationId,
+    staleTime: 60_000,
+  });
+}
+
 export function useVisitorContext(workspaceId: string, conversationId: string | null) {
   return useQuery<VisitorContextResponse>({
     queryKey: queryKeys.support.visitorContext(workspaceId, conversationId ?? ''),
@@ -1117,12 +1303,33 @@ export function useUploadSupportAttachment(workspaceId: string, conversationId: 
   });
 }
 
+type ConversationStatusHandoff = { shouldAdvanceSelection: boolean; nextConversationId: string | null };
+
 export function useUpdateConversationStatus(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ conversationId, status }: { conversationId: string; status: ConversationStatus }) =>
       supportService.updateConversationStatus(workspaceId, conversationId, status).then(unwrap),
-    onSuccess: (data, variables) => {
+    // Start the hand-off on click, so the thread is already leaving when the
+    // server's "resolved" notice arrives over the websocket.
+    onMutate: ({ conversationId, status }): ConversationStatusHandoff | undefined => {
+      if (status !== 'resolved' && status !== 'spam') return undefined;
+      useSupportInboxCelebrationStore.getState().noteOwnRemovals([conversationId]);
+      const { selectedConversationId, startConversationHandoff } = useSupportInboxStore.getState();
+      const shouldAdvanceSelection = selectedConversationId === conversationId;
+      const cached = queryClient.getQueriesData<SupportConversationListCache>({
+        queryKey: queryKeys.support.conversations(workspaceId),
+      });
+      const conversations: SupportConversation[] = cached.flatMap(([queryKey, data]) =>
+        isSupportConversationListQueryKey(queryKey, workspaceId) ? extractConversationListConversations(data) : []
+      );
+      const nextConversationId = shouldAdvanceSelection
+        ? getNextConversationIdAfterRemoval(conversations, conversationId)
+        : null;
+      startConversationHandoff(conversationId, nextConversationId);
+      return { shouldAdvanceSelection, nextConversationId };
+    },
+    onSuccess: (data, variables, handoff) => {
       const { conversationId, status } = variables;
       const currentState = useSupportInboxStore.getState();
 
@@ -1157,20 +1364,8 @@ export function useUpdateConversationStatus(workspaceId: string) {
       };
 
       // Auto-advance: when resolving/spamming, select the next conversation in the list
-      if (status === 'resolved' || status === 'spam') {
-        const { selectedConversationId, startConversationHandoff } = currentState;
-        const shouldAdvanceSelection = selectedConversationId === conversationId;
-        const cached = queryClient.getQueriesData<SupportConversationListCache>({
-          queryKey: queryKeys.support.conversations(workspaceId),
-        });
-        const conversations: SupportConversation[] = cached.flatMap(([queryKey, data]) =>
-          isSupportConversationListQueryKey(queryKey, workspaceId) ? extractConversationListConversations(data) : []
-        );
-        const nextConversationId = shouldAdvanceSelection
-          ? getNextConversationIdAfterRemoval(conversations, conversationId)
-          : null;
-
-        startConversationHandoff(conversationId, nextConversationId);
+      if ((status === 'resolved' || status === 'spam') && handoff) {
+        const { shouldAdvanceSelection, nextConversationId } = handoff;
         window.setTimeout(() => {
           applyStatusPatch();
           const latestState = useSupportInboxStore.getState();
@@ -1191,7 +1386,12 @@ export function useUpdateConversationStatus(workspaceId: string) {
       applyStatusPatch();
       invalidateAfterStatusChange();
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { conversationId }, handoff) => {
+      if (handoff) {
+        useSupportInboxCelebrationStore.getState().forgetOwnRemovals([conversationId]);
+        const inbox = useSupportInboxStore.getState();
+        if (inbox.conversationHandoff?.fromConversationId === conversationId) inbox.cancelConversationHandoff();
+      }
       toast.error('Failed to update conversation status', { description: error.message });
     },
   });
@@ -1218,14 +1418,21 @@ export function useAssignConversationUser(workspaceId: string) {
   return useMutation({
     mutationFn: ({ conversationId, userId }: { conversationId: string; userId: string | null }) =>
       supportService.assignConversationUser(workspaceId, conversationId, { user_id: userId }).then(unwrap),
-    onSuccess: (_data, variables) => {
+    onMutate: async ({ conversationId, userId }) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.support.conversation(workspaceId, conversationId) });
+      const cached = findCachedConversation(queryClient, workspaceId, conversationId);
+      patchCachedConversation(queryClient, workspaceId, conversationId, { assigned_user_id: userId ?? undefined });
+      return cached ? { previous: cached.assigned_user_id } : undefined;
+    },
+    onError: (error: Error, { conversationId }, context) => {
+      if (context) patchCachedConversation(queryClient, workspaceId, conversationId, { assigned_user_id: context.previous });
+      toast.error('Failed to assign conversation', { description: error.message });
+    },
+    onSettled: (_data, _error, variables) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.support.conversations(workspaceId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.support.conversation(workspaceId, variables.conversationId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.support.unreadStats(workspaceId) });
       invalidateSupportInboxViewCounts(queryClient, workspaceId);
-    },
-    onError: (error: Error) => {
-      toast.error('Failed to assign conversation', { description: error.message });
     },
   });
 }
@@ -1303,9 +1510,7 @@ export function useCreateTaskFromConversation(workspaceId: string) {
       queryClient.invalidateQueries({ queryKey: queryKeys.pm.tasks(workspaceId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.pm.board(workspaceId) });
     },
-    onError: (error: Error) => {
-      toast.error('Failed to create task', { description: error.message });
-    },
+    // The shared creation modal handles errors, including upgrade requirements.
   });
 }
 

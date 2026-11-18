@@ -8,6 +8,7 @@ import { useSupportInboxStore } from '@/stores/supportInboxStore';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import type { Editor } from '@tiptap/core';
 import { clearReplyDeliveryDraft, loadReplyDelivery, saveReplyDelivery, saveReplySubject } from '../replyDelivery';
+import { prepareAppRefresh } from '@/lib/appLoadRecovery';
 
 const mocks = vi.hoisted(() => ({
   translation: false,
@@ -20,11 +21,19 @@ vi.mock('@/hooks/queries/useSupport', () => ({
   useUpdateSupportNote: () => mocks.mutation,
   useConversation: () => ({ data: mocks.conversation }),
   useCannedResponses: () => ({ data: mocks.empty }),
+  useSupportTags: () => ({ data: mocks.empty }),
   useCreateCannedResponse: () => mocks.mutation,
   useUpdateCannedResponse: () => mocks.mutation,
   useDeleteCannedResponse: () => mocks.mutation,
   useUpdateConversationEmailRecipients: () => mocks.mutation,
   useUploadSupportAttachment: () => mocks.mutation,
+  useSupportAttachmentPolicy: () => ({ data: { max_bytes: 100 * 1024 * 1024, content_types: ['image/png', 'image/jpeg', 'application/pdf', 'text/plain', 'video/mp4'] } }),
+}));
+vi.mock('@/hooks/queries/useSupportOperations', () => ({
+  useApplyMacro: () => mocks.mutation,
+}));
+vi.mock('@/hooks/queries/useWorkspaces', () => ({
+  useWorkspaceMembers: () => ({ data: mocks.empty }),
 }));
 vi.mock('@/hooks/queries/useSupportTranslation', () => ({
  useSupportTranslationOptions: () => ({ data: { available: mocks.translation, languages: { en: 'English', de: 'German' }, conversation: { customer_language: 'de' }, preference: { reading_language: 'en', auto_translate_incoming: true, auto_translate_outgoing: true } } }),
@@ -51,15 +60,16 @@ vi.mock('@/components/ui/dropdown-menu', () => {
 describe('ReplyComposer AI loading state', () => {
   let container: HTMLDivElement;
   let root: Root;
-  function setup(emailConversation = false, widgetConversation = false) {
+  function setup(emailConversation = false, widgetConversation = false, portalVisible?: boolean, emailDeliveryEnabled = true) {
     mocks.send.mockReset();
-    mocks.conversation = emailConversation ? { source: 'email', customer_email: 'customer@example.com', subject: 'Invoice question' }
+    mocks.conversation = portalVisible !== undefined ? { source: 'portal', channel: 'portal', portal_visible: portalVisible, customer_email: 'customer@example.com' }
+      : emailConversation ? { source: 'email', customer_email: 'customer@example.com', subject: 'Invoice question' }
       : widgetConversation ? { source: 'widget', anonymous_id: 'visitor-1', customer_email: 'customer@example.com' } : null;
     useSupportInboxStore.setState({ replyMode: 'reply', drafts: { 'conv-1': '**Original** draft' } });
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
-    act(() => { root.render(<TooltipProvider><ReplyComposer workspaceId="ws-1" conversationId="conv-1" emailDeliveryEnabled /></TooltipProvider>); });
+    act(() => { root.render(<TooltipProvider><ReplyComposer workspaceId="ws-1" conversationId="conv-1" emailDeliveryEnabled={emailDeliveryEnabled} /></TooltipProvider>); });
   }
   function button(label: string) {
     const found = [...container.querySelectorAll('button')].find((element) => element.textContent === label);
@@ -73,6 +83,34 @@ describe('ReplyComposer AI loading state', () => {
     mocks.translation = false;
     saveReplySubject('ws-1', 'conv-1');
     clearReplyDeliveryDraft('ws-1', 'conv-1');
+    sessionStorage.clear();
+  });
+
+  it('flushes freshly typed formatted content before a user refreshes', () => {
+    setup();
+    const editor = (container.querySelector('.tiptap') as HTMLElement & { editor: Editor }).editor;
+    act(() => { editor.commands.setContent({ type: 'doc', content: [{ type: 'paragraph', content: [
+      { type: 'text', text: 'Just typed', marks: [{ type: 'bold' }] },
+      { type: 'text', text: ' reply' },
+    ] }] }); });
+    act(() => { expect(prepareAppRefresh()).toBeNull(); });
+    expect(JSON.parse(localStorage.getItem('support_inbox_drafts')!)['conv-1']).toBe('**Just typed** reply');
+  });
+
+  it('sends a visible portal reply without a widget session or email delivery', async () => {
+    setup(false, false, true, false);
+    const send = button('Send');
+    expect(send.disabled).toBe(false);
+    await act(async () => { send.click(); });
+    expect(mocks.send).toHaveBeenCalledWith(expect.objectContaining({ delivery_mode: 'chat_only', channels: ['chat'] }));
+  });
+
+  it('routes hidden portal intake replies through email', async () => {
+    setup(false, false, false, true);
+    const send = button('Send');
+    expect(send.disabled).toBe(false);
+    await act(async () => { send.click(); });
+    expect(mocks.send).toHaveBeenCalledWith(expect.objectContaining({ delivery_mode: 'email_only', channels: ['email'] }));
   });
 
   it('offers an explicit original send after translation fails and preserves delivery and retry identity', async () => {
@@ -133,6 +171,36 @@ describe('ReplyComposer AI loading state', () => {
     act(() => useSupportInboxStore.setState({ replyMode: 'note' }));
     await act(async () => { button('Add Note').click(); });
     expect(mocks.send.mock.calls[0][0].auto_translate).toBeUndefined();
+  });
+
+  it('shows merged email recipients once in the original delivery notice', () => {
+    setup(true);
+    mocks.conversation = { ...mocks.conversation, merge_email_recipients: [' CUSTOMER@example.com ', 'other@example.com', 'OTHER@example.com'], email_cc: ['other@example.com', 'copy@example.com'] };
+    act(() => { root.render(<TooltipProvider><ReplyComposer workspaceId="ws-1" conversationId="conv-1" emailDeliveryEnabled /></TooltipProvider>); });
+    const notices = [...container.querySelectorAll('p')].filter(p => p.textContent?.startsWith('Only emailed to '));
+    expect(notices).toHaveLength(1);
+    expect(notices[0].textContent).toBe('Only emailed to customer@example.com +1 · Cc copy@example.com');
+    expect(notices[0].querySelector('button')?.getAttribute('aria-label')).toBe('More recipients: other@example.com');
+  });
+
+  it('lists a shared address only once after merging conversations from the same customer', () => {
+    setup(true);
+    mocks.conversation = { ...mocks.conversation, merge_email_recipients: ['customer@example.com', ' CUSTOMER@example.com '] };
+    act(() => { root.render(<TooltipProvider><ReplyComposer workspaceId="ws-1" conversationId="conv-1" emailDeliveryEnabled /></TooltipProvider>); });
+    const notice = [...container.querySelectorAll('p')].find(p => p.textContent?.startsWith('Only emailed to '));
+    expect(notice?.textContent).toBe('Only emailed to customer@example.com');
+  });
+
+  it('raises the email notice only once a reply is started', () => {
+    setup(true);
+    const editor = (container.querySelector('.tiptap') as HTMLElement & { editor: Editor }).editor;
+    const notice = () => container.querySelector('[data-support-delivery-notice]')!;
+    act(() => { editor.commands.setContent(''); });
+    expect(notice().getAttribute('aria-hidden')).toBe('true');
+    expect(notice().hasAttribute('inert')).toBe(true);
+    act(() => { editor.commands.setContent('Thanks for the details'); });
+    expect(notice().getAttribute('aria-hidden')).toBe('false');
+    expect(notice().hasAttribute('inert')).toBe(false);
   });
 
   it('sends email without a subject editor or a stale draft subject override', async () => {

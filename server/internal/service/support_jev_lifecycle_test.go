@@ -231,7 +231,7 @@ func setupJevChat(t *testing.T, p *lifecycleJev) (*SupportChatService, *gorm.DB,
 		t.Fatal(err)
 	}
 	mustExec(t, db, `INSERT INTO support_widget_installations(id,workspace_id,widget_key,secret_key,settings,active) VALUES ('inst','ws','key','secret',?,true)`, string(raw))
-	mustExec(t, db, `CREATE TABLE ai_message_processing(id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),workspace_id TEXT,conversation_id TEXT,source_message_id TEXT,reply_message_id TEXT,status TEXT,tokens_used INTEGER,attempts INTEGER,created_at DATETIME,updated_at DATETIME)`)
+	mustExec(t, db, `CREATE TABLE ai_message_processing(action_validation_repair_used BOOLEAN NOT NULL DEFAULT 0,validation_repair_used BOOLEAN NOT NULL DEFAULT 0,id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),workspace_id TEXT,conversation_id TEXT,source_message_id TEXT,reply_message_id TEXT,status TEXT,tokens_used INTEGER,attempts INTEGER,created_at DATETIME,updated_at DATETIME)`)
 	ai := &SupportAIService{conversationRepo: inbox.conversationRepo, messageRepo: inbox.messageRepo, installationRepo: repository.NewSupportInboxInstallationRepository(db), handoffRepo: repository.NewAgentHandoffRepository(db)}
 	chat := &SupportChatService{conversationRepo: inbox.conversationRepo, messageRepo: inbox.messageRepo, supportAIService: ai, processingRepo: repository.NewAIMessageProcessingRepository(db)}
 	msg := &model.SupportMessage{ID: "source", WorkspaceID: "ws", ConversationID: conv.ID, SenderType: "customer", MessageType: "reply", Content: "I followed those steps twice and nothing changed", CreatedAt: time.Now()}
@@ -298,6 +298,8 @@ func TestJevLifecycleConfiguration(t *testing.T) {
 	}{
 		{"invalid handoff mode", func(c *SupportJevConfig) { c.HandoffMode = "bad" }},
 		{"invalid followup mode", func(c *SupportJevConfig) { c.FollowUpMode = "bad" }},
+		{"invalid priority mode", func(c *SupportJevConfig) { c.PriorityMode = "bad" }},
+		{"priority threshold above one", func(c *SupportJevConfig) { c.PriorityThreshold = 1.1 }},
 		{"zero threshold", func(c *SupportJevConfig) { c.HandoffThreshold = 0 }},
 		{"negative threshold", func(c *SupportJevConfig) { c.FollowUpThreshold = -1 }},
 		{"nan threshold", func(c *SupportJevConfig) { c.HandoffThreshold = math.NaN() }},
@@ -313,6 +315,9 @@ func TestJevLifecycleConfiguration(t *testing.T) {
 	}
 	if jev.config.HandoffMode != "primary" || jev.config.FollowUpMode != "primary" {
 		t.Fatal("lifecycle default is not primary")
+	}
+	if jev.config.PriorityMode != "primary" || jev.config.PriorityThreshold != supportJevDefaultPriorityThreshold {
+		t.Fatalf("priority defaults = %q %v", jev.config.PriorityMode, jev.config.PriorityThreshold)
 	}
 }
 
@@ -472,15 +477,18 @@ func TestJevWaitingCustomerPreservesReminderSequence(t *testing.T) {
 	}
 }
 
-func TestJevHardHumanRequestRetainsPrecedence(t *testing.T) {
-	p := &lifecycleJev{choice: "continue", probability: .99}
+// A request for a person is judged in any language, not matched against an
+// English keyword list that also caught "connect me to my Facebook page".
+func TestJevJudgesHumanRequests(t *testing.T) {
+	p := &lifecycleJev{choice: "customer_requested_human", probability: .99}
 	chat, db, msg := setupJevChat(t, p)
-	msg.Content = "I want to speak to a real person"
+	msg.Content = "Je voudrais parler à une vraie personne"
 	mustExec(t, db, `UPDATE support_messages SET content=? WHERE id=?`, msg.Content, msg.ID)
 	if err := chat.HandleVisitorMessage(context.Background(), "ws", "conv", msg); err != nil {
 		t.Fatal(err)
 	}
-	if p.calls != 0 || !supportConversationHumanOwned(readControlConversation(t, db)) {
-		t.Fatal("explicit human request lost precedence")
+	conv := readControlConversation(t, db)
+	if p.calls != 1 || !supportConversationHumanOwned(conv) || conv.CustomerRequestedHumanAt == nil {
+		t.Fatalf("human request not handed off: calls=%d conv=%+v", p.calls, conv)
 	}
 }

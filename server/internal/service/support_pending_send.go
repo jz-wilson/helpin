@@ -337,6 +337,7 @@ func (s *SupportInboxService) executePendingSupportSend(ctx context.Context, job
 	work = context.WithValue(work, supportSendProgressKey{}, progress)
 	msg, err := s.CreateConversationMessage(work, job.WorkspaceID, job.ConversationID, req, "user", &job.UserID, nil, nil)
 	if err != nil {
+		slog.WarnContext(ctx, "support pending reply could not be delivered", "send_id", job.ID, "conversation_id", job.ConversationID, "error", err)
 		if errors.Is(err, ErrSupportTranslation) || errors.Is(err, repository.ErrTranslationUnavailable) {
 			fail("translation")
 		} else {
@@ -352,6 +353,12 @@ func supportReplyTarget(options *model.SupportTranslationOptions) string {
 	if !options.Preference.AutoTranslateOutgoing {
 		return ""
 	}
+	return savedCustomerLanguage(options)
+}
+
+// savedCustomerLanguage is the teammate's choice or the first clear detection.
+// Detection never replaces it, whether or not translation is on.
+func savedCustomerLanguage(options *model.SupportTranslationOptions) string {
 	if options.Conversation.CustomerLanguage != "" {
 		return options.Conversation.CustomerLanguage
 	}

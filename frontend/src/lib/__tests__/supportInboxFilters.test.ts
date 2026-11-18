@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_CONVERSATION_LIST_FILTERS,
   buildConversationListRequestFilters,
   buildSupportInboxViewFilters,
   defaultAssignmentForNav,
@@ -454,5 +455,109 @@ describe('buildSupportInboxViewFilters', () => {
     })).toMatchObject({
       assignment: 'me',
     });
+  });
+});
+
+describe('snooze and SLA filters', () => {
+  const later = '2026-10-30T09:00:00Z'
+
+  it('keeps snoozed conversations out of every view except Snoozed', () => {
+    const conversations = [
+      buildConversation({ id: 'active' }),
+      buildConversation({ id: 'snoozed', snoozed_until: later }),
+      buildConversation({ id: 'snoozed-waiting', status: 'waiting_on_customer', snoozed_until: later }),
+      buildConversation({ id: 'resolved-stale-snooze', status: 'resolved', snoozed_until: later }),
+    ];
+    const ids = (navFilter: 'inbox' | 'waiting' | 'snoozed' | 'resolved') =>
+      filterSupportConversations(conversations, { navFilter, mailboxScope: 'all', userId: 'user-1', searchQuery: '', skipViewFilter: navFilter === 'snoozed' }).map((c) => c.id);
+    expect(ids('inbox')).toEqual(['active']);
+    expect(ids('waiting')).toEqual([]);
+    expect(ids('snoozed').sort()).toEqual(['snoozed', 'snoozed-waiting']);
+    expect(ids('resolved')).toEqual(['resolved-stale-snooze']);
+  });
+
+  it('filters to breached SLAs and sorts by the next due time, overdue first', () => {
+    const conversations = [
+      buildConversation({ id: 'none' }),
+      buildConversation({ id: 'later', sla: { policy_name: 'P', metrics: [], next_due_at: '2026-10-26T12:00:00Z', breached: false } }),
+      buildConversation({ id: 'overdue', sla: { policy_name: 'P', metrics: [], next_due_at: '2026-10-26T08:00:00Z', breached: true } }),
+      buildConversation({ id: 'soon', sla: { policy_name: 'P', metrics: [], next_due_at: '2026-10-26T10:30:00Z', breached: false } }),
+    ];
+    const sorted = filterSupportConversations(conversations, { navFilter: 'inbox', mailboxScope: 'all', userId: 'user-1', searchQuery: '', sortOrder: 'sla' });
+    expect(sorted.map((c) => c.id)).toEqual(['overdue', 'soon', 'later', 'none']);
+    const breached = filterSupportConversations(conversations, { navFilter: 'inbox', mailboxScope: 'all', userId: 'user-1', searchQuery: '', sla: 'breached' });
+    expect(breached.map((c) => c.id)).toEqual(['overdue']);
+  });
+
+  it('filters by request type, with none for conversations without one', () => {
+    const conversations = [
+      buildConversation({ id: 'bug', request_type_id: 'type-bug' }),
+      buildConversation({ id: 'billing', request_type_id: 'type-billing' }),
+      buildConversation({ id: 'untyped' }),
+    ];
+    const ids = (requestTypeIds: string[]) =>
+      filterSupportConversations(conversations, { navFilter: 'inbox', mailboxScope: 'all', userId: 'user-1', searchQuery: '', requestTypeIds }).map((c) => c.id).sort();
+    expect(ids(['type-bug'])).toEqual(['bug']);
+    expect(ids(['type-bug', 'none'])).toEqual(['bug', 'untyped']);
+    expect(ids([])).toEqual(['billing', 'bug', 'untyped']);
+  });
+
+  it('keeps the request type filter in saved views and requests', () => {
+    const listFilters = { ...DEFAULT_CONVERSATION_LIST_FILTERS, states: ['open' as const, 'waiting_on_customer' as const], requestTypeIds: ['type-bug', 'none'] };
+    const view = buildSupportInboxViewFilters({ navFilter: 'inbox', selectedMailboxId: 'all', searchQuery: '', listFilters });
+    expect(view.request_type_ids).toBe('type-bug,none');
+    expect(parseSupportInboxViewFilters(view).listFilters.requestTypeIds).toEqual(['type-bug', 'none']);
+    expect(buildConversationListRequestFilters({ navFilter: 'inbox', selectedMailboxId: 'all', searchQuery: '', listFilters })?.request_type_ids).toBe('type-bug,none');
+  });
+
+  it('filters to SLA targets due within the hour, not overdue ones', () => {
+    const dueIn = (minutes: number) => new Date(Date.now() + minutes * 60_000).toISOString();
+    const conversations = [
+      buildConversation({ id: 'none' }),
+      buildConversation({ id: 'soon', sla: { policy_name: 'P', metrics: [], next_due_at: dueIn(20), breached: false } }),
+      buildConversation({ id: 'later', sla: { policy_name: 'P', metrics: [], next_due_at: dueIn(90), breached: false } }),
+      buildConversation({ id: 'overdue', sla: { policy_name: 'P', metrics: [], next_due_at: dueIn(-5), breached: true } }),
+    ];
+    const dueSoon = filterSupportConversations(conversations, { navFilter: 'inbox', mailboxScope: 'all', userId: 'user-1', searchQuery: '', sla: 'due_soon' });
+    expect(dueSoon.map((c) => c.id)).toEqual(['soon']);
+    const filters = { ...defaultConversationListFiltersForNav('inbox'), sla: 'due_soon' as const };
+    expect(buildConversationListRequestFilters({ navFilter: 'inbox', selectedMailboxId: 'all', searchQuery: '', listFilters: filters })).toMatchObject({ sla: 'due_soon' });
+    const restored = parseSupportInboxViewFilters(buildSupportInboxViewFilters({ navFilter: 'inbox', selectedMailboxId: 'all', searchQuery: '', listFilters: filters }), 'inbox');
+    expect(restored.listFilters.sla).toBe('due_soon');
+    expect(parseSupportInboxViewFilters({ nav_filter: 'inbox', sla: 'whenever' }, 'inbox').listFilters.sla).toBeUndefined();
+  });
+
+  it('requests the Snoozed view, the SLA sort and the breached filter from the API', () => {
+    expect(buildConversationListRequestFilters({ navFilter: 'snoozed', selectedMailboxId: 'all', searchQuery: '', listFilters: defaultConversationListFiltersForNav('snoozed') })).toEqual({ filter: 'snoozed' });
+    const filters = { ...defaultConversationListFiltersForNav('inbox'), sort: 'sla' as const, sla: 'breached' as const };
+    expect(buildConversationListRequestFilters({ navFilter: 'inbox', selectedMailboxId: 'all', searchQuery: '', listFilters: filters })).toMatchObject({ sort: 'sla', sla: 'breached', filter: 'inbox' });
+    expect(hasConversationListChanges({ navFilter: 'inbox', searchQuery: '', listFilters: { ...defaultConversationListFiltersForNav('inbox'), sla: 'breached' as const } })).toBe(true);
+  });
+
+  it('saves and restores the SLA sort and filter in views', () => {
+    const listFilters = { ...defaultConversationListFiltersForNav('snoozed'), sort: 'sla' as const, sla: 'breached' as const };
+    const saved = buildSupportInboxViewFilters({ navFilter: 'snoozed', selectedMailboxId: 'all', searchQuery: '', listFilters });
+    expect(saved).toMatchObject({ nav_filter: 'snoozed', sort: 'sla', sla: 'breached' });
+    const restored = parseSupportInboxViewFilters(saved, 'inbox');
+    expect(restored.navFilter).toBe('snoozed');
+    expect(restored.listFilters).toMatchObject({ sort: 'sla', sla: 'breached' });
+  });
+});
+
+
+describe('priority views', () => {
+  it('saves, restores and requests multiple priorities', () => {
+    const listFilters = { ...defaultConversationListFiltersForNav('inbox'), priorities: ['urgent', 'high'] as const };
+    const args = { navFilter: 'inbox' as const, selectedMailboxId: 'all', searchQuery: '', listFilters: { ...listFilters, priorities: [...listFilters.priorities] } };
+    const saved = buildSupportInboxViewFilters(args);
+    expect(saved.priority).toBe('urgent,high');
+    expect(parseSupportInboxViewFilters(saved, 'inbox').listFilters.priorities).toEqual(['urgent', 'high']);
+    expect(buildConversationListRequestFilters(args)?.priority).toBe('urgent,high');
+    expect(hasConversationListChanges(args)).toBe(true);
+  });
+
+  it('removes conversations that no longer match the selected priority', () => {
+    const conversations = [buildConversation({ id: 'high', priority: 'high' }), buildConversation({ id: 'low', priority: 'low' })];
+    expect(filterSupportConversations(conversations, { navFilter: 'inbox', mailboxScope: 'all', searchQuery: '', priorities: ['high', 'urgent'] }).map(c => c.id)).toEqual(['high']);
   });
 });

@@ -21,6 +21,18 @@ func (s *MCPService) SetPMComments(comments mcpPMCommentLister) {
 	}
 }
 
+type mcpPMCommentDeleter interface {
+	Get(context.Context, string) (*model.PMComment, error)
+	Delete(ctx context.Context, id, actorID string, isAdmin bool, workspaceID string) error
+}
+
+// SetPMCommentDeleter wires comment deletion for delete_task_comment.
+func (s *MCPService) SetPMCommentDeleter(comments mcpPMCommentDeleter) {
+	if comments != nil {
+		s.pmCommentDeleter = comments
+	}
+}
+
 func pmParityMCPToolDefinitions() []MCPToolDefinition {
 	taskOnly := map[string]any{
 		"type":                 "object",
@@ -32,7 +44,10 @@ func pmParityMCPToolDefinitions() []MCPToolDefinition {
 		definition.Toolset, definition.Scope = MCPToolsetPM, MCPScopePMWrite
 		definition.Permission, definition.Module = authorization.PermPMEdit, model.ModulePM
 		definition.Mutating, definition.IdempotentHint = true, true
-		definition.InputSchema = withMCPIdempotencyKey(taskOnly)
+		if definition.InputSchema == nil {
+			definition.InputSchema = taskOnly
+		}
+		definition.InputSchema = withMCPIdempotencyKey(definition.InputSchema)
 		return definition
 	}
 	return []MCPToolDefinition{
@@ -43,6 +58,16 @@ func pmParityMCPToolDefinitions() []MCPToolDefinition {
 		pmWrite(MCPToolDefinition{
 			Name: "restore_task", Title: "Restore task",
 			Description: "Restore an archived task.",
+		}),
+		pmWrite(MCPToolDefinition{
+			Name: "delete_task_comment", Title: "Delete task comment", Destructive: true,
+			Description: "Permanently delete a task comment. Only the comment's author can delete it, and the deletion cannot be undone.",
+			InputSchema: map[string]any{
+				"type":                 "object",
+				"properties":           map[string]any{"comment_id": map[string]any{"type": "string", "minLength": 1}},
+				"required":             []string{"comment_id"},
+				"additionalProperties": false,
+			},
 		}),
 		{
 			Name: "list_task_comments", Title: "List task comments",
@@ -60,6 +85,9 @@ func (s *MCPService) executePMParityMCPTool(
 	arguments json.RawMessage,
 ) (*MCPToolResult, bool, error) {
 	switch name {
+	case "delete_task_comment":
+		result, err := s.deleteMCPTaskComment(ctx, principal, arguments)
+		return result, true, err
 	case "archive_task", "restore_task", "list_task_comments":
 	default:
 		return nil, false, nil
@@ -94,6 +122,49 @@ func (s *MCPService) executePMParityMCPTool(
 		Summary: "Task " + updated.Task.Name + " " + verb + ".",
 		Data:    map[string]any{"task_id": updated.Task.ID, "name": updated.Task.Name, "archived": updated.Task.Archived},
 	}, true, nil
+}
+
+// deleteMCPTaskComment mirrors the REST comment delete (author only, no admin
+// override) and hides comments that are missing, not on a task, or on a task
+// outside the principal's workspace.
+func (s *MCPService) deleteMCPTaskComment(ctx context.Context, principal *model.MCPPrincipal, arguments json.RawMessage) (*MCPToolResult, error) {
+	var input struct {
+		CommentID string `json:"comment_id"`
+	}
+	if err := decodeMCPArguments(arguments, &input); err != nil {
+		return nil, err
+	}
+	if s.pmCommentDeleter == nil {
+		return nil, ErrMCPForbidden
+	}
+	commentID := strings.TrimSpace(input.CommentID)
+	if commentID == "" {
+		return nil, ErrMCPNotFound
+	}
+	comment, err := s.pmCommentDeleter.Get(ctx, commentID)
+	if err != nil {
+		return nil, err
+	}
+	if comment == nil || comment.EntityType != "task" {
+		return nil, ErrMCPNotFound
+	}
+	task, err := s.accessibleMCPTask(ctx, principal, comment.EntityID)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil {
+		return nil, ErrMCPNotFound
+	}
+	if comment.AuthorID != principal.UserID {
+		return nil, ErrMCPForbidden
+	}
+	if err := s.pmCommentDeleter.Delete(ctx, comment.ID, principal.UserID, false, principal.WorkspaceID); err != nil {
+		return nil, err
+	}
+	return &MCPToolResult{
+		Summary: "Comment deleted.",
+		Data:    map[string]any{"comment_id": comment.ID, "task_id": task.Task.ID, "deleted": true},
+	}, nil
 }
 
 func (s *MCPService) listMCPTaskComments(ctx context.Context, taskID string) (*MCPToolResult, error) {

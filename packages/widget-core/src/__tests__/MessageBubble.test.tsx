@@ -69,7 +69,7 @@ describe('MessageBubble', () => {
     expect(container.querySelector('.helpin-message--internal')).toBeNull();
   });
 
-  it('displays AI source count and reveals titles in popover', () => {
+  it('shows the AI source count and lists the titles inside the bubble on click', () => {
     const message = createMessage({
       role: 'ai',
       sources: [
@@ -77,11 +77,50 @@ describe('MessageBubble', () => {
       ],
     });
     const { container, getByRole, queryByText } = render(<MessageBubble message={message} />);
-    expect(container.textContent).toContain('1 source');
+    const trigger = getByRole('button', { name: '1 source' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
     expect(queryByText('Test Doc')).toBeNull();
 
-    fireEvent.click(getByRole('button', { name: 'Based on 1 source' }));
-    expect(queryByText('Test Doc')).toBeTruthy();
+    fireEvent.click(trigger);
+    const list = container.querySelector('.helpin-message-bubble .helpin-sources-list')!;
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    expect(list.id).toBe(trigger.getAttribute('aria-controls'));
+    expect(list.tagName).toBe('UL');
+    expect(list.textContent).toBe('Test Doc');
+
+    fireEvent.click(trigger);
+    expect(queryByText('Test Doc')).toBeNull();
+  });
+
+  it('numbers several sources and opens their links in a new window', () => {
+    const { getByRole, queryByText } = render(<MessageBubble message={createMessage({
+      role: 'ai',
+      sources: [
+        { docId: 'doc-link', title: 'Public guide', snippet: '', confidence: 0.9, language: 'en', url: 'https://help.example.com/articles/guide' },
+        { docId: 'doc-other', title: 'Billing settings', snippet: '', confidence: 0.8, language: 'en', url: 'https://help.example.com/articles/billing' },
+      ],
+    })} />);
+    fireEvent.click(getByRole('button', { name: '2 sources' }));
+    expect(getByRole('list', { name: 'Sources' }).tagName).toBe('OL');
+    const link = getByRole('link', { name: 'Public guide' });
+    expect(link.getAttribute('href')).toBe('https://help.example.com/articles/guide');
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+    expect(queryByText('Sources')).toBeNull();
+  });
+
+  it('leaves sources without safe web URLs as plain text', () => {
+    const { getByRole, queryAllByRole, getByText } = render(<MessageBubble message={createMessage({
+      role: 'ai',
+      sources: [
+        { docId: 'missing', title: 'No URL', snippet: '', confidence: 0.9, language: 'en' },
+        { docId: 'unsafe', title: 'Unsafe URL', snippet: '', confidence: 0.9, language: 'en', url: 'javascript:alert(1)' },
+      ],
+    })} />);
+    fireEvent.click(getByRole('button', { name: '2 sources' }));
+    expect(queryAllByRole('link')).toHaveLength(0);
+    expect(getByText('No URL')).toBeTruthy();
+    expect(getByText('Unsafe URL')).toBeTruthy();
   });
 
   it('uses source attribution instead of exposing an exact confidence score', () => {
@@ -93,7 +132,7 @@ describe('MessageBubble', () => {
       aiConfidence: 0.85,
     });
     const { container } = render(<MessageBubble message={message} />);
-    expect(container.textContent).toContain('Based on 1 source');
+    expect(container.textContent).toContain('1 source');
     expect(container.textContent).not.toContain('85%');
   });
 

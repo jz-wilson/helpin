@@ -1,3 +1,4 @@
+import { AppLoadBoundary } from '@/components/layout/AppLoadError';
 import { useNotificationView } from '@/hooks/useNotificationView';
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from '@tanstack/react-router';
@@ -15,9 +16,11 @@ import { buildSupportConversationPageContext } from './supportAgentContext';
 import { supportSidebarWidthClass } from './supportSidebarLayout';
 import { shouldClearConversationForMailbox } from './supportInboxSelection';
 import { NewConversationDialog } from './NewConversationDialog';
+import { SupportShortcutsDialog } from './SupportShortcutsDialog';
+import { useSupportInboxShortcuts } from '@/hooks/useSupportInboxShortcuts';
 import { TeamInboxDialog } from './TeamInboxDialog';
 import { buildSupportInboxSearch, navFilterFromView, normalizeSupportInboxRouteSearch } from '@/lib/supportInboxRouting';
-import { conversationListFiltersEqual, defaultAIStatesForNav, defaultAssignmentForNav, defaultConversationListFiltersForNav, defaultStatesForNav, parseSupportInboxViewFilters, statesEqual, stringArraysEqual, type ConversationAIStateFilter, type ConversationAssignmentFilter, type ConversationListFilters, type ConversationStateFilter } from '@/lib/supportInboxFilters';
+import { parseConversationPriorities, conversationListFiltersEqual, defaultAIStatesForNav, defaultAssignmentForNav, defaultConversationListFiltersForNav, defaultStatesForNav, parseConversationSortOrder, parseSupportInboxViewFilters, statesEqual, stringArraysEqual, type ConversationAIStateFilter, type ConversationAssignmentFilter, type ConversationListFilters, type ConversationStateFilter } from '@/lib/supportInboxFilters';
 
 const LazySupportAgentSidebar = lazy(() => import('./SupportAgentSidebar').then((module) => ({ default: module.SupportAgentSidebar })));
 const LazyConversationDetailSidebar = lazy(() => import('./ConversationDetailSidebar').then((module) => ({ default: module.ConversationDetailSidebar })));
@@ -118,6 +121,9 @@ export function SupportInboxLayout() {
   useNotificationView(workspaceId, 'support_conversation', isMultiPanel ? selectedConversationId : routeConversationId);
   const showDetailSidebar = useMinWidth(1280) && !!selectedConversationId;
   const [mobileDetailsOpen, setMobileDetailsOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const openShortcuts = useCallback(() => setShortcutsOpen(true), []);
+  useSupportInboxShortcuts({ enabled: isMultiPanel, onCheatsheet: openShortcuts });
   const mobileOpenedFromInboxRef = useRef(false);
   const previousRouteConversationIdRef = useRef(routeConversationId);
   const routeSearch = useMemo(
@@ -226,8 +232,11 @@ export function SupportInboxLayout() {
       assignment: parseRouteAssignments(routeSearch.assigned_to, effectiveNavFilter),
       mailboxIds: parseRouteStringList(routeSearch.mailbox_ids),
       tagIds: parseRouteStringList(routeSearch.tag_ids),
+      ...(routeSearch.priority ? { priorities: parseConversationPriorities(routeSearch.priority) } : {}),
       aiStates: parseRouteAIStates(routeSearch.ai, routeSearch.system_tags, effectiveNavFilter),
-      sort: routeSearch.sort === 'oldest' ? 'oldest' : 'newest',
+      sort: parseConversationSortOrder(routeSearch.sort),
+      ...(routeSearch.sla ? { sla: routeSearch.sla } : {}),
+      ...(routeSearch.request_type ? { requestTypeIds: parseRouteStringList(routeSearch.request_type) } : {}),
     };
     const hasExplicitRouteFilters = !!(
       routeSearch.status ||
@@ -236,7 +245,10 @@ export function SupportInboxLayout() {
       routeSearch.assigned_to ||
       routeSearch.mailbox_ids ||
       routeSearch.tag_ids ||
+      routeSearch.priority ||
       routeSearch.ai ||
+      routeSearch.sla ||
+      routeSearch.request_type ||
       routeSearch.system_tags ||
       routeSearch.sort
     );
@@ -302,6 +314,7 @@ export function SupportInboxLayout() {
       !stringArraysEqual(nextConversationListFilters.assignment, currentState.conversationListFilters.assignment) ||
       !stringArraysEqual(nextConversationListFilters.mailboxIds, currentState.conversationListFilters.mailboxIds) ||
       !stringArraysEqual(nextConversationListFilters.tagIds, currentState.conversationListFilters.tagIds) ||
+      !stringArraysEqual(nextConversationListFilters.priorities ?? [], currentState.conversationListFilters.priorities ?? []) ||
       !stringArraysEqual(nextConversationListFilters.aiStates, currentState.conversationListFilters.aiStates) ||
       nextConversationListFilters.sort !== currentState.conversationListFilters.sort
     ) {
@@ -469,9 +482,9 @@ export function SupportInboxLayout() {
             }`}
           >
             {detailSidebarMode !== 'agents' ? (
-              <Suspense fallback={null}>
+              <AppLoadBoundary><Suspense fallback={null}>
                 <LazyConversationDetailSidebar workspaceId={workspaceId} conversationId={selectedConversationId} />
-              </Suspense>
+              </Suspense></AppLoadBoundary>
             ) : null}
           </div>
           {supportAgentContext && detailSidebarMode === 'agents' ? (
@@ -482,13 +495,13 @@ export function SupportInboxLayout() {
                 detailSidebarMode === 'agents' ? 'translate-x-0 opacity-100' : 'pointer-events-none translate-x-2 opacity-0'
               }`}
             >
-              <Suspense fallback={null}>
+              <AppLoadBoundary><Suspense fallback={null}>
                 <LazySupportAgentSidebar
                   context={supportAgentContext}
                   active={detailSidebarMode === 'agents'}
                   onBack={handleCloseAgentSidebar}
                 />
-              </Suspense>
+              </Suspense></AppLoadBoundary>
             </div>
           ) : null}
         </div> : null}
@@ -532,16 +545,18 @@ export function SupportInboxLayout() {
           <SheetDescription className="sr-only">
             Customer identity, assignment, tags, and conversation context.
           </SheetDescription>
-          <Suspense fallback={null}>
+          <AppLoadBoundary><Suspense fallback={null}>
             <LazyConversationDetailSidebar
               workspaceId={workspaceId}
               conversationId={routeConversationId}
               presentation="mobile-sheet"
               onClose={() => setMobileDetailsOpen(false)}
             />
-          </Suspense>
+          </Suspense></AppLoadBoundary>
         </SheetContent>
       </Sheet>
+
+      <SupportShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
 
       <NewConversationDialog
         workspaceId={workspaceId}

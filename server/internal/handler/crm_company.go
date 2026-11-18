@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/helpin-ai/helpin/server/internal/model"
+	"github.com/helpin-ai/helpin/server/internal/querybuilder"
 	"github.com/helpin-ai/helpin/server/internal/service"
 )
 
@@ -27,15 +29,26 @@ func (h *CRMCompanyHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
 		return
 	}
+	queryFilters, err := queryFilterGroup(r, "filters")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid filters query")
+		return
+	}
 	filters := model.CRMCompanyListFilters{
 		Industry:      queryStringPtr(r, "industry"),
 		OwnerMemberID: queryStringPtr(r, "owner_member_id"),
 		Search:        queryStringPtr(r, "search"),
+		Query:         queryFilters,
 	}
 	pagination := queryPagination(r)
 
 	companies, total, err := h.companyService.List(r.Context(), workspaceID, filters, pagination)
 	if err != nil {
+		var validationErr *querybuilder.ValidationError
+		if errors.As(err, &validationErr) {
+			writeError(w, http.StatusBadRequest, validationErr.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -49,6 +62,22 @@ func (h *CRMCompanyHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// FilterOptions handles GET /api/crm/companies/filter-options. It returns the
+// industries and custom property keys in use, with their common values.
+func (h *CRMCompanyHandler) FilterOptions(w http.ResponseWriter, r *http.Request) {
+	workspaceID := getWorkspaceID(r)
+	if workspaceID == "" {
+		writeError(w, http.StatusBadRequest, "workspace_id is required")
+		return
+	}
+	options, err := h.companyService.FilterOptions(r.Context(), workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load company filter options")
+		return
+	}
+	writeJSON(w, http.StatusOK, options)
+}
+
 // Create handles POST /api/crm/companies.
 func (h *CRMCompanyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req model.CreateCRMCompanyRequest
@@ -56,9 +85,14 @@ func (h *CRMCompanyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.WorkspaceID == "" {
-		req.WorkspaceID = getWorkspaceID(r)
+	// The company always lands in the workspace the caller was authorized
+	// for; a different workspace in the body is refused, never honored.
+	workspaceID := getWorkspaceID(r)
+	if req.WorkspaceID != "" && req.WorkspaceID != workspaceID {
+		writeError(w, http.StatusForbidden, "workspace_id does not match the current workspace")
+		return
 	}
+	req.WorkspaceID = workspaceID
 	company, err := h.companyService.Create(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -70,6 +104,10 @@ func (h *CRMCompanyHandler) Create(w http.ResponseWriter, r *http.Request) {
 // Get handles GET /api/crm/companies/{id}.
 func (h *CRMCompanyHandler) Get(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if err := h.companyService.RequireWorkspace(r.Context(), getWorkspaceID(r), id); err != nil {
+		writeError(w, http.StatusNotFound, "company not found")
+		return
+	}
 	company, err := h.companyService.GetByID(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
@@ -137,6 +175,10 @@ func (h *CRMCompanyHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if err := h.companyService.RequireWorkspace(r.Context(), getWorkspaceID(r), id); err != nil {
+		writeError(w, http.StatusNotFound, "company not found")
+		return
+	}
 	company, err := h.companyService.Update(r.Context(), id, req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -145,9 +187,28 @@ func (h *CRMCompanyHandler) Update(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, company)
 }
 
+// SetCustomFields handles PATCH /api/crm/companies/{id}/custom-properties:
+// defined field values, key by key; null clears a field.
+func (h *CRMCompanyHandler) SetCustomFields(w http.ResponseWriter, r *http.Request) {
+	var req model.SetCustomFieldValuesRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.companyService.SetCustomFieldValues(r.Context(), getWorkspaceID(r), chi.URLParam(r, "id"), req.Values); err != nil {
+		writeCustomFieldError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // Delete handles DELETE /api/crm/companies/{id}.
 func (h *CRMCompanyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if err := h.companyService.RequireWorkspace(r.Context(), getWorkspaceID(r), id); err != nil {
+		writeError(w, http.StatusNotFound, "company not found")
+		return
+	}
 	if err := h.companyService.Delete(r.Context(), id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

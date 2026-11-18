@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render } from '@testing-library/preact';
+import { act, fireEvent, render, waitFor } from '@testing-library/preact';
 import { ChatWindow } from '../components/ChatWindow';
 import { mountWidget, unmountWidget } from '../index';
 import type { UploadAttachment } from '../hooks/useAttachmentUploads';
@@ -383,7 +383,9 @@ describe('ChatWindow', () => {
       />,
     );
 
-    expect(container.querySelectorAll('.helpin-home-header-presence')).toHaveLength(2);
+    const avatars = container.querySelectorAll<HTMLElement>('.helpin-home-header-presence');
+    expect(avatars).toHaveLength(2);
+    expect(Number(avatars[0].style.zIndex)).toBeGreaterThan(Number(avatars[1].style.zIndex));
     expect(container.querySelector('.helpin-presence-dot--online')).toBeTruthy();
     expect(container.querySelector('.helpin-presence-dot--away')).toBeTruthy();
   });
@@ -613,7 +615,7 @@ describe('ChatWindow', () => {
     expect(queryByText('Talk to a person')).toBeNull();
   });
 
-  it('asks for contact details only after handoff is requested and escalates after the choice', () => {
+  it('asks for contact details only after handoff is requested and escalates after the choice', async () => {
     const onPreChatSubmit = vi.fn();
     const onEscalateToHuman = vi.fn();
     const { getByText, queryByPlaceholderText, getByPlaceholderText } = render(
@@ -668,7 +670,7 @@ describe('ChatWindow', () => {
       phone: '',
       email: 'visitor@example.com',
     });
-    expect(onEscalateToHuman).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onEscalateToHuman).toHaveBeenCalledTimes(1));
   });
 
   it('shows waiting for teammate after an escalated system handoff message', () => {

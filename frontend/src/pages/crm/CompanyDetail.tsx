@@ -1,3 +1,4 @@
+import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from '@tanstack/react-router';
 import { toast } from 'sonner';
@@ -30,6 +31,7 @@ import { ActivityTimeline } from '@/components/crm/ActivityTimeline';
 import { LinkedTasksPanel } from '@/components/crm/LinkedTasksPanel';
 import { AssociationsList } from '@/components/crm/AssociationsList';
 import { EnrichmentRailCard } from '@/components/crm/contact-detail/EnrichmentRailCard';
+import { CustomFieldRailRows } from '@/components/crm/CustomFieldRailRows';
 import { CreateDealDialog } from '@/components/crm/CreateDealDialog';
 import { DetailDescriptionEditorActions } from '@/components/pm/DetailDescriptionEditorActions';
 import { DetailDescriptionEditButton } from '@/components/pm/DetailDescriptionEditButton';
@@ -42,6 +44,9 @@ import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { EmailTimeline } from '@/components/crm/EmailTimeline';
 import { DesktopDetailRail } from '@/components/crm/DesktopDetailRail';
 import { CompanyContactsView, CompanyDealsView, CompanyMeetingsView, CompanySupportView } from '@/components/crm/CompanyDetailCollections';
+import { CompanySLASection } from '@/components/crm/CompanySLASection';
+import { CompanyPortalPanel } from '@/components/crm/CompanyPortalPanel';
+import { usePermissions, useWorkspaceAccess } from '@/hooks/queries/useSession';
 import { EntitySummaryCard } from '@/components/crm/EntitySummaryCard';
 import { EntitySignals } from '@/components/crm/EntitySignals';
 import { useTitle } from '@/hooks/useTitle';
@@ -49,7 +54,7 @@ import { useAssignableWorkspaceMembers } from '@/hooks/useAssignableWorkspaceMem
 import { findAssignableMember } from '@/lib/assignableMembers';
 import { cn } from '@/lib/utils';
 import type { CRMCompanyTimelineFilter, CRMCompanyTimelineItem, UpdateCRMCompanyRequest } from '@/lib/crmTypes';
-import type { CompanyDetailTab } from '@/lib/companyDetailTabs';
+import { visibleCompanyDetailTab, type CompanyDetailTab } from '@/lib/companyDetailTabs';
 
 interface FormState {
   name: string;
@@ -74,6 +79,7 @@ const companyDetailTabLabels: Array<{
   { value: 'calls', label: 'Calls' },
   { value: 'deals', label: 'Deals' },
   { value: 'support', label: 'Support' },
+  { value: 'portal', label: 'Portal' },
   { value: 'notes', label: 'Notes' },
 ];
 
@@ -89,10 +95,17 @@ function MetadataRow({ icon: Icon, label, children }: { icon: React.ElementType;
 
 const railInputClassName = 'w-full rounded bg-transparent px-1.5 py-0.5 text-xs text-foreground outline-none transition-colors placeholder:text-muted-foreground hover:bg-accent focus:bg-accent';
 
-export function CompanyDetailPage({ companyId, activeTab = 'overview', onTabChange, emailThreadId, onEmailThreadChange }: { companyId: string; activeTab?: CompanyDetailTab; onTabChange?: (tab: CompanyDetailTab) => void; emailThreadId?: string; onEmailThreadChange?: (threadId?: string) => void }) {
+export function CompanyDetailPage({ companyId, activeTab: requestedTab = 'overview', onTabChange, emailThreadId, onEmailThreadChange }: { companyId: string; activeTab?: CompanyDetailTab; onTabChange?: (tab: CompanyDetailTab) => void; emailThreadId?: string; onEmailThreadChange?: (threadId?: string) => void }) {
   const { currentWorkspace } = useWorkspaceStore();
   const wsId = currentWorkspace?.id ?? '';
   const wsSlug = currentWorkspace?.slug ?? '';
+  const { data: workspaceAccess } = useWorkspaceAccess(wsId);
+  // Portal access is managed by support admins, as on the contact page.
+  const permissions = usePermissions(workspaceAccess);
+  const canManagePortal = permissions.has('support.admin');
+  const canReadSupport = permissions.has('support.read');
+  const visibleTabLabels = companyDetailTabLabels.filter((tab) => tab.value !== 'portal' || canManagePortal);
+  const activeTab = visibleCompanyDetailTab(requestedTab, canManagePortal, workspaceAccess !== undefined);
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -110,6 +123,7 @@ export function CompanyDetailPage({ companyId, activeTab = 'overview', onTabChan
   const [pendingPatch, setPendingPatch] = useState<UpdateCRMCompanyRequest>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  useUnsavedChangesGuard(saving || Object.keys(pendingPatch).length > 0, 'Wait for your company changes to save before refreshing.');
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [createDealOpen, setCreateDealOpen] = useState(false);
   const [editingDescription, setEditingDescription] = useState(false);
@@ -344,7 +358,11 @@ export function CompanyDetailPage({ companyId, activeTab = 'overview', onTabChan
 				}}
 			/>
 		</MetadataRow>
+        <CustomFieldRailRows workspaceId={wsId} objectType="crm_company" recordId={companyId} properties={company.custom_properties} editable={permissions.has('crm.edit')} />
       </div>
+      {canReadSupport ? (
+        <CompanySLASection workspaceId={wsId} workspaceSlug={wsSlug} companyId={companyId} companyName={form.name || company.name} canManage={canManagePortal} />
+      ) : null}
 		{company.commercial_state_health ? (
 			<div className="mt-5 rounded-md border border-border/70 bg-muted/20 p-3">
 				<div className="flex items-center gap-2">
@@ -416,7 +434,7 @@ export function CompanyDetailPage({ companyId, activeTab = 'overview', onTabChan
             <div className="min-w-0 flex-1 overflow-x-auto px-1 pt-1">
               <Tabs value={activeTab} onValueChange={(value) => onTabChange?.(value as CompanyDetailTab)} className="min-w-max gap-0">
                 <TabsList variant="quiet" aria-label="Company detail views" className="border-b-0">
-                {companyDetailTabLabels.map((tab) => (
+                {visibleTabLabels.map((tab) => (
                   <TabsTrigger
                     key={tab.value}
                     value={tab.value}
@@ -584,6 +602,7 @@ export function CompanyDetailPage({ companyId, activeTab = 'overview', onTabChan
           )}
           {activeTab === 'deals' && <CompanyDealsView workspaceId={wsId} workspaceSlug={wsSlug} companyId={companyId} companyName={form.name || 'this company'} />}
           {activeTab === 'support' && <CompanySupportView workspaceId={wsId} workspaceSlug={wsSlug} companyId={companyId} />}
+          {activeTab === 'portal' && canManagePortal && <CompanyPortalPanel workspaceId={wsId} workspaceSlug={wsSlug} companyId={companyId} />}
         </div>
 
         <DesktopDetailRail

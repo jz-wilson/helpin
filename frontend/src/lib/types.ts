@@ -83,6 +83,7 @@ export interface Workspace {
   name: string;
   slug: string;
   workspace_key: string;
+  link_previews_enabled?: boolean;
   owner_id: string;
   organization_id?: string;
   role?: string;
@@ -241,6 +242,7 @@ export interface WorkspaceAccess {
     user_id: string;
     role: 'owner' | 'admin' | 'member' | 'viewer';
     status: string;
+    support_task_team_by_inbox?: Record<string, string>;
     support_default_team_id?: string;
     support_task_dialog_dismissed: boolean;
   };

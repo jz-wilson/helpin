@@ -184,6 +184,9 @@ func (r *CoverageV2Repository) StartAnalysisAttempt(ctx context.Context, batchID
 		if err == nil {
 			attemptNumber = latest.Attempt + 1
 		}
+		if err := releaseExpiredCoverageLeases(tx, workspaceID, logicalWorkKey, "", now); err != nil {
+			return err
+		}
 		expiresAt := now.Add(leaseDuration)
 		started = model.CoverageAnalysisAttempt{
 			ID: uuid.NewString(), WorkspaceID: workspaceID, BatchID: batchID, LogicalWorkKey: logicalWorkKey,
@@ -258,8 +261,13 @@ func (r *CoverageV2Repository) claimAttempts(ctx context.Context, workspaceID, o
 	}
 	var claimed []model.CoverageAnalysisAttempt
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Only the newest attempt for a piece of work runs. Older attempts are
+		// history, and leasing two of them would break the one-lease-per-work
+		// index and fail the whole claim.
 		query := tx.Where("((status IN ? AND (retry_at IS NULL OR retry_at <= ?)) OR (status = ? AND lease_expires_at <= ?))",
 			[]string{model.CoverageAttemptQueued, model.CoverageAttemptRetryable}, now, model.CoverageAttemptLeased, now).
+			Where("NOT EXISTS (SELECT 1 FROM coverage_analysis_attempts newer WHERE newer.workspace_id = coverage_analysis_attempts.workspace_id AND newer.logical_work_key = coverage_analysis_attempts.logical_work_key AND newer.attempt > coverage_analysis_attempts.attempt)").
+			Where(currentCoverageAttemptSQL).
 			Order("created_at ASC, id ASC").Limit(limit)
 		if workspaceID != "" {
 			query = query.Where("workspace_id = ?", workspaceID)
@@ -274,6 +282,9 @@ func (r *CoverageV2Repository) claimAttempts(ctx context.Context, workspaceID, o
 		expiresAt := now.Add(leaseDuration)
 		for idx := range candidates {
 			candidate := &candidates[idx]
+			if err := releaseExpiredCoverageLeases(tx, candidate.WorkspaceID, candidate.LogicalWorkKey, candidate.ID, now); err != nil {
+				return err
+			}
 			result := tx.Model(&model.CoverageAnalysisAttempt{}).
 				Where("id = ? AND ((status IN ? AND (retry_at IS NULL OR retry_at <= ?)) OR (status = ? AND lease_expires_at <= ?))",
 					candidate.ID, []string{model.CoverageAttemptQueued, model.CoverageAttemptRetryable}, now, model.CoverageAttemptLeased, now).
@@ -294,13 +305,38 @@ func (r *CoverageV2Repository) claimAttempts(ctx context.Context, workspaceID, o
 	return claimed, nil
 }
 
+// releaseExpiredCoverageLeases marks leases on the same work that expired
+// without finishing (the worker stopped mid-run) as retryable history, so a
+// new lease on that work does not collide with them.
+func releaseExpiredCoverageLeases(tx *gorm.DB, workspaceID, logicalWorkKey, exceptID string, now time.Time) error {
+	query := tx.Model(&model.CoverageAnalysisAttempt{}).
+		Where("workspace_id = ? AND logical_work_key = ? AND status = ? AND lease_expires_at <= ?", workspaceID, logicalWorkKey, model.CoverageAttemptLeased, now)
+	if exceptID != "" {
+		query = query.Where("id <> ?", exceptID)
+	}
+	err := query.Updates(map[string]interface{}{
+		"status": model.CoverageAttemptRetryable, "lease_owner": "", "lease_expires_at": nil,
+		"failure_class": model.CoverageFailureLeaseLost, "failure_message": "The analysis stopped before this conversation finished.",
+	}).Error
+	if err != nil {
+		return fmt.Errorf("release expired coverage leases: %w", err)
+	}
+	return nil
+}
+
 func (r *CoverageV2Repository) ListQueuedWorkspaces(ctx context.Context, limit int) ([]string, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 1000
 	}
 	var workspaceIDs []string
-	err := r.db.WithContext(ctx).Model(&model.CoverageAnalysisAttempt{}).Distinct("workspace_id").
+	// Pending assignments must keep a workspace scheduled even after its
+	// conversation cursor advances and no new conversations arrive.
+	attempts := r.db.WithContext(ctx).Model(&model.CoverageAnalysisAttempt{}).Select("workspace_id").
 		Where("status IN ? AND (retry_at IS NULL OR retry_at <= ?)", []string{model.CoverageAttemptQueued, model.CoverageAttemptRetryable}, time.Now().UTC()).
+		Where(currentCoverageAttemptSQL)
+	findings := r.db.WithContext(ctx).Model(&model.CoverageFinding{}).Select("workspace_id").
+		Where("is_current = ? AND assignment_status IN ?", true, []string{"pending", "retryable"})
+	err := r.db.WithContext(ctx).Table("(? UNION ?) AS queued_workspaces", attempts, findings).
 		Order("workspace_id").Limit(limit).Pluck("workspace_id", &workspaceIDs).Error
 	return workspaceIDs, err
 }
@@ -432,6 +468,10 @@ func (r *CoverageV2Repository) ReplaceCurrentFinding(ctx context.Context, findin
 			Where("workspace_id = ? AND logical_work_key = ? AND is_current = ?", finding.WorkspaceID, finding.LogicalWorkKey, true).
 			Updates(map[string]interface{}{"is_current": false, "superseded_at": now}).Error; err != nil {
 			return err
+		}
+		// The embedding is added later; "" is not a valid pgvector literal.
+		if strings.TrimSpace(finding.Embedding) == "" {
+			tx = tx.Omit("Embedding")
 		}
 		return tx.Create(finding).Error
 	})
@@ -796,12 +836,41 @@ func (r *CoverageV2Repository) CoverageRolloutStats(ctx context.Context, workspa
 	return stats, nil
 }
 
+// The analyzer evaluates the latest lifecycle segment and transcript of a
+// source. A newer reassessment supersedes older failures even when its content
+// hash or segment changed. Keep history, but never present or retry it as
+// outstanding work after the source has been reassessed.
+const currentCoverageAttemptSQL = `NOT EXISTS (SELECT 1 FROM coverage_analysis_attempts newer
+    WHERE newer.workspace_id = coverage_analysis_attempts.workspace_id
+      AND newer.source_kind = coverage_analysis_attempts.source_kind
+      AND newer.source_id = coverage_analysis_attempts.source_id
+      AND (newer.created_at > coverage_analysis_attempts.created_at
+        OR (newer.created_at = coverage_analysis_attempts.created_at AND newer.attempt > coverage_analysis_attempts.attempt)))`
+
+// ListFailedAttempts returns current unresolved sources across batches,
+// prioritizing work that needs intervention over automatic retries.
 func (r *CoverageV2Repository) ListFailedAttempts(ctx context.Context, workspaceID string, limit int) ([]model.CoverageAnalysisAttempt, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 25
 	}
 	var attempts []model.CoverageAnalysisAttempt
-	err := r.db.WithContext(ctx).Where("workspace_id = ? AND status IN ?", workspaceID, []string{model.CoverageAttemptRetryable, model.CoverageAttemptDeadLetter, model.CoverageAttemptPausedConfiguration}).Order("created_at DESC").Limit(limit).Find(&attempts).Error
+	err := r.db.WithContext(ctx).Model(&model.CoverageAnalysisAttempt{}).
+		Where("workspace_id = ? AND status IN ?", workspaceID, []string{model.CoverageAttemptRetryable, model.CoverageAttemptDeadLetter, model.CoverageAttemptPausedConfiguration}).
+		Where(currentCoverageAttemptSQL).
+		Order("CASE WHEN status = 'retryable' THEN 1 ELSE 0 END, created_at DESC, id").Limit(limit).Find(&attempts).Error
+	return attempts, err
+}
+
+// ListFailedAttemptsForBatch lists the failed attempts of one batch, newest
+// first. Older batches' failures are history, not current health.
+func (r *CoverageV2Repository) ListFailedAttemptsForBatch(ctx context.Context, workspaceID, batchID string, limit int) ([]model.CoverageAnalysisAttempt, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	var attempts []model.CoverageAnalysisAttempt
+	err := r.db.WithContext(ctx).
+		Where("workspace_id = ? AND batch_id = ? AND status IN ?", workspaceID, batchID, []string{model.CoverageAttemptRetryable, model.CoverageAttemptDeadLetter, model.CoverageAttemptPausedConfiguration}).
+		Order("created_at DESC").Limit(limit).Find(&attempts).Error
 	return attempts, err
 }
 

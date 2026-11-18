@@ -1,15 +1,19 @@
 import { AskAgentAvatar } from '@/components/agents/AskAgentAvatar';
+import { SupportCSATEvent } from './SupportCSATEvent';
+import { parseSupportCSATEvent } from './supportCSAT';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { ContactAvatarImage } from '@/components/ui/contact-avatar-image';
 import { SupportAIActivity } from './SupportAIActivity';
-import { getSupportAIActivity } from './supportAIActivity';
+import { getSupportAIActivity, getSupportCodeCheck } from './supportAIActivityModel';
+import { SupportCodeCheckCard } from './SupportCodeCheckCard';
+import { getSupportInvestigationReport } from './supportInvestigationReport';
 import { PendingSendStatus } from './PendingSendStatus';
 import { MessageDeliveryStatus } from './MessageDeliveryStatus';
 import { getMessageDelivery } from './messageDelivery';
 import { memo, useCallback, useMemo, useState, type ComponentPropsWithoutRef, type ReactNode } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { CheckmarkCircle02Icon, ArrowDown01Icon, LinkSquare01Icon, File01Icon, RotateLeft01Icon, StickyNote01Icon, CancelCircleIcon, Mail01Icon, UserIcon, ZapIcon } from '@/lib/icons';
+import { CheckmarkCircle02Icon, ArrowDown01Icon, LinkSquare01Icon, File01Icon, RotateLeft01Icon, StickyNote01Icon, CancelCircleIcon, Mail01Icon, UserIcon, ZapIcon, Timer01Icon } from '@/lib/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { EmailDetailModal } from './EmailDetailModal';
@@ -18,6 +22,7 @@ import { MessageDeleteDialog } from './MessageDeleteDialog';
 import { MessageInfoDialog } from './MessageInfoDialog';
 import { SupportAttachmentGallery } from './SupportAttachmentGallery';
 import { useShortcutComposerStore } from './shortcutDialogStore';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useDeleteSupportMessage } from '@/hooks/queries/useSupport';
 import { useAuthStore } from '@/stores/authStore';
@@ -30,7 +35,9 @@ import { cleanForwardedDisplayContent, hasForwardedHeaderMarker } from './forwar
 import { timeAgo } from '@/lib/utils';
 import { toast } from 'sonner';
 import { buildTaskPath } from '@/lib/pmTaskLinks';
+import { openTaskPanelFromLink } from '@/components/pm/task-detail/taskRouteNavigation';
 import { SupportLink } from './SupportLink';
+import { supportChannel } from '@/lib/supportChannels';
 
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
 const RESTORE_SUPPORT_DRAFT_EVENT = 'support:restore-draft';
@@ -140,7 +147,9 @@ function renderBoldedSupportMatches(content: string, pattern: RegExp): ReactNode
     if (valueIndex > lastIndex) {
       parts.push(content.slice(lastIndex, valueIndex));
     }
-    parts.push(<strong key={key++} className="font-semibold text-foreground">{value}</strong>);
+    // A removed tag or Cc address is struck through so it reads apart from an added one.
+    const removed = prefix.startsWith('removed');
+    parts.push(<strong key={key++} data-removed-value={removed || undefined} className={removed ? 'font-semibold text-foreground line-through' : 'font-semibold text-foreground'}>{value}</strong>);
     lastIndex = match.index + fullMatch.length - suffix.length;
   }
   if (lastIndex < content.length) {
@@ -149,11 +158,27 @@ function renderBoldedSupportMatches(content: string, pattern: RegExp): ReactNode
   return parts.length > 1 ? <>{parts}</> : content;
 }
 
-function supportTaskIDFromMetadata(metadata?: string): string | null {
+function supportSnoozedEventText(metadata: string | undefined, senderName: string): string | null {
   if (!metadata?.trim()) return null;
   try {
-    const parsed = JSON.parse(metadata) as { task_id?: unknown };
-    return typeof parsed.task_id === 'string' && parsed.task_id.trim() ? parsed.task_id.trim() : null;
+    const parsed = JSON.parse(metadata) as { snoozed_until?: unknown };
+    if (typeof parsed.snoozed_until !== 'string') return null;
+    const until = new Date(parsed.snoozed_until);
+    if (Number.isNaN(until.getTime())) return null;
+    const actor = senderName.trim().split(/\s+/)[0] || 'A teammate';
+    return `${actor} snoozed this conversation until ${until.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}.`;
+  } catch {
+    return null;
+  }
+}
+
+const SUPPORT_TASK_EVENT_TYPES: ReadonlySet<string> = new Set(['task_created', 'task_linked', 'task_unlinked']);
+
+function supportMetadataString(metadata: string | undefined, key: string): string | null {
+  if (!metadata?.trim()) return null;
+  try {
+    const value = (JSON.parse(metadata) as Record<string, unknown>)[key];
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
   } catch {
     return null;
   }
@@ -163,6 +188,7 @@ function renderSupportAuditSystemEventContent(
   eventType: string | undefined,
   content: string,
   taskHref?: string | null,
+  taskId?: string | null,
 ): ReactNode {
   if (eventType === 'assigned') {
     return renderAssignedSystemEventContent(content);
@@ -183,15 +209,23 @@ function renderSupportAuditSystemEventContent(
     return renderBoldedSupportMatches(content, /(\b(?:added|removed) tag\s+)([^.]+)(\.)/g);
   }
 
-  if (eventType === 'task_created') {
-    const taskMatch = content.match(/^(.*\bcreated task\s+)(#[^:\s]+)(?::\s+(.+))?(\.)$/);
+  if (eventType === 'priority_changed') {
+    return renderBoldedSupportMatches(content, /(\b(?:from|to)\s+)(Low|Medium|High|Urgent)((?=\s+to\s)|\.$)/g);
+  }
+
+  if (eventType === 'request_type_changed') {
+    return renderBoldedSupportMatches(content, /(\b(?:from|to)\s+)(.+?)((?=\s+to\s)|\.$)/g);
+  }
+
+  if (eventType && SUPPORT_TASK_EVENT_TYPES.has(eventType)) {
+    const taskMatch = content.match(/^(.*\b(?:created|linked|unlinked) task\s+)(#[^:\s]+)(?::\s+(.+))?(\.)$/);
     if (taskMatch) {
       const [, prefix, taskKey, taskName, suffix] = taskMatch;
       return (
         <span data-task-created-event className="flex min-w-0 max-w-full items-center whitespace-nowrap">
           <span data-task-created-prefix className="mr-1 shrink-0">{prefix.trimEnd()}</span>
           {taskHref ? (
-            <a data-task-created-link href={taskHref} title={`${taskKey}${taskName ? `: ${taskName}` : ''}`} className="-mx-1 flex min-w-0 items-center rounded-md px-1 font-semibold text-foreground underline decoration-border underline-offset-2 transition-[color,background-color,text-decoration-color] duration-150 hover:bg-muted hover:text-primary hover:decoration-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50">
+            <a data-task-created-link href={taskHref} onClick={taskId ? (event) => openTaskPanelFromLink(event, taskId) : undefined} title={`${taskKey}${taskName ? `: ${taskName}` : ''}`} className="-mx-1 flex min-w-0 items-center rounded-md px-1 font-semibold text-foreground underline decoration-border underline-offset-2 transition-[color,background-color,text-decoration-color] duration-150 hover:bg-muted hover:text-primary hover:decoration-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50">
               <strong className="shrink-0 font-semibold text-foreground">{taskKey}</strong>
               {taskName ? <><span className="shrink-0">:&nbsp;</span><strong data-task-created-title className="truncate font-semibold text-foreground">{taskName}</strong></> : null}
             </a>
@@ -223,13 +257,6 @@ const markdownBaseComponents = {
       className={`max-h-60 max-w-full rounded-lg object-cover ${className ?? ''}`.trim()}
     />
   ),
-};
-
-const SOURCE_LABELS: Record<string, string> = {
-  widget: 'Chat',
-  email: 'Email',
-  internal: 'Internal',
-  api: 'API',
 };
 
 function previewHostLabel(preview: SupportLinkPreview): string {
@@ -276,7 +303,7 @@ function LinkPreviewCard({ preview, security }: { preview: SupportLinkPreview; s
         <div className="min-w-0 flex-1 space-y-0.5">
           <div className="flex min-w-0 items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             <span className="truncate">{preview.site_name || previewHostLabel(preview)}</span>
-            {security?.status === 'malicious' ? <span className="shrink-0 text-red-600 dark:text-red-400">Potentially harmful</span> : preview.url.toLowerCase().startsWith('http://') ? <span className="shrink-0 text-amber-600 dark:text-amber-400" title="This link starts with HTTP. The site may redirect to HTTPS.">HTTP link</span> : null}
+            {security?.status === 'malicious' ? <span className="shrink-0 text-red-600 dark:text-red-400">Potentially harmful</span> : null}
           </div>
           <div className="truncate text-sm font-semibold leading-snug">{preview.title}</div>
         </div>
@@ -339,6 +366,8 @@ export interface MessageBubbleProps {
   customerEmail?: string | null;
   workspaceSlug?: string;
   linkedTaskId?: string | null;
+  /** Older AI cards fold to one line once a newer handoff exists. */
+  folded?: boolean;
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -359,6 +388,7 @@ export const MessageBubble = memo(function MessageBubble({
   customerEmail,
   workspaceSlug,
   linkedTaskId,
+  folded = false,
 }: MessageBubbleProps) {
   const queryClient = useQueryClient();
   const inboundIdentity = useMemo(() => {
@@ -424,7 +454,7 @@ export const MessageBubble = memo(function MessageBubble({
   );
   const messageSource = message.via_channel ?? source;
   const sourceLabel = isInternal ? null : deliveryMode ? REPLY_DELIVERY_LABELS[deliveryMode]
-    : messageSource ? SOURCE_LABELS[messageSource] ?? messageSource : null;
+    : messageSource ? supportChannel(messageSource)?.messageLabel ?? messageSource : null;
 
   // Strip trailing AI contract JSON blocks that LLM sometimes appends to content.
   // Only strip if the JSON parses as an AI contract (has can_answer + content keys)
@@ -586,7 +616,27 @@ export const MessageBubble = memo(function MessageBubble({
       teammateName={teammateDisplayName}
       avatarUrl={resolvedAvatarUrl}
       detailsContent={<Markdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={markdownComponents}>{message.content}</Markdown>}
+      readOnly={readOnly}
+      folded={folded}
     />;
+  }
+  const codeCheck = getSupportCodeCheck(message);
+  if (codeCheck) {
+    return <SupportCodeCheckCard
+      message={message}
+      check={codeCheck}
+      linkedTaskId={linkedTaskId}
+      readOnly={readOnly}
+      folded={folded}
+      renderMarkdown={(markdown) => <Markdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={markdownComponents}>{markdown}</Markdown>}
+    />;
+  }
+
+  if (message.message_type === 'system' && message.system_event_type === 'csat_rated') {
+    const csat = parseSupportCSATEvent(message.metadata);
+    if (csat) {
+      return <SupportCSATEvent details={csat} customerName={resolvedSenderName} timestamp={fullTimestamp} />;
+    }
   }
 
   // ── System message: centered pill with avatar ──
@@ -611,7 +661,13 @@ export const MessageBubble = memo(function MessageBubble({
       'email_recipients_updated',
       'tag_added',
       'tag_removed',
-      'task_created',
+      ...SUPPORT_TASK_EVENT_TYPES,
+      'priority_changed',
+      'request_type_changed',
+      'field_changed',
+      'snoozed',
+      'unsnoozed',
+      'sla_breached',
     ];
 
     const stateEventTypes: ReadonlyArray<string> = ['resolved', 'closed'];
@@ -628,12 +684,16 @@ export const MessageBubble = memo(function MessageBubble({
     const showAIAvatar = eventType !== 'customer_requested_human' && !isRuleRoutingEvent
       && (isAI || isAgent || isAIRoutingEvent || eventType === 'ai_escalated');
     const aiStatusAvatar = <AskAgentAvatar plateStyle="solid" radius={50} className="h-5 w-5 shrink-0" decorative={false} label={isAIRoutingEvent ? 'AI routing' : HELPIN_AI_DISPLAY_NAME} />;
-    const systemDisplayContent = escalationLabel ?? supportSystemEventDisplayContent(eventType, message.content, resolvedSenderName);
-    const taskID = eventType === 'task_created'
-      ? supportTaskIDFromMetadata(message.metadata) ?? linkedTaskId
+    const snoozedDisplay = eventType === 'snoozed' ? supportSnoozedEventText(message.metadata, resolvedSenderName) : null;
+    const isSLABreachEvent = eventType === 'sla_breached';
+    const systemDisplayContent = escalationLabel ?? snoozedDisplay ?? supportSystemEventDisplayContent(eventType, message.content, resolvedSenderName);
+    const isTaskEvent = !!eventType && SUPPORT_TASK_EVENT_TYPES.has(eventType);
+    const taskID = isTaskEvent
+      ? supportMetadataString(message.metadata, 'task_id') ?? (eventType === 'task_created' ? linkedTaskId : null)
       : null;
+    const viaAgent = isTaskEvent ? supportMetadataString(message.metadata, 'via_agent') : null;
     const taskHref = taskID && workspaceSlug ? buildTaskPath(workspaceSlug, taskID) : null;
-    const systemDisplayNode = renderSupportAuditSystemEventContent(eventType, systemDisplayContent, taskHref);
+    const systemDisplayNode = renderSupportAuditSystemEventContent(eventType, systemDisplayContent, taskHref, taskID);
 
     let isRoutingEvent: boolean;
     let stateEventKind: 'resolved' | 'reopened' | 'closed' | null;
@@ -692,12 +752,17 @@ export const MessageBubble = memo(function MessageBubble({
     if (isRoutingEvent) {
       const escalationPillClass = 'rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200';
       const defaultPillClass = 'rounded-full px-3 py-1 text-xs text-muted-foreground';
+      const slaBreachPillClass = 'rounded-full border border-red-200 bg-red-50 px-3 py-1 text-xs font-medium text-red-800 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-200';
       return (
         <div className="my-5 flex items-center justify-center gap-2 animate-in fade-in duration-300">
           <Tooltip>
             <TooltipTrigger asChild>
-              <div data-support-system-callout className={`flex min-w-0 items-center gap-2 ${eventType === 'task_created' ? 'max-w-[70%]' : 'max-w-full'} ${isEscalationEvent ? escalationPillClass : defaultPillClass}`}>
-                {showAIAvatar ? aiStatusAvatar : isEscalationEvent ? (
+              <div data-support-system-callout className={`flex min-w-0 items-center gap-2 ${isTaskEvent ? 'max-w-[70%]' : 'max-w-full'} ${isSLABreachEvent ? slaBreachPillClass : isEscalationEvent ? escalationPillClass : defaultPillClass}`}>
+                {isSLABreachEvent ? (
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">
+                    <Timer01Icon className="h-3 w-3" />
+                  </span>
+                ) : showAIAvatar ? aiStatusAvatar : isEscalationEvent ? (
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
                     <UserIcon className="h-3 w-3" />
                   </span>
@@ -713,6 +778,7 @@ export const MessageBubble = memo(function MessageBubble({
                   </div>
                 )}
                 <span className="min-w-0 max-w-full">{systemDisplayNode}</span>
+                {viaAgent ? <span data-task-via-agent className="shrink-0 whitespace-nowrap">via {viaAgent}</span> : null}
               </div>
             </TooltipTrigger>
             <TooltipContent side="top">
@@ -806,6 +872,8 @@ export const MessageBubble = memo(function MessageBubble({
 
   // ── Internal note: team bubble with the same author avatar as replies ──
   if (isInternal) {
+    const investigationReport = getSupportInvestigationReport(message, visibleContent);
+    const suggestedReply = readOnly ? '' : investigationReport?.suggestedReply ?? '';
     return (
       <>
         <div className={`flex min-w-0 max-w-full justify-end ${isConsecutive ? 'mt-1' : 'mt-5'}`}>
@@ -823,7 +891,24 @@ export const MessageBubble = memo(function MessageBubble({
                   </div>
                   {hasDisplayContent && (
                     <div className="prose-chat inline text-sm leading-relaxed text-amber-900 [&>p:last-child]:inline dark:text-amber-200">
-                      <Markdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} rehypePlugins={NOTE_REHYPE_PLUGINS} components={markdownComponents}>{visibleContent}</Markdown>
+                      <Markdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} rehypePlugins={NOTE_REHYPE_PLUGINS} components={markdownComponents}>{investigationReport?.summary ?? visibleContent}</Markdown>
+                    </div>
+                  )}
+                  {(suggestedReply || investigationReport?.engineering) && (
+                    <div data-support-code-check-actions className="mt-2 space-y-1.5 text-xs text-amber-700 dark:text-amber-300">
+                      {suggestedReply && (
+                        <button type="button" onClick={() => restoreComposerDraft(suggestedReply)} className="block w-fit rounded-sm font-medium hover:text-amber-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:text-amber-100">
+                          Use suggested reply
+                        </button>
+                      )}
+                      {investigationReport?.engineering && (
+                        <details>
+                          <summary className="w-fit cursor-pointer rounded-sm font-medium hover:text-amber-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:text-amber-100">Engineering details</summary>
+                          <div className="prose-chat mt-2 text-sm leading-relaxed text-amber-900 dark:text-amber-200">
+                            <Markdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} rehypePlugins={NOTE_REHYPE_PLUGINS} components={markdownComponents}>{investigationReport.engineering}</Markdown>
+                          </div>
+                        </details>
+                      )}
                     </div>
                   )}
                   {renderFileAttachments('note', hasDisplayContent ? 'mt-2' : 'mt-1.5')}
@@ -879,13 +964,11 @@ export const MessageBubble = memo(function MessageBubble({
 
   return (
     <div className={`${isConsecutive ? 'mt-1' : 'mt-5'} ${!isConsecutive ? (isCustomer ? 'animate-in fade-in slide-in-from-left-2 duration-200' : 'animate-in fade-in slide-in-from-right-2 duration-200') : ''}`}>
-      {/* Bubble row: avatar + bubble aligned together */}
+      {/* Message column with the avatar anchored to the bubble, above its footer. */}
       <div className={`flex min-w-0 max-w-full ${isCustomer ? 'justify-start' : 'justify-end'}`}>
-        {/* Left side: avatar or spacer (customer messages) */}
+        {/* Reserve space for the customer avatar. */}
         {isCustomer && (
-          <div className="mr-2 flex w-7 shrink-0 flex-col justify-end">
-            {showAvatar && avatarEl}
-          </div>
+          <div className="mr-2 w-7 shrink-0" />
         )}
 
         <MessageActionsContextMenu
@@ -902,83 +985,170 @@ export const MessageBubble = memo(function MessageBubble({
           data-slot="support-message-bubble"
           className={`${message.pending_send && message.pending_send !== 'failed' ? 'opacity-70' : ''} ${bubbleWidthClass} group/message ${showBubble ? '' : 'relative'}`}
         >
-          {showBubble ? (
-            <div data-slot="support-message-bubble-frame" className="relative">
-              {!message.pending_send && messageActionsMenu}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div
-                    className={`flow-root rounded-2xl border border-border/40 px-3.5 py-2 text-sm leading-relaxed [overflow-wrap:anywhere] ${
-                      isCustomer
-                        ? `bg-muted text-foreground/85 dark:text-foreground ${isLastInGroup ? 'rounded-bl-sm' : ''}`
-                        : `bg-blue-50 text-foreground/85 dark:bg-blue-950/40 dark:text-foreground ${isLastInGroup ? 'rounded-br-sm' : ''}`
-                    } ${hasTableContent || (hasEmailBody && !renderEmailBodyAsForwardedText) ? 'overflow-hidden' : ''}`}
-                  >
-                    {hasEmailBody && !renderEmailBodyAsForwardedText ? (
-                      <div className="-mx-1" data-chat-tone={isCustomer ? 'customer' : 'agent'}>
-                        <EmailBodyRenderer html={message.html_body ?? ''} collapsedByDefault />
-                      </div>
-                    ) : (
-                      visibleContent && (
-                        <div
-                          className="prose-chat inline [&>p:last-child]:inline"
-                          data-chat-tone={isCustomer ? 'customer' : 'agent'}
-                          data-has-table={hasTableContent ? 'true' : 'false'}
-                        >
-                          <Markdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={markdownComponents}>{visibleContent}</Markdown>
+          <div className="relative">
+            {showBubble ? (
+              <div data-slot="support-message-bubble-frame" className="relative">
+                {!message.pending_send && messageActionsMenu}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div
+                      className={`flow-root rounded-2xl border border-border/40 px-3.5 py-2 text-sm leading-relaxed [overflow-wrap:anywhere] ${
+                        isCustomer
+                          ? `bg-muted text-foreground/85 dark:text-foreground ${isLastInGroup ? 'rounded-bl-sm' : ''}`
+                          : `bg-blue-50 text-foreground/85 dark:bg-blue-950/40 dark:text-foreground ${isLastInGroup ? 'rounded-br-sm' : ''}`
+                      } ${hasTableContent || (hasEmailBody && !renderEmailBodyAsForwardedText) ? 'overflow-hidden' : ''}`}
+                    >
+                      {hasEmailBody && !renderEmailBodyAsForwardedText ? (
+                        <div className="-mx-1" data-chat-tone={isCustomer ? 'customer' : 'agent'}>
+                          <EmailBodyRenderer themeAware html={message.html_body ?? ''} collapsedByDefault linkSecurity={linkSecurity} />
                         </div>
-                      )
-                    )}
-                    {fileAttachments.length > 0 && (
-                      renderFileAttachments('default', visibleContent ? 'mt-2' : '')
-                    )}
-                    {linkPreviews.length > 0 && (
-                      <div className={`${visibleContent || fileAttachments.length > 0 ? 'mt-2' : ''} space-y-2`}>
-                        {linkPreviews.map((preview) => (
-                          <LinkPreviewCard
-                            key={`${message.id}:${preview.url}`}
-                            preview={preview}
-                            security={findSupportLinkSecurity(linkSecurity, preview.url)}
-                          />
-                        ))}
-                      </div>
-                    )}
-                    {renderImageAttachments(hasDisplayContent || fileAttachments.length > 0 || linkPreviews.length > 0 ? 'mt-2' : '')}
-                    {translationFooter ? <div data-slot="support-message-footer" className="mt-1 flex items-end justify-between gap-3">
-                      {translationFooter}
-                      {renderBubbleTime('ml-auto shrink-0 text-muted-foreground')}
-                    </div> : renderBubbleTime('float-right ml-2 mt-1 text-muted-foreground')}
+                      ) : (
+                        visibleContent && (
+                          <div
+                            className="prose-chat inline [&>p:last-child]:inline"
+                            data-chat-tone={isCustomer ? 'customer' : 'agent'}
+                            data-has-table={hasTableContent ? 'true' : 'false'}
+                          >
+                            <Markdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} components={markdownComponents}>{visibleContent}</Markdown>
+                          </div>
+                        )
+                      )}
+                      {fileAttachments.length > 0 && (
+                        renderFileAttachments('default', visibleContent ? 'mt-2' : '')
+                      )}
+                      {linkPreviews.length > 0 && (
+                        <div className={`${visibleContent || fileAttachments.length > 0 ? 'mt-2' : ''} space-y-2`}>
+                          {linkPreviews.map((preview) => (
+                            <LinkPreviewCard
+                              key={`${message.id}:${preview.url}`}
+                              preview={preview}
+                              security={findSupportLinkSecurity(linkSecurity, preview.url)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                      {renderImageAttachments(hasDisplayContent || fileAttachments.length > 0 || linkPreviews.length > 0 ? 'mt-2' : '')}
+                      {translationFooter ? <div data-slot="support-message-footer" className="mt-1 flex items-end justify-between gap-3">
+                        {translationFooter}
+                        {renderBubbleTime('ml-auto shrink-0 text-muted-foreground')}
+                      </div> : renderBubbleTime('float-right ml-2 mt-1 text-muted-foreground')}
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {tooltipContent}
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+            ) : (
+              messageActionsMenu
+            )}
+            {showAvatar && (
+              <div className={`absolute bottom-0 w-7 ${isCustomer ? '-left-9' : '-right-9'}`}>
+                {avatarEl}
+              </div>
+            )}
+          </div>
+          {/* Footer shares the bubble column, so feedback stays attached to the message. */}
+          {translationStatus && <div data-slot="support-message-translation-status" className={`mt-1 flex text-xs text-muted-foreground ${isCustomer ? 'justify-start' : 'justify-end'}`}>{translationStatus}</div>}
+          {message.pending_send && <PendingSendStatus message={message}/>}
+          {!message.pending_send && (hasStatusBelow || cancellableActive || visitorFeedback !== undefined) && (
+            <div className="mt-0.5">
+              {showStandaloneEmailBadge && (
+                <div className={`mb-0.5 space-y-0.5 ${isCustomer ? '' : 'text-right'}`}>
+                  <div className={`flex ${isCustomer ? '' : 'justify-end'}`}>
+                    <button
+                      type="button"
+                      onClick={() => setEmailDetailOpen(true)}
+                      className="inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground hover:underline"
+                    >
+                      <Mail01Icon className="h-3 w-3" />
+                      {forwardedAttribution && isCustomer
+                        ? `Forwarded by ${forwardedAttribution.forwarded_by_name || forwardedAttribution.forwarded_by_email}`
+                        : inboundEmailBadgeLabel}
+                    </button>
                   </div>
-                </TooltipTrigger>
-                <TooltipContent side="top">
-                  {tooltipContent}
-                </TooltipContent>
-              </Tooltip>
-            </div>
-          ) : (
-            messageActionsMenu
-          )}
-          {visitorFeedback !== undefined && (
-            <div data-slot="support-answer-feedback" className="mt-1 flex h-5 justify-start">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span role="img" tabIndex={0} aria-label={feedbackLabel}
-                    className="inline-flex h-5 min-w-6 items-center justify-center rounded-full border border-border/60 bg-background px-1 text-sm leading-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                    {visitorFeedback ? '👍' : '👎'}
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">{feedbackLabel}</TooltipContent>
-              </Tooltip>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {visitorFeedback !== undefined && (
+                  <div data-slot="support-answer-feedback" className="mr-auto flex h-5 shrink-0 justify-start">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span role="img" tabIndex={0} aria-label={feedbackLabel}
+                          className="inline-flex h-5 min-w-6 items-center justify-center rounded-full border border-border/60 bg-background px-1 text-sm leading-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                          {visitorFeedback ? '👍' : '👎'}
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom">{feedbackLabel}</TooltipContent>
+                    </Tooltip>
+                  </div>
+                )}
+                {(aiConfidence !== null || !!aiMeta?.ai_sources?.length) && (
+                  <div className="inline-flex items-center gap-1.5 text-[11px]">
+                    {aiConfidence !== null && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 font-medium text-muted-foreground">
+                        <CheckmarkCircle02Icon className="h-3 w-3" />
+                        {(aiConfidence * 100).toFixed(0)}% confident
+                      </span>
+                    )}
+                    {!!aiMeta?.ai_sources?.length && (
+                      <Popover open={sourcesOpen} onOpenChange={setSourcesOpen}>
+                        <PopoverTrigger asChild>
+                          <button
+                            type="button"
+                            className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-muted-foreground transition-colors hover:bg-background hover:text-foreground ${sourcesOpen ? 'border-border bg-background text-foreground' : 'border-border/60 bg-muted/40'}`}
+                          >
+                            <File01Icon className="h-3 w-3" />
+                            {aiMeta.ai_sources.length} source{aiMeta.ai_sources.length > 1 ? 's' : ''}
+                            <ArrowDown01Icon className={`h-3 w-3 transition-transform ${sourcesOpen ? 'rotate-180' : ''}`} />
+                          </button>
+                        </PopoverTrigger>
+                        <PopoverContent align="end" className="w-fit max-w-sm gap-0 p-1">
+                          {aiMeta.ai_sources.map((src, idx) => {
+                            const Tag: 'a' | 'div' = src.url ? 'a' : 'div';
+                            const linkProps = src.url
+                              ? { href: src.url, target: '_blank' as const, rel: 'noopener noreferrer' }
+                              : {};
+                            return (
+                              <Tag
+                                key={src.docId}
+                                {...linkProps}
+                                className={`group flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs ${idx > 0 ? 'border-t border-border/60' : ''} ${src.url ? 'cursor-pointer text-foreground hover:bg-muted hover:text-primary' : 'text-foreground'}`}
+                              >
+                                <File01Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                                <span className={`min-w-0 break-words font-medium ${src.url ? 'group-hover:underline' : ''}`}>{src.title}</span>
+                                {src.url && (
+                                  <LinkSquare01Icon className="h-3 w-3 shrink-0 text-muted-foreground transition-colors group-hover:text-primary" />
+                                )}
+                              </Tag>
+                            );
+                          })}
+                        </PopoverContent>
+                      </Popover>
+                    )}
+                  </div>
+                )}
+                {delivery && <MessageDeliveryStatus delivery={delivery} onClick={() => setInfoOpen(true)} />}
+                {cancellableActive && (
+                  <button
+                    type="button"
+                    className="text-[11px] font-medium text-foreground transition-colors hover:text-primary hover:underline"
+                    onClick={handleUndoOrEdit}
+                    disabled={deleteMutation.isPending}
+                  >
+                    Undo
+                  </button>
+                )}
+              </div>
             </div>
           )}
         </div>
         </MessageActionsContextMenu>
 
-        {/* Right side: avatar or spacer (agent/user messages) */}
+        {/* Reserve space for the teammate/AI avatar. */}
         {!isCustomer && (
-          <div className={`ml-2 flex w-7 shrink-0 flex-col justify-end ${visitorFeedback !== undefined ? 'pb-6' : ''}`}>
-            {showAvatar && avatarEl}
-          </div>
+          <div className="ml-2 w-7 shrink-0" />
         )}
       </div>
 
@@ -1005,88 +1175,6 @@ export const MessageBubble = memo(function MessageBubble({
         onConfirm={handleDelete}
         isPending={deleteMutation.isPending}
       />
-      {/* Status below the bubble row — outside the avatar alignment */}
-      {translationStatus && <div data-slot="support-message-translation-status" className={`mt-1 flex text-xs text-muted-foreground ${isCustomer ? 'justify-start pl-9' : 'justify-end pr-9'}`}>{translationStatus}</div>}
-      {message.pending_send && <PendingSendStatus message={message}/>}
-      {!message.pending_send && (hasStatusBelow || cancellableActive) && (
-        <div className={`mt-0.5 ${isCustomer ? 'pl-9' : 'pr-9'}`}>
-          {showStandaloneEmailBadge && (
-            <div className={`mb-0.5 space-y-0.5 ${isCustomer ? '' : 'text-right'}`}>
-              <div className={`flex ${isCustomer ? '' : 'justify-end'}`}>
-                <button
-                  type="button"
-                  onClick={() => setEmailDetailOpen(true)}
-                  className="inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground hover:underline"
-                >
-                  <Mail01Icon className="h-3 w-3" />
-                  {forwardedAttribution && isCustomer
-                    ? `Forwarded by ${forwardedAttribution.forwarded_by_name || forwardedAttribution.forwarded_by_email}`
-                    : inboundEmailBadgeLabel}
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            {(aiConfidence !== null || !!aiMeta?.ai_sources?.length) && (
-              <div className="inline-flex items-center gap-1.5 text-[11px]">
-                {aiConfidence !== null && (
-                  <span className="inline-flex items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2 py-0.5 font-medium text-primary">
-                    <CheckmarkCircle02Icon className="h-3 w-3" />
-                    {(aiConfidence * 100).toFixed(0)}% confident
-                  </span>
-                )}
-                {!!aiMeta?.ai_sources?.length && (
-                  <button
-                    type="button"
-                    onClick={() => setSourcesOpen(!sourcesOpen)}
-                    aria-expanded={sourcesOpen}
-                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-muted-foreground transition-colors hover:bg-background hover:text-foreground ${sourcesOpen ? 'border-border bg-background text-foreground' : 'border-border/60 bg-muted/40'}`}
-                  >
-                    <File01Icon className="h-3 w-3" />
-                    {aiMeta.ai_sources.length} source{aiMeta.ai_sources.length > 1 ? 's' : ''}
-                    <ArrowDown01Icon className={`h-3 w-3 transition-transform ${sourcesOpen ? 'rotate-180' : ''}`} />
-                  </button>
-                )}
-              </div>
-            )}
-            {delivery && <MessageDeliveryStatus delivery={delivery} onClick={() => setInfoOpen(true)} />}
-            {cancellableActive && (
-              <button
-                type="button"
-                className="text-[11px] font-medium text-foreground transition-colors hover:text-primary hover:underline"
-                onClick={handleUndoOrEdit}
-                disabled={deleteMutation.isPending}
-              >
-                Undo
-              </button>
-            )}
-          </div>
-          {sourcesOpen && !!aiMeta?.ai_sources?.length && (
-            <div className="mt-1.5 overflow-hidden rounded-xl border bg-muted/40 p-1 shadow-sm">
-              {aiMeta.ai_sources.map((src, idx) => {
-                const Tag: 'a' | 'div' = src.url ? 'a' : 'div';
-                const linkProps = src.url
-                  ? { href: src.url, target: '_blank' as const, rel: 'noopener noreferrer' }
-                  : {};
-                return (
-                  <Tag
-                    key={src.docId}
-                    {...linkProps}
-                    className={`group flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs ${idx > 0 ? 'border-t border-border/60' : ''} ${src.url ? 'cursor-pointer text-foreground hover:bg-background hover:text-primary' : 'text-foreground'}`}
-                  >
-                    <File01Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                    <span className={`min-w-0 truncate font-medium ${src.url ? 'group-hover:underline' : ''}`}>{src.title}</span>
-                    {src.url && (
-                      <LinkSquare01Icon className="h-3 w-3 shrink-0 text-muted-foreground transition-colors group-hover:text-primary" />
-                    )}
-                  </Tag>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 });

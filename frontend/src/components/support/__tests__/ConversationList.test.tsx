@@ -16,6 +16,20 @@ const mockUseSupportInboxViews = vi.fn()
 const mockUseSupportTags = vi.fn()
 const mockUseHasAnySupportConversation = vi.fn()
 
+vi.mock('@/hooks/queries/useSupportOperations', () => {
+  const mutation = () => ({ mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false });
+  return {
+    useSLAPolicies: () => ({ data: [{ enabled: true }] }),
+    useUpdateConversationPriority: mutation,
+    useSnoozeConversation: mutation,
+    useUnsnoozeConversation: mutation,
+  };
+});
+
+vi.mock('@/hooks/queries/useCustomFields', () => ({
+  useRequestTypes: () => ({ requestTypes: [] }),
+}))
+
 vi.mock('@/hooks/queries/useSupport', () => ({
   useInfiniteConversations: (...args: unknown[]) => mockUseInfiniteConversations(...args),
   useMarkConversationRead: (...args: unknown[]) => mockUseMarkConversationRead(...args),
@@ -328,6 +342,36 @@ describe('ConversationList presence resync', () => {
     act(() => root.unmount())
   })
 
+  it('shows no loader when the open inbox empties and refetches', () => {
+    useSupportInboxStore.setState({ selectedConversationId: 'conv-last', activePanel: 'thread' })
+    const listState = (data: unknown[], isFetching: boolean) => ({
+      data: { pages: [{ data }] },
+      isLoading: false,
+      isFetching,
+      isFetchingNextPage: false,
+      hasNextPage: false,
+      fetchNextPage: vi.fn(),
+      error: null,
+    })
+    mockUseInfiniteConversations.mockReturnValue(listState([{ id: 'conv-last', status: 'open', list_last_message_at: '2026-03-27T20:02:00Z' }], false))
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(<ConversationList workspaceId="ws-1" userId="user-1" />)
+    })
+
+    // The viewer resolved the last conversation: the row left, the list refetches.
+    mockUseInfiniteConversations.mockReturnValue(listState([], true))
+    act(() => {
+      root.render(<ConversationList workspaceId="ws-1" userId="user-1" />)
+    })
+
+    expect(container.querySelectorAll('.animate-pulse')).toHaveLength(0)
+
+    act(() => root.unmount())
+  })
+
   it('keeps an existing selected conversation instead of replacing it with the first row', () => {
     useSupportInboxStore.setState({ selectedConversationId: 'conv-2', activePanel: 'thread' })
 
@@ -632,8 +676,10 @@ describe('ConversationList presence resync', () => {
     act(() => root.unmount())
   })
 
-  it('saves the current filters as a support view', () => {
-    const mutate = vi.fn((_payload, options?: { onSuccess?: () => void }) => options?.onSuccess?.())
+  it.each([true, false])('saves changed filters as a view with sharing %s', (shared) => {
+    const createdView = { id: 'new-view', name: 'Billing followups', filters: { nav_filter: 'waiting' } };
+    const onViewCreated = vi.fn();
+    const mutate = vi.fn((_payload, options?: { onSuccess?: (view: typeof createdView) => void }) => options?.onSuccess?.(createdView))
     mockUseCreateSupportInboxView.mockReturnValue({
       mutate,
       isPending: false,
@@ -657,13 +703,19 @@ describe('ConversationList presence resync', () => {
     const root = createRoot(container)
 
     act(() => {
-      root.render(<ConversationList workspaceId="ws-1" userId="user-1" canCreateSharedViews />)
+      root.render(<ConversationList workspaceId="ws-1" userId="user-1" canCreateSharedViews onViewCreated={onViewCreated} />)
     })
 
     const filterButton = container.querySelector('[aria-label="Conversation filters"]') as HTMLButtonElement
     act(() => {
       filterButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
+
+    for (const label of ['High', 'Urgent']) {
+      const priorityButton = Array.from(document.body.querySelectorAll('button')).find(button => button.textContent === label) as HTMLButtonElement
+      act(() => priorityButton.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    }
+    expect(mockUseInfiniteConversations).toHaveBeenLastCalledWith('ws-1', expect.objectContaining({ priority: 'high,urgent' }))
 
     const saveAsViewButton = Array.from(document.body.querySelectorAll('button')).find((button) => button.textContent === 'Save as new view') as HTMLButtonElement
     act(() => {
@@ -677,9 +729,8 @@ describe('ConversationList presence resync', () => {
     })
 
     const sharedSwitch = document.body.querySelector('#support-view-shared') as HTMLButtonElement
-    act(() => {
-      sharedSwitch.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-    })
+    expect(sharedSwitch.getAttribute('aria-checked')).toBe('true')
+    if (!shared) act(() => sharedSwitch.click())
 
     const saveButton = Array.from(document.body.querySelectorAll('button')).find((button) => button.textContent === 'Save') as HTMLButtonElement
     act(() => {
@@ -688,7 +739,7 @@ describe('ConversationList presence resync', () => {
 
     expect(mutate).toHaveBeenCalledWith({
       name: 'Billing followups',
-      is_shared: true,
+      is_shared: shared,
       filters: {
         nav_filter: 'waiting',
         states: 'waiting_on_customer',
@@ -696,53 +747,14 @@ describe('ConversationList presence resync', () => {
         search: 'refund',
         assignment: 'unassigned',
         tag_ids: 'tag-billing',
+        priority: 'high,urgent',
         ai: 'handoff',
         sort: 'oldest',
       },
     }, expect.any(Object))
 
-    act(() => root.unmount())
-  })
-
-  it('opens view creation from the sidebar and selects the saved view', () => {
-    const createdView = {
-      id: 'view-new',
-      workspace_id: 'ws-1',
-      name: 'Customer followups',
-      filters: { nav_filter: 'inbox' },
-      is_shared: false,
-      view_type: 'custom' as const,
-      created_by: 'user-1',
-      created_at: '2026-09-24T00:00:00Z',
-      updated_at: '2026-09-24T00:00:00Z',
-    }
-    const mutate = vi.fn((_payload, options?: { onSuccess?: (view: typeof createdView) => void }) => options?.onSuccess?.(createdView))
-    mockUseCreateSupportInboxView.mockReturnValue({ mutate, isPending: false })
-    useSupportInboxStore.setState({ createCustomViewOpen: true })
-    const onViewCreated = vi.fn()
-    const container = document.createElement('div')
-    document.body.appendChild(container)
-    const root = createRoot(container)
-
-    act(() => root.render(<ConversationList workspaceId="ws-1" userId="user-1" onViewCreated={onViewCreated} />))
-
-    expect(document.body.textContent).toContain('New view')
-    const createButton = Array.from(document.body.querySelectorAll('button')).find((button) => button.textContent === 'Create view') as HTMLButtonElement
-    expect(createButton).toBeTruthy()
-    act(() => createButton.click())
-
-    const nameInput = document.body.querySelector('#support-view-name') as HTMLInputElement
-    act(() => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(nameInput, 'Customer followups')
-      nameInput.dispatchEvent(new Event('input', { bubbles: true }))
-    })
-    const saveButton = Array.from(document.body.querySelectorAll('button')).find((button) => button.textContent === 'Save') as HTMLButtonElement
-    act(() => saveButton.click())
-
-    expect(mutate).toHaveBeenCalledWith(expect.objectContaining({ name: 'Customer followups' }), expect.any(Object))
     expect(onViewCreated).toHaveBeenCalledWith(createdView)
-    expect(useSupportInboxStore.getState().createCustomViewOpen).toBe(false)
-
+    expect(document.body.querySelector('#support-view-name')).toBeNull()
     act(() => root.unmount())
   })
 

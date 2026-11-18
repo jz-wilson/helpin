@@ -47,6 +47,7 @@ func setupDocsHelpcenterTranslationServiceTestDB(t *testing.T) *gorm.DB {
 
 	stmts := []string{
 		`CREATE TABLE docs_spaces (
+			helpcenter_audience TEXT NOT NULL DEFAULT 'public',
 			id TEXT PRIMARY KEY,
 			workspace_id TEXT NOT NULL,
 			team_id TEXT,
@@ -132,10 +133,20 @@ func setupDocsHelpcenterTranslationServiceTestDB(t *testing.T) *gorm.DB {
 			updated_at DATETIME
 		)`,
 		`CREATE TABLE docs_helpcenter_configs (
+ demo_mode BOOLEAN NOT NULL DEFAULT 0,
+ search_indexing_enabled BOOLEAN NOT NULL DEFAULT 1,
+ official_docs_url TEXT NOT NULL DEFAULT '',
 			id TEXT PRIMARY KEY,
 			workspace_id TEXT NOT NULL UNIQUE,
 			subdomain TEXT NOT NULL,
 			custom_domain TEXT,
+			custom_domain_status TEXT,
+			custom_domain_token TEXT,
+			custom_domain_verified_at DATETIME,
+			custom_domain_checked_at DATETIME,
+			custom_domain_last_error TEXT,
+			custom_domain_failing_since DATETIME,
+			custom_domain_alerted_status TEXT,
 			public_url_mode TEXT NOT NULL DEFAULT 'hosted_subdomain',
 			reverse_proxy_host TEXT,
 			reverse_proxy_base_path TEXT,
@@ -169,6 +180,7 @@ func setupDocsHelpcenterTranslationServiceTestDB(t *testing.T) *gorm.DB {
 			updated_at DATETIME
 		)`,
 		`CREATE TABLE docs_helpcenter_articles (
+			customer_published_at DATETIME,
 			id TEXT PRIMARY KEY,
 			document_id TEXT NOT NULL UNIQUE,
 			public_id TEXT NOT NULL DEFAULT '',

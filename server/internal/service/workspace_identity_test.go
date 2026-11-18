@@ -182,7 +182,7 @@ func TestWorkspaceRepositoryListSupportAssignableMembers(t *testing.T) {
 		created_at DATETIME,
 		updated_at DATETIME
 	)`)
-	mustExecWorkspaceIdentity(t, db, `CREATE TABLE IF NOT EXISTS support_mailboxes (
+	mustExecWorkspaceIdentity(t, db, `CREATE TABLE IF NOT EXISTS support_mailboxes (ai_replies_disabled BOOLEAN NOT NULL DEFAULT false,
 		id TEXT PRIMARY KEY,
 		workspace_id TEXT NOT NULL,
 		name TEXT NOT NULL,
@@ -744,6 +744,7 @@ func newWorkspaceIdentityTestDB(t *testing.T) *gorm.DB {
 			website_url TEXT,
 			logo_url TEXT,
 			timezone TEXT NOT NULL,
+			link_previews_enabled BOOLEAN NOT NULL DEFAULT true,
 			created_at DATETIME,
 			updated_at DATETIME
 		)`,
@@ -759,6 +760,7 @@ func newWorkspaceIdentityTestDB(t *testing.T) *gorm.DB {
 			invited_at DATETIME,
 			accepted_at DATETIME,
 			support_default_team_id TEXT,
+			support_task_team_by_inbox TEXT NOT NULL DEFAULT '{}',
 			support_task_dialog_dismissed BOOLEAN NOT NULL DEFAULT 0,
 			created_at DATETIME,
 			updated_at DATETIME

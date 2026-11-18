@@ -1,3 +1,4 @@
+import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useParams, useRouter, useSearch } from '@tanstack/react-router'
@@ -10,7 +11,6 @@ import {
   Calendar03Icon,
   Tick01Icon,
   Clock01Icon,
-  Copy01Icon,
   ViewIcon,
   LinkSquare01Icon,
   FolderOpenIcon,
@@ -34,12 +34,11 @@ import {
 import { StoredIcon } from '@/components/ui/icon-picker'
 import { toast } from 'sonner'
 import { useTitle } from '@/hooks/useTitle'
-import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
 import { useWorkspaceTeams } from '@/hooks/useWorkspaceTeams'
 import { useAuthStore } from '@/stores/authStore'
 import { useDocsPresenceStore } from '@/stores/docsPresenceStore'
 import { useWorkspaceStore } from '@/stores/workspaceStore'
-import { useWSStore } from '@/hooks/useWebSocket'
+import { useDocsPresence } from '@/hooks/useDocsPresence'
 import {
   useDocsDocument,
   useDocsContent,
@@ -101,8 +100,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
-import { DocsEditor, SaveIndicator, type DocsCommentAnchor, type DocsCommentAnchorDecoration, type DocsEditingPresenceSignal, type SaveStatus } from '@/components/docs/DocsEditor'
+import { DocsEditor, SaveIndicator, type DocsCommentAnchor, type DocsCommentAnchorDecoration, type SaveStatus } from '@/components/docs/DocsEditor'
+import { DocsSharePopover } from '@/components/docs/DocsSharePopover'
+import { DocsDocumentLayout } from '@/components/docs/DocsDocumentLayout'
 import { SlugDisplay } from '@/components/docs/SlugDisplay'
 import {
   buildCollectionTree,
@@ -130,6 +130,7 @@ import { CommentThread } from '@/components/pm/CommentThread'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { getHelpcenterLocaleLabel } from '@/lib/docsTypes'
 import { suggestDocsSlug } from '@/lib/docsSlugs'
+import { buildHelpcenterArticleUrl } from '@/lib/helpcenterArticleUrl'
 import { buildHelpcenterPreviewUrlFromEnv } from '@/lib/helpcenterPreview'
 import { docsService } from '@/lib/services/docsService'
 import { docsCommentService } from '@/lib/services/docsCommentService'
@@ -526,7 +527,7 @@ export function DocsDocumentDetail({
   })
   const remoteViewers = useDocsPresenceStore((s) => s.viewingUsers[docId] ?? EMPTY_DOC_VIEWERS)
   const remoteEditors = useDocsPresenceStore((s) => s.editingUsers[docId] ?? EMPTY_DOC_EDITORS)
-  const wsSendRaw = useWSStore((s) => s.send)
+  const handleEditingPresenceChange = useDocsPresence(doc ? docId : '')
   const { data: collections = [] } = useDocsCollections(wsId, doc?.space_id ?? '')
   const { data: spaceTranslations = [] } = useDocsHelpcenterSpaceTranslations(wsId, doc?.space_id ?? '')
   const { data: collectionTranslations = [] } = useDocsHelpcenterCollectionTranslations(wsId, doc?.collection_id ?? '')
@@ -673,7 +674,6 @@ export function DocsDocumentDetail({
   const [pendingSlug, setPendingSlug] = useState('')
   const [pendingPublishLocale, setPendingPublishLocale] = useState<string | null>(null)
   const [proposalStatusMessage, setProposalStatusMessage] = useState('')
-  const { copied: linkCopied, copy: copyLink } = useCopyToClipboard()
 
   // Version preview state — when set, the editor shows version content read-only
   const [previewVersion, setPreviewVersion] = useState<DocsVersion | null>(null)
@@ -870,38 +870,6 @@ export function DocsDocumentDetail({
     }
   }, [wsId])
 
-  useEffect(() => {
-    if (!docId || !wsSendRaw) return
-
-    wsSendRaw({ type: 'docs:presence:sync', data: { document_ids: [docId] } })
-    wsSendRaw({ type: 'docs:viewing:start', data: { document_id: docId } })
-
-    return () => {
-      wsSendRaw({ type: 'docs:viewing:stop', data: { document_id: docId } })
-    }
-  }, [docId, wsSendRaw])
-
-  const handleEditingPresenceChange = useCallback((presence: DocsEditingPresenceSignal | null) => {
-    if (!docId || !wsSendRaw) return
-    if (presence) {
-      wsSendRaw({
-        type: 'docs:editing:update',
-        data: {
-          document_id: docId,
-          area: presence.area,
-          section: presence.section,
-        },
-      })
-      return
-    }
-    wsSendRaw({
-      type: 'docs:editing:stop',
-      data: {
-        document_id: docId,
-      },
-    })
-  }, [docId, wsSendRaw])
-
   const handleCreateCommentAnchor = useCallback((anchor: DocsCommentAnchor) => {
     setCommentAnchor(anchor)
     setActiveCommentId(null)
@@ -970,6 +938,8 @@ export function DocsDocumentDetail({
   }, [createRepairVersion, docId, handleSave])
 
   const isExternalHelpCenter = space?.type === 'external_capable'
+  // Articles for signed-in customers are read in the portal; they have no public address.
+  const isCustomersOnly = isExternalHelpCenter && space?.helpcenter_audience === 'customers'
   const { data: helpcenterConfig } = useDocsHelpcenterConfig(wsId)
   const defaultLocale = localesConfig?.default_locale ?? 'en'
   const enabledLocales = localesConfig?.enabled_locales?.length
@@ -1027,6 +997,18 @@ export function DocsDocumentDetail({
   const activeTranslationDraft = isSourceLocaleActive
     ? emptyTranslationDraft(activeLocale)
     : translationDrafts[translationDraftKey(docId, activeLocale)] ?? translationDraftFromTranslation(activeLocale, activeTranslation)
+  useUnsavedChangesGuard(Boolean(doc) && (
+    updateDoc.isPending || upsertArticleTranslation.isPending || savingSourceSocial || uploadingSourceOGImage ||
+    (titleDraftState?.docId === docId && titleDraftState.value.trim() !== doc?.title) ||
+    sourceSocialDraft.og_title !== (doc?.hc_og_title ?? '') || sourceSocialDraft.og_description !== (doc?.hc_og_description ?? '') ||
+    sourceSocialDraft.og_image_url !== (doc?.hc_og_image_url ?? '') || sourceSocialDraft.og_image_alt !== (doc?.hc_og_image_alt ?? '') ||
+    Object.entries(translationDrafts).some(([key, draft]) => {
+      if (!key.startsWith(`${docId}:`)) return false
+      const saved = articleTranslationsByLocale.get(draft.locale)
+      return draft.title.trim() !== (saved?.title ?? '') || (Boolean(draft.slug.trim()) && draft.slug.trim() !== (saved?.slug ?? '')) || draft.excerpt.trim() !== (saved?.excerpt ?? '')
+    })
+  ), 'Save your document changes before refreshing.')
+
   const displayedTitle = isSourceLocaleActive ? titleDraft : activeTranslationDraft.title
   const outlineContent = previewVersion
     ? previewVersion.content as JSONContent | null
@@ -1325,13 +1307,23 @@ export function DocsDocumentDetail({
   const activePublishLabel = !isPublished
     ? `Publish${localeSuffix}`
     : hasUnpublishedChanges
-      ? `Publish update${localeSuffix}`
+      ? `Update${localeSuffix}`
       : `Published${localeSuffix}`
   const showContextualPublish = canPublishDocs && doc?.status !== 'archived'
   const parentTranslationsMissing = !isSourceLocaleActive && Boolean(activeLocaleRow?.publishBlockedReason)
   const publishDisabled = isSourceLocaleActive
     ? publishDoc.isPending || doc?.is_locked || (isPublished && !hasUnpublishedChanges)
     : !activeTranslation || publishArticleTranslation.isPending || doc?.is_locked || (isPublished && !hasUnpublishedChanges)
+  const canPreviewArticle = isExternalHelpCenter && isSourceLocaleActive && (!isPublished || hasUnpublishedChanges)
+  const getPreviewUrl = async () => {
+    const res = await docsService.getPreviewToken(wsId, docId)
+    if (res.error || !res.data) throw new Error(res.error || 'Failed to generate preview')
+    const { token, subdomain, custom_domain } = res.data
+    return buildHelpcenterPreviewUrlFromEnv({ subdomain, customDomain: custom_domain }, docId, token)
+  }
+  const liveArticleUrl = isExternalHelpCenter && isPublished && !isCustomersOnly
+    ? buildHelpcenterArticleUrl(helpcenterConfig, isSourceLocaleActive ? doc?.live_slug : activeTranslation?.live_slug, doc?.hc_public_id, activeLocale)
+    : null
   const activeSlug = isSourceLocaleActive ? doc?.hc_slug : activeTranslationDraft.slug
   const handleActiveSlugChange = effectiveReadOnly || !activeSlug
     ? undefined
@@ -1427,7 +1419,7 @@ export function DocsDocumentDetail({
   }
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto lg:overflow-hidden">
+    <DocsDocumentLayout content={<>
       <div className="sr-only" aria-live="polite" aria-atomic="true">
         {proposalStatusMessage}
       </div>
@@ -1475,7 +1467,7 @@ export function DocsDocumentDetail({
           </span>
         ) : (
           <span className="shrink-0 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-            Published{showLocalePills ? ` · ${activeLocaleShortLabel}` : isExternalHelpCenter ? ' · help center' : ' · internal'}
+            Published{showLocalePills ? ` · ${activeLocaleShortLabel}` : isExternalHelpCenter ? '' : ' · internal'}
             {hasUnpublishedChanges ? <span className="ml-1 text-amber-600 dark:text-amber-400"> · Unpublished changes</span> : null}
           </span>
         )}
@@ -1487,44 +1479,51 @@ export function DocsDocumentDetail({
                 <span className={cn('hidden text-[11.5px] font-medium sm:inline', activeDocEditors.length > 0 ? 'text-quiet-accent' : 'text-quiet-muted')}>
                   {activeDocEditors.length > 0 ? 'Editing now' : 'Viewing now'}
                 </span>
-                <div className="flex items-end gap-1.5">
+                <div className="flex items-center gap-1.5">
                   {headerPresencePeople.slice(0, 4).map((person) => (
                     <QuickTooltip key={person.userId} label={person.tooltip}>
-                      <div className="relative pb-1">
+                      <div className="relative flex size-7 shrink-0 items-center justify-center">
                         <UserAvatar
                           name={person.name}
                           avatarUrl={person.avatarUrl}
-                          className={person.isEditing ? 'h-6 w-6 ring-1 ring-quiet-accent/30' : 'h-6 w-6 opacity-75'}
+                          className={person.isEditing ? 'size-7 ring-1 ring-quiet-accent/30' : 'size-7 opacity-75'}
                           fallbackClassName="text-[8px]"
                         />
                         {person.isEditing && <EditingIndicator />}
                       </div>
                     </QuickTooltip>
                   ))}
-                  {headerPresencePeople.length > 4 ? <AvatarGroupCount className="size-6 text-[10px]">+{headerPresencePeople.length - 4}</AvatarGroupCount> : null}
+                  {headerPresencePeople.length > 4 ? <AvatarGroupCount className="size-7 text-[10px]">+{headerPresencePeople.length - 4}</AvatarGroupCount> : null}
                 </div>
               </div>
             ) : null}
             <div className="order-first flex items-center gap-1.5 sm:order-none sm:gap-3">
-              {isExternalHelpCenter ? (
+              {canPreviewArticle ? (
                 <QuietDetailAction
                   icon={<ViewIcon className="h-3.5 w-3.5" />}
                   label="Preview"
                   onClick={async () => {
                     try {
-                      const res = await docsService.getPreviewToken(wsId, docId)
-                      if (res.error || !res.data) {
-                        toast.error(res.error || 'Failed to generate preview')
-                        return
-                      }
-                      const { token, subdomain, custom_domain } = res.data
-                      window.open(buildHelpcenterPreviewUrlFromEnv({ subdomain, customDomain: custom_domain }, docId, token), '_blank', 'noopener')
+                      window.open(await getPreviewUrl(), '_blank', 'noopener')
                     } catch {
                       toast.error('Failed to generate preview')
                     }
                   }}
                 />
               ) : null}
+              {(isExternalHelpCenter || isSourceLocaleActive) && canEditDocs && <DocsSharePopover
+                helpCenter={isExternalHelpCenter ? { published: isPublished, liveUrl: liveArticleUrl, canPreview: canPreviewArticle, previewDisabledReason: !isSourceLocaleActive ? 'Original language only' : undefined, getPreviewUrl } : undefined}
+                shared={doc.is_publicly_shared}
+                shareToken={doc.share_token}
+                disabled={toggleShare.isPending}
+                onToggle={(checked) => toggleShare.mutate(
+                  { docId, isPubliclyShared: checked },
+                  {
+                    onSuccess: () => toast.success(checked ? 'Public link enabled' : 'Public link disabled'),
+                    onError: (err) => toast.error(err instanceof Error ? err.message : 'Failed to toggle share'),
+                  },
+                )}
+              />}
               {showContextualPublish && !(isPublished && !hasUnpublishedChanges) ? (
                 <QuietDetailAction
                   tone="primary"
@@ -1623,14 +1622,19 @@ export function DocsDocumentDetail({
       {/* Lock banner */}
       {doc.is_locked && (() => {
         const locker = doc.locked_by ? members.find((m) => m.user_id === doc.locked_by) : null
-        const lockerName = locker ? formatAssignableMemberName(locker) : 'someone'
+        const lockerName = locker ? formatAssignableMemberName(locker) : 'Someone'
+        const lockedByYou = Boolean(doc.locked_by && doc.locked_by === currentUserId)
         return (
           <div className="flex items-center gap-2 border-b border-blue-500/30 bg-blue-500/10 px-4 py-2">
             <LockIcon className="h-4 w-4 text-blue-600 dark:text-blue-400" />
             <span className="text-sm text-blue-700 dark:text-blue-300">
-              {canUnlock
-                ? `This document is locked${doc.locked_by ? ` by ${lockerName}` : ''}. Unlock to edit.`
-                : `This document is locked by ${lockerName}. Contact them or an admin to unlock it.`}
+              {lockedByYou ? (
+                'You locked this document for editing. You, a workspace admin, or the workspace owner can unlock it.'
+              ) : (
+                <>
+                  <strong>{lockerName}</strong> locked this document for editing. Only the person who locked it, a workspace admin, or the workspace owner can unlock it.
+                </>
+              )}
             </span>
             {canUnlock && (
               <Button
@@ -1868,10 +1872,11 @@ export function DocsDocumentDetail({
             />
           )}
         </div>
+      </div>
+      )}
 
-        {/* Right rail: swap between Overview / Comments / History / Linked / References */}
-        {railOpen && (
-          <aside className="flex w-[300px] shrink-0 flex-col overflow-hidden border-l border-border/60">
+    </>} sidebar={railOpen && !proposalSearchId ? (
+      <>
             <DocsRailHeader
               title={
                 railView === 'comments' ? 'Comments'
@@ -1907,7 +1912,7 @@ export function DocsDocumentDetail({
                     'text-amber-600 dark:text-amber-400'
                   }`}>
                     {doc.status === 'published'
-                      ? `Published · ${isExternalHelpCenter ? 'help center' : 'internal'}`
+                      ? `Published · ${isCustomersOnly ? 'signed-in customers' : isExternalHelpCenter ? 'help center' : 'internal'}`
                       : doc.status === 'archived' ? 'Archived' : 'Draft'}
                   </span>
                 </div>
@@ -1928,7 +1933,7 @@ export function DocsDocumentDetail({
                     'text-amber-600 dark:text-amber-400'
                   }`}>
                     {activeTranslationStatus === 'published'
-                      ? `Published · ${isExternalHelpCenter ? 'help center' : 'internal'}`
+                      ? `Published · ${isCustomersOnly ? 'signed-in customers' : isExternalHelpCenter ? 'help center' : 'internal'}`
                       : activeTranslationStatus === 'needs_review' ? 'Needs review' : 'Draft'}
                   </span>
                 </div>
@@ -2000,49 +2005,6 @@ export function DocsDocumentDetail({
                   <Button type="button" size="sm" className="h-8 w-full text-xs" disabled={savingSourceSocial || doc.is_locked} onClick={() => void handleSaveSourceSocial()}>
                     {savingSourceSocial ? 'Saving...' : 'Save social preview'}
                   </Button>
-                </div>
-                <Separator className="my-4" />
-              </>
-            )}
-
-            {/* ── Sharing (source locale only) ── */}
-            {isSourceLocaleActive && canEditDocs && (
-              <>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-1.5">
-                      <Link01Icon className="h-3.5 w-3.5 text-muted-foreground" />
-                      <span className="text-xs text-muted-foreground">Public link</span>
-                    </div>
-                    <Switch
-                      checked={doc.is_publicly_shared}
-                      onCheckedChange={(checked) => {
-                        toggleShare.mutate(
-                          { docId, isPubliclyShared: checked },
-                          {
-                            onSuccess: () => toast.success(checked ? 'Public link enabled' : 'Public link disabled'),
-                            onError: (err) => toast.error(err instanceof Error ? err.message : 'Failed to toggle share'),
-                          },
-                        )
-                      }}
-                      disabled={toggleShare.isPending || doc.is_locked}
-                    />
-                  </div>
-                  {doc.is_publicly_shared && doc.share_token && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="w-full h-7 gap-1.5 text-xs"
-                      onClick={() => {
-                        const url = `${window.location.origin}/share/${doc.share_token}`
-                        copyLink(url)
-                        toast.success('Link copied to clipboard')
-                      }}
-                    >
-                      {linkCopied ? <Tick01Icon className="h-3 w-3" /> : <Copy01Icon className="h-3 w-3" />}
-                      {linkCopied ? 'Copied!' : 'Copy link'}
-                    </Button>
-                  )}
                 </div>
                 <Separator className="my-4" />
               </>
@@ -2463,11 +2425,8 @@ export function DocsDocumentDetail({
               </div>
             )}
             </div>
-          </aside>
-        )}
-
-      </div>
-      )}
+      </>
+    ) : null}>
 
       {editingTranslationLocale && (
         <EditArticleTranslationDialog
@@ -2609,6 +2568,6 @@ export function DocsDocumentDetail({
         onConfirm={handleConfirmPublish}
         isPublishing={pendingPublishLocale && pendingPublishLocale !== defaultLocale ? publishArticleTranslation.isPending : publishDoc.isPending}
       />
-    </div>
+    </DocsDocumentLayout>
   )
 }

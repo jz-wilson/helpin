@@ -17,6 +17,7 @@ function createChain() {
   const chain = {
     focus: vi.fn(() => chain),
     setTextSelection: vi.fn(() => chain),
+    clearNodes: vi.fn(() => chain),
     setResizableImage: vi.fn(() => chain),
     setVideoEmbed: vi.fn(() => chain),
     setEntityEmbed: vi.fn(() => chain),
@@ -165,6 +166,7 @@ vi.mock('../EntityEmbedDialog', () => ({ EntityEmbedDialog: () => null }))
 vi.mock('../TableControls', () => ({ TableControls: () => null }))
 vi.mock('../BlockGapInserter', () => ({ BlockGapInserter: () => null }))
 vi.mock('../SlashMenu', () => ({ SlashMenu: () => null }))
+vi.mock('../DocsAISelectionMenu', () => ({ DocsAISelectionMenu: () => null }))
 
 vi.mock('@/hooks/useEditorImageUpload', () => ({
   uploadEditorImage: (...args: unknown[]) => testState.uploadEditorImage(...args),
@@ -263,6 +265,9 @@ vi.mock('@/lib/icons', () => {
 })
 
 import { DocsEditor } from '../DocsEditor'
+import { prepareAppRefresh } from '@/lib/appLoadRecovery'
+
+vi.mock('@tanstack/react-router', () => ({ useRouter: () => null }))
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -303,6 +308,80 @@ describe('DocsEditor', () => {
     container.remove()
     vi.runOnlyPendingTimers()
     vi.useRealTimers()
+  })
+
+  it('anchors Text format outside the toolbar layout and keeps it open when interacting with the menu', async () => {
+    await act(async () => root.render(<DocsEditor onSave={vi.fn()} />))
+    await markEditorReady()
+    const editor = testState.editorBundle!.editor
+    editor.state.selection = { ...editor.state.selection, from: 1, to: 3, empty: false }
+    const rect = { left: 200, right: 400, top: 200, bottom: 225, width: 200, height: 25 }
+    const range = { getBoundingClientRect: () => rect, cloneRange: () => range }
+    const selectionSpy = vi.spyOn(window, 'getSelection').mockReturnValue({ rangeCount: 1, getRangeAt: () => range } as unknown as Selection)
+    try {
+      const update = editor.on.mock.calls.find(([event]) => event === 'selectionUpdate')?.[1]
+      await act(async () => update?.())
+      const trigger = Array.from(container.querySelectorAll('button')).find(button => button.textContent?.includes('Text format'))
+      expect(trigger).toBeTruthy()
+      await act(async () => trigger!.click())
+      const menu = document.querySelector('[data-slot="popover-content"]')
+      expect(menu?.textContent).toContain('Blockquote')
+      expect(container.contains(menu)).toBe(false)
+      expect(menu?.getAttribute('data-align')).toBe('end')
+      await act(async () => menu!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })))
+      expect(document.querySelector('[data-slot="popover-content"]')).not.toBeNull()
+      await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+      expect(document.querySelector('[data-slot="popover-content"]')).toBeNull()
+      await act(async () => trigger!.click())
+      const normal = Array.from(document.querySelectorAll('[data-slot="popover-content"] button')).find(button => button.textContent === 'Normal')
+      await act(async () => (normal as HTMLButtonElement).click())
+      expect(editor.chain().clearNodes).toHaveBeenCalledOnce()
+      expect(document.querySelector('[data-slot="popover-content"]')).toBeNull()
+    } finally {
+      selectionSpy.mockRestore()
+    }
+  })
+
+  it('blocks release refresh until the latest edit has finished saving, including edits queued behind an earlier save', async () => {
+    const saves: Array<() => void> = []
+    const onSave = vi.fn(() => new Promise<void>(resolve => saves.push(resolve)))
+    await act(async () => root.render(<DocsEditor onSave={onSave} autoSaveMs={25} />))
+    await markEditorReady()
+    expect(prepareAppRefresh()).toBeNull()
+    const edit = async (text: string) => {
+      testState.editorBundle?.setCurrentJson({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] })
+      await act(async () => testState.editorOptions?.onUpdate?.({ editor: testState.editorBundle?.editor }))
+    }
+    await edit('First edit')
+    expect(prepareAppRefresh()).toContain('document')
+    await act(async () => { vi.advanceTimersByTime(25) })
+    await edit('Latest edit')
+    await act(async () => saves[0]())
+    // The first save finishing must not allow refresh during the next debounce.
+    expect(prepareAppRefresh()).toContain('document')
+    await act(async () => { vi.advanceTimersByTime(25) })
+    await act(async () => saves[1]())
+    expect(prepareAppRefresh()).toBeNull()
+  })
+
+  it('keeps refresh blocked after a failed document save', async () => {
+    const onSave = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValue(new Error('Offline'))
+    await act(async () => root.render(<DocsEditor onSave={onSave} autoSaveMs={25} />))
+    await markEditorReady()
+    testState.editorBundle?.setCurrentJson({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Saved edit' }] }] })
+    await act(async () => {
+      testState.editorOptions?.onUpdate?.({ editor: testState.editorBundle?.editor })
+      vi.advanceTimersByTime(25)
+    })
+    expect(prepareAppRefresh()).toBeNull()
+    testState.editorBundle?.setCurrentJson({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Unsent edit' }] }] })
+    await act(async () => {
+      testState.editorOptions?.onUpdate?.({ editor: testState.editorBundle?.editor })
+      vi.advanceTimersByTime(25)
+    })
+    expect(prepareAppRefresh()).toContain('document')
+    await act(async () => { vi.advanceTimersByTime(5000) })
+    expect(prepareAppRefresh()).toContain('document')
   })
 
   it('can suppress the editor title when page chrome owns it', async () => {

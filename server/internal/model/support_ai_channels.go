@@ -16,16 +16,32 @@ func SupportAIChannelEnabled(settings SupportInboxSettings, channel string) bool
 	if channel == "" || channel == "widget" {
 		channel = "chat"
 	}
-	if channel != "chat" && channel != "email" {
+	mode := SupportAIModeNone
+	if channel == string(SupportAIModeChat) { // SupportAIReplyChannel's widget alias
+		mode = SupportAIModeChat
+	} else if spec, ok := LookupSupportChannel(channel); ok {
+		mode = spec.AIMode
+	}
+	switch mode {
+	case SupportAIModePortal:
+		return settings.PortalAIDraftsEnabled()
+	case SupportAIModeChat, SupportAIModeEmail:
+		return selection == "both" || selection == string(mode)
+	default:
 		return false
 	}
-	return selection == "both" || selection == channel
 }
 
 // SupportAIReplyAllowed checks the incoming medium, falling back to the
 // conversation channel for scheduled work. Email continuations count as email.
 func SupportAIReplyAllowed(settings SupportInboxSettings, conversation *SupportConversation, message *SupportMessage) bool {
+	if conversation != nil && conversation.MailboxAIRepliesDisabled {
+		return false
+	}
 	channel := SupportAIReplyChannel(conversation, message)
+	if channel == "portal" && (conversation == nil || !conversation.PortalVisible) {
+		return false
+	}
 	if message != nil {
 		if conversation != nil && conversation.AIResumedAt != nil && !message.CreatedAt.After(*conversation.AIResumedAt) {
 			return false
@@ -93,5 +109,5 @@ func SupportAIConversationBlocked(c *SupportConversation) bool {
 		return true
 	}
 	nonempty := func(s *string) bool { return s != nil && strings.TrimSpace(*s) != "" }
-	return c.AnonymizedAt != nil || c.MergedIntoID != nil || c.AIPausedAt != nil || (c.HumanTakeover != nil && *c.HumanTakeover) || c.CustomerRequestedHumanAt != nil || nonempty(c.AssignedUserID) || nonempty(c.OpenedByUserID) || (c.AIState != nil && *c.AIState == "escalated") || (c.Status == "resolved" && (c.AIState == nil || *c.AIState != "resolved")) || c.Status == "spam"
+	return c.MailboxAIRepliesDisabled || c.AnonymizedAt != nil || c.MergedIntoID != nil || c.AIPausedAt != nil || (c.HumanTakeover != nil && *c.HumanTakeover) || c.CustomerRequestedHumanAt != nil || nonempty(c.AssignedUserID) || nonempty(c.OpenedByUserID) || (c.AIState != nil && *c.AIState == "escalated") || (c.Status == "resolved" && (c.AIState == nil || *c.AIState != "resolved")) || c.Status == "spam"
 }

@@ -137,7 +137,7 @@ func TestSupportMCPCustomerRequiresVerifiedWidgetEmail(t *testing.T) {
 }
 
 func TestSupportMCPReviewReceivesActualResultAndFullReply(t *testing.T) {
-	provider := &scriptedSupportRewriteLLM{response: llm.ChatResponse{Content: `{"customer_scoped":true,"supported":true,"safe":true,"confidence":0.9}`}}
+	provider := &scriptedSupportRewriteLLM{response: llm.ChatResponse{Content: `{"allowed":true,"unsupported_claims":[],"customer_scoped":true,"supported":true,"safe":true,"confidence":0.9}`}}
 	svc := &SupportAIService{llmProvider: provider}
 	contract := &AIResponseContract{Content: "Your import failed.", Confidence: .95, Claims: []AIResponseClaim{{Text: "Your import failed.", EvidenceIDs: []string{"mcp__logs__lookup"}}}}
 	evidence := []KnowledgeSearchResult{{ID: "mcp__logs__lookup", SourceType: "external_mcp", Content: `{"email":"customer@example.com","status":"failed"}`}}
@@ -175,7 +175,7 @@ func TestSupportMCPReplyPublishesFromAuditedEvidence(t *testing.T) {
 			mustExec(t, db, `INSERT INTO external_mcp_tools VALUES ('tool','ws','server','mcp__logs__lookup','read',true)`)
 			runtime := &fakeAgentRuntimeSignalClient{toolCalls: map[string][]AgentRuntimeToolCall{"runtime-run": {{ID: "call", RunID: "runtime-run", ToolName: "mcp__logs__lookup", CreatedAt: time.Now(), Input: json.RawMessage(`{"email":"customer@example.com"}`), Output: json.RawMessage(`{"email":"customer@example.com","status":"failed","cause":"duplicate headers","token":"private-secret"}`)}}}}
 			commands.agentService = &AgentService{agentRuntimeClient: runtime, externalMCPService: &ExternalMCPService{repo: repository.NewExternalMCPRepository(db)}}
-			provider := &scriptedSupportRewriteLLM{response: llm.ChatResponse{Content: `{"customer_scoped":true,"supported":true,"safe":true,"confidence":0.96}`}}
+			provider := &scriptedSupportRewriteLLM{response: llm.ChatResponse{Content: `{"allowed":true,"unsupported_claims":[],"customer_scoped":true,"supported":true,"safe":true,"confidence":0.96}`}}
 			commands.supportAIService.llmProvider = provider
 			input := json.RawMessage(`{"content":"Your import failed because of duplicate headers.","reply_kind":"answer","confidence":0.95,"source_doc_ids":["mcp__logs__lookup"],"claims":[{"text":"Your import failed because of duplicate headers.","evidence_ids":["mcp__logs__lookup"]}]}`)
 			output, err := commands.executeSupportSendReply(context.Background(), meta, input)
@@ -219,6 +219,45 @@ func TestSupportMCPReplyPublishesFromAuditedEvidence(t *testing.T) {
 			}
 			if count != 0 {
 				t.Fatal("raw MCP result was persisted as knowledge")
+			}
+		})
+	}
+}
+
+func TestSupportHandoffCustomerUpdateUsesReplyFactCheck(t *testing.T) {
+	cited := []AIResponseClaim{{Text: "Your import started but did not finish.", EvidenceIDs: []string{"mcp__logs__lookup"}}}
+	tests := []struct {
+		name   string
+		review string
+		claims []AIResponseClaim
+		want   string
+	}{
+		{name: "supported update is kept", review: `{"allowed":true,"unsupported_claims":[],"customer_scoped":true,"supported":true,"safe":true,"confidence":0.96}`, claims: cited, want: "Your import started but did not finish."},
+		{name: "unsupported update is dropped", review: `{"allowed":true,"unsupported_claims":[],"customer_scoped":true,"supported":false,"safe":true,"confidence":0.96}`, claims: cited},
+		{name: "low confidence update is dropped", review: `{"allowed":true,"unsupported_claims":[],"customer_scoped":true,"supported":true,"safe":true,"confidence":0.2}`, claims: cited},
+		{name: "uncited update skips review", claims: []AIResponseClaim{{Text: "Your import started but did not finish."}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, commands, db, conv, _, meta := setupSupportProgressTest(t)
+			mustExec(t, db, `UPDATE support_conversations SET customer_email='customer@example.com' WHERE id='conv'`)
+			conv.CustomerEmail = strPtr("customer@example.com")
+			mustExec(t, db, `INSERT INTO support_widget_sessions(id,workspace_id,conversation_id,session_token,customer_email,identity_method,identity_trust,expires_at,created_at) VALUES ('session','ws','conv','token','customer@example.com','signed_widget',?,?,?)`, model.IdentityTrustVerified, time.Now().Add(time.Hour), time.Now())
+			mustExec(t, db, `CREATE TABLE external_mcp_servers(id TEXT PRIMARY KEY, workspace_id TEXT, enabled BOOLEAN)`)
+			mustExec(t, db, `CREATE TABLE external_mcp_tools(id TEXT PRIMARY KEY, workspace_id TEXT, server_id TEXT, runtime_alias TEXT, access TEXT, enabled BOOLEAN)`)
+			mustExec(t, db, `INSERT INTO external_mcp_servers VALUES ('server','ws',true)`)
+			mustExec(t, db, `INSERT INTO external_mcp_tools VALUES ('tool','ws','server','mcp__logs__lookup','read',true)`)
+			runtime := &fakeAgentRuntimeSignalClient{toolCalls: map[string][]AgentRuntimeToolCall{"runtime-run": {{ID: "call", RunID: "runtime-run", ToolName: "mcp__logs__lookup", CreatedAt: time.Now(), Output: json.RawMessage(`{"email":"customer@example.com","import":"started","finished":false}`)}}}}
+			commands.agentService = &AgentService{agentRuntimeClient: runtime, externalMCPService: &ExternalMCPService{repo: repository.NewExternalMCPRepository(db)}}
+			provider := &scriptedSupportRewriteLLM{response: llm.ChatResponse{Content: tt.review}}
+			commands.supportAIService.llmProvider = provider
+
+			got := commands.checkedSupportHandoffUpdate(context.Background(), meta, conv, "source", " Your import started but did not finish. ", tt.claims)
+			if got != tt.want {
+				t.Fatalf("update = %q, want %q", got, tt.want)
+			}
+			if tt.review == "" && len(provider.lastReq.Messages) != 0 {
+				t.Fatal("uncited update reached the reviewer")
 			}
 		})
 	}

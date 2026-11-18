@@ -50,9 +50,22 @@ export interface CRMContact {
   owner_member_id?: string;
   avatar_url?: string;
   source?: string;
+  /** Customer portal decision; only support admins can change it. */
+  portal_access?: 'allowed' | 'blocked' | null;
   custom_properties: Record<string, unknown>;
+  /** Synced product-usage data; absent when no product events match the contact. */
+  behavior?: CRMBehaviorSummary;
   created_at: string;
   updated_at: string;
+}
+
+/** Product-usage data synced from tracked events onto a contact or company. */
+interface CRMBehaviorSummary {
+  first_seen_at: string;
+  last_seen_at: string;
+  sessions_30d: number;
+  match_methods: Array<'identity_link' | 'record_id' | 'external_id' | 'email'>;
+  computed_at: string;
 }
 
 export interface CreateCRMContactRequest {
@@ -136,6 +149,8 @@ export interface CRMCompany {
     rejected_update_count: number;
   };
   custom_properties: Record<string, unknown>;
+  /** Synced product-usage data; absent when no product events match the company. */
+  behavior?: CRMBehaviorSummary;
   created_at: string;
   updated_at: string;
 }
@@ -1277,4 +1292,38 @@ export interface CRMSearchResult {
   name: string;
   detail: string;
   object: CRMContact | CRMCompany | CRMDeal;
+}
+
+/** A value in use for a filterable CRM field, with how many records use it. */
+interface CRMFilterValueCount {
+  value: string;
+  count: number;
+}
+
+/** A custom property key in use on companies, discovered from the data. */
+export interface CRMCustomPropertySummary {
+  key: string;
+  count: number;
+  value_type: 'text' | 'number' | 'boolean' | 'list' | 'mixed';
+  values: CRMFilterValueCount[];
+  has_more_values: boolean;
+  /** Records whose value numeric filters can compare (a number or numeric text). */
+  numeric_count: number;
+  numeric_min?: number;
+  numeric_max?: number;
+}
+
+/** Filterable values in use on a workspace's contacts. */
+export interface CRMContactFilterOptions {
+  custom_properties: CRMCustomPropertySummary[];
+  scanned_contacts: number;
+  truncated: boolean;
+}
+
+/** Filterable values in use on a workspace's companies. */
+export interface CRMCompanyFilterOptions {
+  industries: CRMFilterValueCount[];
+  custom_properties: CRMCustomPropertySummary[];
+  scanned_companies: number;
+  truncated: boolean;
 }

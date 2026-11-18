@@ -20,6 +20,7 @@ import { useChatSettings } from '@/hooks/queries/useSupport';
 import { supportService } from '@/lib/services/supportService';
 import { unwrap } from '@/lib/queryUtils';
 import type { SupportConversation } from '@/lib/pmTypes';
+import { supportChannel } from '@/lib/supportChannels';
 
 export function useSupportAIControl(conversation: SupportConversation) {
   const [confirmReturnFor, setConfirmReturnFor] = useState<string | null>(null);
@@ -28,6 +29,7 @@ export function useSupportAIControl(conversation: SupportConversation) {
   const { has } = usePermissions(access);
   const { data: installation } = useChatSettings(conversation.workspace_id);
   const { data: members } = useWorkspaceMembers(conversation.workspace_id);
+  const portal = (conversation.channel ?? conversation.source) === 'portal';
   const paused = Boolean(
     conversation.ai_paused_at ||
     conversation.human_takeover ||
@@ -53,7 +55,7 @@ export function useSupportAIControl(conversation: SupportConversation) {
     !conversation.merged_into_id &&
     !conversation.anonymized_at &&
     !['resolved', 'spam'].includes(conversation.status) &&
-    ['widget', 'email'].includes(conversation.channel ?? conversation.source) &&
+    ['chat', 'email'].includes(supportChannel(conversation.channel ?? conversation.source)?.aiMode ?? '') &&
     (channels === 'both' || channels === channel);
   const pausedBy = members?.find(
     (member) => member.user_id === conversation.ai_paused_by_user_id,
@@ -88,7 +90,9 @@ export function useSupportAIControl(conversation: SupportConversation) {
       void queryClient.invalidateQueries({ queryKey: ['support'] });
     },
   });
+  // People answer portal requests; AI there only drafts private suggestions.
   if (
+    portal ||
     !has('support.edit') ||
     conversation.anonymized_at ||
     ['resolved', 'spam'].includes(conversation.status) ||

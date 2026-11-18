@@ -1,3 +1,4 @@
+import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard';
 import { SequenceEnrollmentDialog } from '@/components/crm/outreach/SequenceEnrollmentDialog';
 import { memo, useEffect, useMemo, useState, type JSX, type SVGProps } from 'react';
 import { Link, useLocation, useNavigate } from '@tanstack/react-router';
@@ -22,6 +23,7 @@ import {
   MapPinIcon,
   PlusSignIcon,
   Tag01Icon,
+  Shield01Icon,
   TelephoneIcon,
   UserIcon,
   ZapIcon,
@@ -61,6 +63,7 @@ import {
 import { EntitySignals } from '@/components/crm/EntitySignals';
 import { EntitySummaryCard } from '@/components/crm/EntitySummaryCard';
 import { EnrichmentRailCard } from '@/components/crm/contact-detail/EnrichmentRailCard';
+import { CustomFieldRailRows } from '@/components/crm/CustomFieldRailRows';
 import { ActivityTimeline } from '@/components/crm/ActivityTimeline';
 import { CreateDealDialog } from '@/components/crm/CreateDealDialog';
 import { LinkedTasksPanel } from '@/components/crm/LinkedTasksPanel';
@@ -77,6 +80,8 @@ import { supportService } from '@/lib/services/supportService';
 import { ContactLimitNotice, isContactLimitError } from '@edition';
 import { useTitle } from '@/hooks/useTitle';
 import { useCopyToClipboard } from '@/hooks/useCopyToClipboard';
+import { usePermissions, useWorkspaceAccess } from '@/hooks/queries/useSession';
+import { ContactPortalAccessControl } from '@/components/crm/ContactPortalAccessControl';
 import { cn } from '@/lib/utils';
 import type {
   HelpcenterSocialPlatform,
@@ -91,6 +96,7 @@ import type {
   UpdateCRMContactRequest,
 } from '@/lib/crmTypes';
 import type { ContactDetailTab } from '@/lib/contactDetailTabs';
+import { LIFECYCLE_STAGE_OPTIONS } from '@/lib/crmLifecycle';
 
 // ── Types ──
 
@@ -158,16 +164,6 @@ type EnrichedDetailRow = {
 };
 
 // ── Constants ──
-
-const lifecycleOptions: { value: LifecycleStage; label: string }[] = [
-  { value: 'subscriber', label: 'Subscriber' },
-  { value: 'lead', label: 'Lead' },
-  { value: 'marketing_qualified', label: 'Marketing Qualified' },
-  { value: 'sales_qualified', label: 'Sales Qualified' },
-  { value: 'opportunity', label: 'Opportunity' },
-  { value: 'customer', label: 'Customer' },
-  { value: 'evangelist', label: 'Evangelist' },
-];
 
 const leadStatusOptions: { value: LeadStatus; label: string }[] = [
   { value: 'new', label: 'New' },
@@ -577,6 +573,8 @@ export function ContactDetailPage({
 
   // ── Data hooks ──
   const { data: contact, isLoading, error: contactError } = useContact(wsId, contactId);
+  const { data: workspaceAccess } = useWorkspaceAccess(wsId);
+  const permissions = usePermissions(workspaceAccess);
   useRegisterPageContext(contact ? {
     entity_type: 'crm_contact',
     entity_id: contact.id,
@@ -604,6 +602,7 @@ export function ContactDetailPage({
   const [pendingPatch, setPendingPatch] = useState<UpdateCRMContactRequest>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  useUnsavedChangesGuard(saving || Object.keys(pendingPatch).length > 0, 'Wait for your contact changes to save before refreshing.');
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [sequenceOpen, setSequenceOpen] = useState(false);
   const [createDealOpen, setCreateDealOpen] = useState(false);
@@ -1014,7 +1013,7 @@ export function ContactDetailPage({
         }
         lifecycleStage={form.lifecycle_stage}
         lifecycleLabel={
-          lifecycleOptions.find((o) => o.value === form.lifecycle_stage)?.label ?? form.lifecycle_stage
+          LIFECYCLE_STAGE_OPTIONS.find((o) => o.value === form.lifecycle_stage)?.label ?? form.lifecycle_stage
         }
         displayId={contact.display_id}
         avatarColorSeed={form.email}
@@ -1387,7 +1386,7 @@ export function ContactDetailPage({
                   <MetadataRow icon={Tag01Icon} label="Stage">
                     <SidebarPopoverSelect
                       value={form.lifecycle_stage}
-                      options={lifecycleOptions}
+                      options={LIFECYCLE_STAGE_OPTIONS}
                       onChange={(value) => updateField('lifecycle_stage', value, { lifecycle_stage: value })}
                     />
                   </MetadataRow>
@@ -1397,6 +1396,15 @@ export function ContactDetailPage({
                       value={form.lead_status}
                       options={leadStatusOptions}
                       onChange={(value) => updateField('lead_status', value, { lead_status: value })}
+                    />
+                  </MetadataRow>
+
+                  <MetadataRow icon={Shield01Icon} label="Portal">
+                    <ContactPortalAccessControl
+                      workspaceId={wsId}
+                      contactId={contact.id}
+                      currentAccess={contact.portal_access}
+                      canManage={permissions.has('support.admin')}
                     />
                   </MetadataRow>
 
@@ -1545,6 +1553,8 @@ export function ContactDetailPage({
                       ))}
                     </>
                   )}
+
+                  <CustomFieldRailRows workspaceId={wsId} objectType="crm_contact" recordId={contact.id} properties={contact.custom_properties} editable={permissions.has('crm.edit')} />
 
                   <div className="col-span-3 pt-1">
                     <button

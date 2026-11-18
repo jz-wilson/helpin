@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -39,6 +40,10 @@ type DocsHelpcenterService struct {
 	translationSvc  *DocsHelpcenterTranslationService
 	wsPublisher     *websocket.Publisher
 	hcCache         cache.Cache
+	// domainVerification, when set, verifies custom domains before they serve.
+	domainVerification *helpcenterDomainVerification
+	// brandImporter reads branding from public sites; created on first use.
+	brandImporter *HelpcenterBrandImporter
 }
 
 // NewDocsHelpcenterService creates a new DocsHelpcenterService.
@@ -124,6 +129,24 @@ func (s *DocsHelpcenterService) UpsertConfig(ctx context.Context, workspaceID st
 	}
 
 	updates := map[string]interface{}{}
+	// Demo mode suppresses discovery without overwriting the saved indexing preference.
+	if req.DemoMode != nil {
+		updates["demo_mode"] = *req.DemoMode
+	}
+	if req.SearchIndexingEnabled != nil {
+		updates["search_indexing_enabled"] = *req.SearchIndexingEnabled
+	}
+	if req.OfficialDocsURL != nil {
+		value := strings.TrimSpace(*req.OfficialDocsURL)
+		if value != "" {
+			parsed, err := url.Parse(value)
+			if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+				return nil, fmt.Errorf("official documentation URL must be an HTTPS URL without credentials")
+			}
+		}
+		updates["official_docs_url"] = value
+	}
+	customDomainChanged := false
 	if req.Subdomain != nil {
 		updates["subdomain"] = *req.Subdomain
 	}
@@ -141,6 +164,16 @@ func (s *DocsHelpcenterService) UpsertConfig(ctx context.Context, workspaceID st
 		}
 		customDomain = normalized
 		updates["custom_domain"] = normalized
+		previous := ""
+		if existing != nil && existing.CustomDomain != nil {
+			previous = *existing.CustomDomain
+		}
+		if derefString(normalized) != previous {
+			customDomainChanged = true
+			if err := s.customDomainUpdates(ctx, workspaceID, existing, normalized, updates); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if req.PublicURLMode != nil {
 		mode = strings.TrimSpace(*req.PublicURLMode)
@@ -262,6 +295,14 @@ func (s *DocsHelpcenterService) UpsertConfig(ctx context.Context, workspaceID st
 	if err == nil && config != nil {
 		publishWorkspaceEvent(s.wsPublisher, "updated", "docs_helpcenter_config", workspaceID, workspaceID, "")
 		s.InvalidateHelpcenterCacheForWorkspace(ctx, workspaceID)
+		// A new domain is checked right away, so it can go live on save.
+		if customDomainChanged && config.CustomDomain != nil && s.CustomDomainTarget() != "" {
+			if checked, checkErr := s.VerifyCustomDomain(ctx, workspaceID); checkErr == nil {
+				config = checked
+			} else {
+				slog.WarnContext(ctx, "help center domain check failed", "workspace_id", workspaceID, "error", checkErr)
+			}
+		}
 	}
 	return config, err
 }
@@ -293,6 +334,9 @@ func (s *DocsHelpcenterService) PublishExternally(ctx context.Context, documentI
 	if space == nil || space.Type != model.SpaceTypeExternalCapable {
 		return fmt.Errorf("document must be in an external-capable space")
 	}
+	// Articles for signed-in customers never get public_published_at, which
+	// every public query requires, nor public search entries or redirects.
+	forCustomers := space.HelpcenterAudience == model.HelpcenterAudienceCustomers
 
 	// Ensure article extension exists.
 	art, err := s.hcRepo.GetArticle(ctx, documentID)
@@ -352,6 +396,9 @@ func (s *DocsHelpcenterService) PublishExternally(ctx context.Context, documentI
 	}
 	if _, err := s.publicationRepo.UpsertArticlePublication(ctx, publication); err != nil {
 		return err
+	}
+	if forCustomers {
+		return s.publishForCustomers(ctx, doc)
 	}
 	if err := s.rebuildArticleSearchEntries(ctx, publication); err != nil {
 		return err
@@ -434,6 +481,9 @@ func (s *DocsHelpcenterService) UnpublishExternally(ctx context.Context, documen
 		return err
 	}
 	if err := s.hcRepo.SetPublicPublishedAt(ctx, documentID, nil); err != nil {
+		return err
+	}
+	if err := s.hcRepo.SetCustomerPublishedAt(ctx, documentID, nil); err != nil {
 		return err
 	}
 	if s.searchRepo != nil {
@@ -557,12 +607,13 @@ func (s *DocsHelpcenterService) EnrichDocumentPublishState(ctx context.Context, 
 		doc.HCSlug = art.Slug
 	}
 	if art != nil {
+		doc.HCPublicID = art.PublicID
 		doc.HCOGTitle = art.OGTitle
 		doc.HCOGDescription = art.OGDescription
 		doc.HCOGImageURL = art.OGImageURL
 		doc.HCOGImageAlt = art.OGImageAlt
 	}
-	if art == nil || art.PublicPublishedAt == nil {
+	if art.LivePublishedAt() == nil {
 		doc.HasUnpublishedChanges = false
 		doc.LivePublishedAt = nil
 		doc.LiveSlug = nil
@@ -580,7 +631,7 @@ func (s *DocsHelpcenterService) EnrichDocumentPublishState(ctx context.Context, 
 	}
 	if publication == nil {
 		doc.HasUnpublishedChanges = false
-		doc.LivePublishedAt = art.PublicPublishedAt
+		doc.LivePublishedAt = art.LivePublishedAt()
 		return nil
 	}
 	doc.LivePublishedAt = &publication.PublishedAt
@@ -1586,7 +1637,7 @@ func (s *DocsHelpcenterService) resolvePublicCollectionTranslationByCanonicalSlu
 		if err != nil {
 			return nil, "", false, err
 		}
-		if space == nil || space.Type != model.SpaceTypeExternalCapable {
+		if space == nil || space.Type != model.SpaceTypeExternalCapable || space.HelpcenterAudience != model.HelpcenterAudiencePublic {
 			return nil, "", false, fmt.Errorf("collection not found")
 		}
 		return s.resolvePublicCollectionTranslationByID(ctx, cfg, coll.ID, requestedLocale, func() error {
@@ -2624,10 +2675,16 @@ func (s *DocsHelpcenterService) getPublicCollectionUncached(ctx context.Context,
 	if coll == nil {
 		return nil, nil, "", nil
 	}
-	var spaceSlug string
-	if space, err := s.spaceRepo.GetByID(ctx, coll.SpaceID); err == nil && space != nil {
-		spaceSlug = space.Slug
+	space, err := s.spaceRepo.GetByID(ctx, coll.SpaceID)
+	if err != nil {
+		return nil, nil, "", err
 	}
+	// Only collections of public help center spaces are public.
+	if space == nil || space.DeletedAt != nil || space.Type != model.SpaceTypeExternalCapable ||
+		space.HelpcenterAudience != model.HelpcenterAudiencePublic {
+		return nil, nil, "", nil
+	}
+	spaceSlug := space.Slug
 	publicCollection := *coll
 	publicCollection.Icon = iconcatalog.ResolvePublicValue(coll.Icon, "folder")
 	return &publicCollection, articles, spaceSlug, nil

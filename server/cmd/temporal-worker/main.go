@@ -462,7 +462,8 @@ func main() {
 	).SetWorkspaceSkillStore(workspaceSkillRepo, nil).SetModelProviderConfig(
 		cfg.AnthropicAPIKey,
 		cfg.OpenAIAPIKey,
-		cfg.OpenRouterAPIKey).SetTriggerExecutionRepository(triggerExecutionRepo).SetCommandBarPlanRepository(commandBarPlanRepo).SetWorkspaceRepository(workspaceRepo).SetNotificationService(notificationService).SetCRMRepositories(crmContactRepo, crmCompanyRepo, crmDealRepo).SetModelTierResolver(agentTierResolver).SetAgentRuntimeLaunchEnabled(cfg.AgentRuntimeLaunchEnabled)
+		cfg.OpenRouterAPIKey).SetTriggerExecutionRepository(triggerExecutionRepo).SetCommandBarPlanRepository(commandBarPlanRepo).SetWorkspaceRepository(workspaceRepo).SetNotificationService(notificationService).SetCRMRepositories(crmContactRepo, crmCompanyRepo, crmDealRepo).SetModelTierResolver(agentTierResolver).SetAgentRuntimeLaunchEnabled(cfg.AgentRuntimeLaunchEnabled).
+		SetCommandBarRunGroups(cfg.CommandBarRunGroupsEnabled, repository.NewCommandBarPlanRunGroupRepository(db))
 
 	aiConnectionService, err := service.NewAIConnectionService(repository.NewAIConnectionRepository(db), modelCatalog, agentRuntimeClient, service.AIConnectionConfig{
 		EncryptionKey: cfg.AIConnectionEncryptionKey, ChatGPTEnabled: cfg.ChatGPTConnectionsEnabled, ChatGPTClientID: cfg.ChatGPTClientID, AppID: cfg.AgentRuntimeAppID,
@@ -501,6 +502,7 @@ func main() {
 	docsHelpcenterService.SetPublicationArtifactDependencies(artifactRepo, s3Client)
 	docsHelpcenterService.SetPublicationAttachmentRepository(pmAttachmentRepo)
 	docsDocumentService.SetHelpcenterService(docsHelpcenterService)
+	docsSpaceService.SetHelpcenterSync(docsHelpcenterService)
 	docsImportService := service.NewDocsImportService(
 		docsImportRepo,
 		docsSpaceService,
@@ -517,7 +519,7 @@ func main() {
 			Model:        cfg.DocsImportAIConversionModel,
 			ArticleLimit: cfg.DocsImportAIConversionArticleLimit,
 		},
-	).SetTemporalClient(nil, resolvePMImportEncryptionKey(cfg))
+	).SetTemporalClient(nil, resolvePMImportEncryptionKey(cfg)).SetIntercomBaseURL(cfg.IntercomAPIBaseURL)
 	docsBlockService := service.NewDocsBlockService(docsBlockRepo, docsContentService, docsDocumentRepo)
 	docsBlockService.SetActivityService(pmActivityService)
 	supportCoverageService.SetDocsBlockService(docsBlockService)
@@ -681,6 +683,10 @@ func main() {
 	}
 	jevDecisions.SetMetrics(metrics)
 	supportCoverageDailyAnalyzer.SetJevDecisions(jevDecisions)
+	supportCoverageDailyAnalyzer.SetDuplicateChecker(
+		service.NewSupportCoverageClusterRebuildService(supportCoverageRepo, coverageEmbeddingProvider, cfg.OpenAIEmbeddingModel).
+			SetNeedJudge(llmProvider, jevDecisions),
+	)
 	commandService.SetJevDecisions(jevDecisions)
 	ruleEngine.SetJevDecisions(jevDecisions)
 	var meetingProcessor *service.CRMMeetingProcessingService

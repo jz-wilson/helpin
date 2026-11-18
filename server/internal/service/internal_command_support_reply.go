@@ -50,6 +50,8 @@ type supportReplyGateResult struct {
 	Confidence        float64
 	EscalationReason  string
 	ValidationOutcome string
+	ValidationReasons []string
+	UnsupportedClaims []AIResponseClaim
 }
 
 // evaluateSupportReplyGate re-validates an agent-produced reply exactly the
@@ -69,6 +71,8 @@ func evaluateSupportReplyGate(input supportReplyGateInput) supportReplyGateResul
 	if kind == supportReplyKindAnswer {
 		validation := validateSupportAnswer(SupportQueryPlanContract{}, supportEvidenceCoverage{}, input.Evidence, input.Contract)
 		result.ValidationOutcome = validation.Outcome
+		result.ValidationReasons = validation.Reasons
+		result.UnsupportedClaims = validation.UnsupportedClaims
 		if validation.Outcome != supportValidationPass {
 			result.EscalationReason = "answer_validation_" + validation.Outcome
 			return result
@@ -137,6 +141,7 @@ func normalizeSupportReplyKind(kind string) string {
 
 func (s *InternalCommandService) registerSupportReplyCommands() {
 	s.registerSupportSkipReplyCommand()
+	s.registerSupportProgressCommand()
 	s.register(InternalCommandDefinition{
 		Name:                 "support.send_reply",
 		Module:               "support",
@@ -146,27 +151,15 @@ func (s *InternalCommandService) registerSupportReplyCommands() {
 			CommandName: "support.send_reply",
 			Alias:       "send_support_reply",
 			Category:    "Support",
-			Description: "Send your reply to the visitor. For public product facts, first call search_knowledge. Factual answers must cite knowledge evidence IDs or MCP tool names for each material claim; the server re-validates grounding and confidence. For customer-specific findings, cite the exact MCP tool name in evidence_ids and source_doc_ids. The server uses its latest read-only result this customer turn and checks customer scope, factual support, and privacy. Reply when the evidence is clear; MCP use alone is not a reason to hand off. When child work is pending, a conversational acknowledgment keeps the customer turn open; wait for the child result and then send the final answer. Otherwise this must be the final successful action of the turn. If the tool returns rewrite_required, rewrite once in customer-facing language and call it again.",
+			Description: "Send your reply to the visitor. For public product facts, first call search_knowledge. Factual answers must cite knowledge evidence IDs or MCP tool names for each material claim; the server re-validates grounding and confidence. For customer-specific findings, cite the exact MCP tool name in evidence_ids and source_doc_ids. The server uses its latest read-only result this customer turn and checks customer scope, factual support, and privacy. Reply when the evidence is clear; MCP use alone is not a reason to hand off. When child work is pending, a conversational acknowledgment keeps the customer turn open; wait for the child result and then send the final answer. For a useful answer that also needs team action, use escalate_to_human with a grounded customer_update instead of sending first. Never claim or promise an action without a successful result; the entire message is checked, regardless of reply_kind. Otherwise this must be the final successful action of the turn. If the tool returns rewrite_required, rewrite once in customer-facing language and call it again.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"content":        map[string]any{"type": "string", "description": "The reply text shown to the visitor."},
-					"reply_kind":     map[string]any{"type": "string", "enum": []string{"answer", "clarify", "conversational", "confirmation"}, "description": "answer = factual answer needing evidence; clarify = asking the visitor a question; conversational = greeting/small talk or a brief acknowledgment while child work is pending; confirmation = confirming the visitor's issue is resolved."},
-					"confidence":     map[string]any{"type": "number", "description": "Your 0-1 confidence that the reply is correct and grounded."},
-					"source_doc_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Knowledge evidence_id values or exact MCP tool names backing the reply. MCP citations use the latest lookup this customer turn."},
-					"claims": map[string]any{
-						"type":        "array",
-						"description": "Each material factual claim in the reply mapped to the evidence ids that support it. Required for reply_kind=answer.",
-						"items": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"text":         map[string]any{"type": "string"},
-								"evidence_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-							},
-							"required":             []string{"text", "evidence_ids"},
-							"additionalProperties": false,
-						},
-					},
+					"content":               map[string]any{"type": "string", "description": "The reply text shown to the visitor."},
+					"reply_kind":            map[string]any{"type": "string", "enum": []string{"answer", "clarify", "conversational", "confirmation"}, "description": "answer = factual answer needing evidence; clarify = asking the visitor a question; conversational = greeting/small talk or a brief acknowledgment while child work is pending; confirmation = confirming the visitor's issue is resolved."},
+					"confidence":            map[string]any{"type": "number", "description": "Your 0-1 confidence that the reply is correct and grounded."},
+					"source_doc_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Knowledge evidence_id values or exact MCP tool names backing the reply. MCP citations use the latest lookup this customer turn."},
+					"claims":                supportClaimsSchema("Each material factual claim in the reply mapped to the evidence ids that support it. Required for reply_kind=answer."),
 					"resolves_conversation": map[string]any{"type": "boolean", "description": "True only when the visitor confirmed their issue is resolved."},
 				},
 				"required":             []string{"content", "reply_kind", "confidence"},
@@ -185,15 +178,31 @@ func (s *InternalCommandService) registerSupportReplyCommands() {
 			CommandName: "support.escalate_to_human",
 			Alias:       "escalate_to_human",
 			Category:    "Support",
-			Description: "Hand the conversation to a human teammate. Use when the visitor asks for a human, the request is risky (billing disputes, account deletion, legal), or the permitted research fallback cannot produce a grounded answer. The server sends the availability-aware handoff message — after calling this, end your turn without sending another reply.",
+			Description: "Hand the conversation to a human teammate. Use when the visitor asks for a human, the request is risky (billing disputes, account deletion, legal), or the permitted research fallback cannot produce a grounded answer. Use this for feature requests or feedback that need team action as well. Include a grounded customer_update when you can also provide a useful answer or workaround. The server saves the team brief and changes ownership together, then sends the checked update with the availability-aware handoff message. Do not announce a handoff yourself. After calling this, end your turn without sending another reply. The teammate fields become a card the support team reads first: keep each one short and plain, say each fact once, and leave a field out when you have nothing new for it.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"reason":               map[string]any{"type": "string", "description": "Short machine reason, e.g. customer_requested, out_of_scope, risky_request, cannot_answer."},
-					"issue_key":            map[string]any{"type": "string", "description": "Optional stable key for the visitor's issue."},
-					"issue_summary":        map[string]any{"type": "string", "description": "Optional one-line summary for the teammate."},
-					"attempted_steps":      map[string]any{"type": "array", "maxItems": 5, "items": map[string]any{"type": "string", "maxLength": 700}, "description": "Brief factual steps and results. Distinguish AI suggestions from customer-confirmed actions. Do not invent completed actions."},
-					"unresolved_questions": map[string]any{"type": "array", "maxItems": 5, "items": map[string]any{"type": "string", "maxLength": 700}, "description": "What remains unanswered or requires a human. Internal only; do not repeat sensitive credentials."},
+					"reason":                 map[string]any{"type": "string", "description": "Short machine reason, e.g. customer_requested, out_of_scope, risky_request, cannot_answer."},
+					"reason_note":            map[string]any{"type": "string", "description": "Optional plain sentence saying why a person is needed, when the reason code alone is vague, e.g. \"Refunds need a teammate's decision.\""},
+					"issue_key":              map[string]any{"type": "string", "description": "Optional stable key for the visitor's issue."},
+					"investigation_kind":     map[string]any{"type": "string", "enum": []string{"suspected_product_bug"}, "description": "Optional background repository investigation after handover, only for suspected product bugs supported by current evidence and workspace skills. Omit for billing, account and how-to requests."},
+					"investigation_question": map[string]any{"type": "string", "maxLength": 700, "description": "Focused code question with observed behavior and repository hints from workspace skills. Requires investigation_kind and a stable issue_key. Technical detail and record IDs belong here, not in the teammate fields. Internal only; do not include credentials. Never wait for this investigation."},
+					"investigation_focus":    map[string]any{"type": "string", "description": "With investigation_kind: what the code check will look at, in plain words the support team understands, e.g. \"How approving a post sets its publishing time\". No code, file names or IDs."},
+					"issue_summary":          map[string]any{"type": "string", "description": "Optional one-line summary for a support teammate, in plain words: what the customer needs and what is going wrong. No record IDs, field names or raw values. The other fields must not repeat it."},
+					"checked": map[string]any{"type": "array", "maxItems": 5, "description": "What you looked up and what it showed, one point per item, in plain words a support teammate understands. Keep names and dates; leave out record IDs, field names and raw values. Distinguish AI suggestions from customer-confirmed actions and never invent completed actions.", "items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"tool":    map[string]any{"type": "string", "description": "Exact name of the tool the finding came from, e.g. search_knowledge. The server shows that tool's source next to the finding and drops findings from tools you did not use."},
+							"finding": map[string]any{"type": "string", "maxLength": 700, "description": "What it showed, e.g. \"Refund policy: full refund within 14 days of payment.\" or \"Nothing about exporting reports.\""},
+						},
+						"required":             []string{"finding"},
+						"additionalProperties": false,
+					}},
+					"unresolved_questions": map[string]any{"type": "array", "maxItems": 5, "items": map[string]any{"type": "string", "maxLength": 700}, "description": "Only a specific question still open that the issue summary doesn't already say, e.g. \"Which workspace was the import in?\" Usually omit. Internal only; do not repeat sensitive credentials."},
+					"unavailable_data":     map[string]any{"type": "array", "maxItems": 5, "items": map[string]any{"type": "string"}, "description": "Kinds of data you needed to answer but none of your tools can provide, e.g. \"Payment history\". Name the kind of data, not a product, unless a workspace skill names the product. Omit it when one of your tools covers that data, even if you did not use it."},
+					"help_article_gap":     map[string]any{"type": "string", "description": "Only when search_knowledge found nothing that answers this: what the help articles are missing, e.g. \"How to export reports to CSV\"."},
+					"customer_update":      map[string]any{"type": "string", "maxLength": 600, "description": "Optional concise answer, documented workaround, or verified account finding for the customer in their language. Cite each fact in claims using exact search_knowledge evidence IDs or read-only MCP tool names. Do not claim or promise a handoff, notification, account change, or future team work. The server validates the full update and includes it with the handoff message in the same operation; an unsafe update is omitted without delaying handoff."},
+					"claims":               supportClaimsSchema("Each fact in customer_update mapped to exact knowledge evidence IDs or MCP tool names. Required with customer_update."),
 				},
 				"required":             []string{"reason"},
 				"additionalProperties": false,
@@ -204,6 +213,11 @@ func (s *InternalCommandService) registerSupportReplyCommands() {
 }
 
 func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, meta model.InternalCommandContext, input json.RawMessage) (json.RawMessage, error) {
+	return s.executeSupportReply(ctx, meta, input, false)
+}
+
+// progressOnly shares publication and ownership fences without settling the turn.
+func (s *InternalCommandService) executeSupportReply(ctx context.Context, meta model.InternalCommandContext, input json.RawMessage, progressOnly bool) (json.RawMessage, error) {
 	supportAI := s.supportAIService
 	if supportAI == nil {
 		return nil, fmt.Errorf("support reply service is not configured")
@@ -227,12 +241,19 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 	if content == "" {
 		return nil, errCommandInput("content is required")
 	}
+	if supportReplyIsPlaceholder(content) {
+		return mustJSON(map[string]any{
+			"status":      "rewrite_required",
+			"reason":      "placeholder_text",
+			"next_action": "Nothing was sent: the content is placeholder text, not a message. Write the actual customer-facing message and retry the same tool, or use escalate_to_human or skip_support_reply if no reply should be sent.",
+		}), nil
+	}
 	if disclosures := supportReplyInternalProcessDisclosures(content); len(disclosures) > 0 {
 		return mustJSON(map[string]any{
 			"status":      "rewrite_required",
 			"reason":      "internal_process_disclosure",
 			"violations":  disclosures,
-			"next_action": "Rewrite once as a direct customer-facing answer without mentioning searches, evidence, tools, agents, repositories, confidence machinery, or other internal process; then call send_support_reply again.",
+			"next_action": "Rewrite once in customer-facing language without internal process details, then retry the same tool. A progress acknowledgment is not a final answer.",
 		}), nil
 	}
 
@@ -268,6 +289,7 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 	if err != nil {
 		return nil, err
 	}
+	*settings = effectiveSupportAISettings(*settings, conv)
 	if !supportAIConversationSupported(conv) {
 		s.closeEscalatedSupportCommandRun(ctx, meta)
 		return mustJSON(map[string]any{"status": "suppressed", "next_action": "AI replies are not enabled for this message channel. End your turn."}), nil
@@ -294,6 +316,9 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 		return mustJSON(map[string]any{"status": "suppressed", "next_action": "This customer turn already has an outcome. Stop; wait for a new customer message."}), nil
 	}
 
+	if turn.ValidationRepairUsed {
+		req.ReplyKind = supportReplyKindAnswer
+	}
 	source, err := supportAI.messageRepo.GetByID(ctx, turn.SourceMessageID)
 	if err != nil {
 		return nil, fmt.Errorf("load support source message: %w", err)
@@ -362,6 +387,49 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 		MCPAssessment: mcpAssessment,
 	})
 	if !gate.OK {
+		repairDecision := "excluded_validation"
+		var repairErr error
+		if supportReplyCanRepairEvidence(gate) {
+			if mcpAssessment != nil {
+				repairDecision = "excluded_mcp_review"
+			} else {
+				var allowed bool
+				allowed, repairErr = s.supportProcessingRepo.ClaimValidationRepair(ctx, meta.WorkspaceID, turn.ID)
+				switch {
+				case repairErr != nil:
+					repairDecision = "reservation_error"
+				case allowed:
+					repairDecision = "offered"
+				case turn.ValidationRepairUsed:
+					repairDecision = "exhausted"
+				default:
+					repairDecision = "inactive_or_concurrent"
+				}
+			}
+		}
+		supportAI.recordSupportAIAnswerTrace(ctx, meta.WorkspaceID, conversationID, turn.SourceMessageID, turn.SourceMessageID, meta.AgentID,
+			SupportQueryPlanContract{}, evidence, contract, supportEvidenceCoverage{},
+			supportAnswerValidation{Outcome: gate.ValidationOutcome, Reasons: gate.ValidationReasons, UnsupportedClaims: gate.UnsupportedClaims, RepairDecision: repairDecision},
+			gate.Confidence, req.ReplyKind, "validation_rejected", false, nil)
+		slog.InfoContext(ctx, "support reply validation repair decision",
+			"workspace_id", meta.WorkspaceID, "conversation_id", conversationID,
+			"run_id", replyRunID, "source_message_id", turn.SourceMessageID,
+			"validation_outcome", gate.ValidationOutcome, "repair_decision", repairDecision)
+		if repairErr != nil {
+			return nil, fmt.Errorf("claim validation repair: %w", repairErr)
+		}
+		if repairDecision == "offered" {
+			evidenceIDs := make([]string, 0, len(evidence))
+			for _, item := range evidence {
+				evidenceIDs = append(evidenceIDs, item.ID)
+			}
+			return mustJSON(map[string]any{
+				"status": "rewrite_required", "reason": gate.EscalationReason,
+				"validation_reasons": gate.ValidationReasons, "unsupported_claims": gate.UnsupportedClaims,
+				"available_evidence_ids": evidenceIDs,
+				"next_action":            "Nothing was sent. You have one correction attempt: copy complete evidence_id values exactly into claims and source_doc_ids; never abbreviate them. Only cite passages that support the claim. Correct unsupported numeric claims using their cited evidence, or retrieve missing approved evidence, then call send_reply again as an answer. Do not bypass validation by relabeling the reply. If unsupported, hand off.",
+			}), nil
+		}
 		slog.WarnContext(ctx, "send_reply: reply gate rejected runtime answer",
 			"workspace_id", meta.WorkspaceID,
 			"conversation_id", conversationID,
@@ -372,8 +440,18 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 			"proposed_confidence", req.Confidence,
 			"source_doc_ids", req.SourceDocIDs)
 		sourceMessageID := s.supportTurnSourceMessageID(ctx, meta.WorkspaceID, conversationID, history)
-		if escErr := supportAI.EscalateToHumanForMessageWithIssue(ctx, meta.WorkspaceID, conversationID, sourceMessageID, gate.EscalationReason, "", "", SupportHandoffBrief{ExpectedRunID: replyRunID}); escErr != nil {
+		// Keep the held answer so a teammate can check it and send it themselves,
+		// unless the account review found it unsafe or about someone else.
+		held := SupportHandoffBrief{ExpectedRunID: replyRunID}
+		if mcpAssessment == nil || (mcpAssessment.CustomerScoped && mcpAssessment.Safe) {
+			held.HeldReply = content
+		}
+		held.Checked, _, held.CheckedKnown = s.supportHandoffChecks(ctx, meta, nil)
+		if escErr := supportAI.EscalateToHumanForMessageWithIssue(ctx, meta.WorkspaceID, conversationID, sourceMessageID, gate.EscalationReason, "", "", held); escErr != nil {
 			return nil, fmt.Errorf("handoff after reply validation: %w", escErr)
+		}
+		if outcome, err := s.checkSupportHandoffCommitted(ctx, meta, conversationID); err != nil || outcome != nil {
+			return outcome, err
 		}
 		s.settleSupportSource(ctx, meta.WorkspaceID, conversationID, sourceMessageID)
 		supportAI.publishTypingIndicator(ctx, meta.WorkspaceID, conversationID, false)
@@ -385,9 +463,18 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 		}), nil
 	}
 
+	if outcome, err := s.checkSupportReplyActions(ctx, meta, conv, source, turn, content, replyRunID); err != nil || outcome != nil {
+		return outcome, err
+	}
+
 	kind := normalizeSupportReplyKind(req.ReplyKind)
 	progressState := ""
-	if kind == supportReplyKindConversational && replyRunID != "" && s.commandBarService != nil && s.commandBarService.planRepo != nil {
+	progressStatus, progressNextAction := "awaiting_result", supportProgressNextAction
+	if progressOnly {
+		progressState = supportAIProgressChecking
+		progressStatus, progressNextAction = "continuing", supportContinueNextAction
+	}
+	if !progressOnly && kind == supportReplyKindConversational && replyRunID != "" && s.commandBarService != nil && s.commandBarService.planRepo != nil {
 		pending, pendingErr := s.commandBarService.planRepo.HasPendingSupportResult(ctx, meta.WorkspaceID, conversationID, replyRunID)
 		if pendingErr != nil {
 			return nil, fmt.Errorf("load pending support work: %w", pendingErr)
@@ -397,7 +484,16 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 		}
 	}
 	if progressState != "" && turn.Status == "waiting_for_result" {
-		return mustJSON(map[string]any{"status": "awaiting_result", "next_action": supportProgressNextAction}), nil
+		return mustJSON(map[string]any{"status": progressStatus, "next_action": progressNextAction}), nil
+	}
+	// An acknowledgment would arrive as its own email, so email customers get
+	// only the finished answer. The turn stays open while child work runs.
+	if progressState != "" && model.SupportAIReplyChannel(conv, source) == "email" {
+		next := supportEmailProgressNextAction
+		if !progressOnly {
+			next = supportEmailAwaitingResultNextAction
+		}
+		return mustJSON(map[string]any{"status": progressStatus, "sent": false, "next_action": next}), nil
 	}
 	// Claims cite chunk ids; AISources are keyed by reference ids — translate.
 	referenceByID := make(map[string]string, len(evidence))
@@ -412,7 +508,26 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 	}
 	sources := buildAISources(sourceRefIDs, evidence)
 	var message *model.SupportMessage
-	if shouldCreatePublicSupportAIReply(*settings) {
+	publicAllowed := shouldCreatePublicSupportAIReply(*settings)
+	if conv.Channel == "portal" {
+		contacts, accessErr := repository.NewCustomerPortalRepository(supportAI.conversationRepo.DB()).ContactsForEmail(ctx, meta.WorkspaceID, derefString(conv.CustomerEmail))
+		if accessErr != nil || !evaluatePortalEligibility(settings.EffectivePortalAccessMode(), contacts).Eligible {
+			supportAI.stopPortalAITurn(ctx, meta.WorkspaceID, conversationID)
+			return mustJSON(map[string]any{"status": "suppressed", "next_action": "Portal access changed. End your turn."}), nil
+		}
+		var dispatch struct{ ModeAtEnqueue string }
+		if err := supportAI.conversationRepo.DB().WithContext(ctx).Table("support_portal_ai_dispatches").
+			Select("mode_at_enqueue").Where("source_message_id = ? AND workspace_id = ?", source.ID, meta.WorkspaceID).
+			Take(&dispatch).Error; err != nil {
+			supportAI.stopPortalAITurn(ctx, meta.WorkspaceID, conversationID)
+			return mustJSON(map[string]any{"status": "suppressed", "next_action": "Portal AI authorization changed. End your turn."}), nil
+		}
+		publicAllowed = publicAllowed && dispatch.ModeAtEnqueue == "ai_first"
+	}
+	if publicAllowed {
+		if conv.Channel == "portal" {
+			ctx = context.WithValue(ctx, portalAIReplyChannelKey{}, true)
+		}
 		message, err = supportAI.publishAIReply(ctx, meta.WorkspaceID, conversationID, agentID, content, supportReplyModelLabel, 0, gate.Confidence, sources, kind, "", "", progressState, conv.CustomerEmail, conv.CustomerPhone, turn.ID, replyRunID)
 	} else {
 		message, err = supportAI.publishAIInternalNote(ctx, meta.WorkspaceID, conversationID, agentID, "Suggested reply:\n\n"+content, supportReplyModelLabel, 0, gate.Confidence, sources, kind, "", "", progressState, conv.CustomerEmail, conv.CustomerPhone, turn.ID, replyRunID)
@@ -427,12 +542,16 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 	if req.ResolvesConversation && kind == supportReplyKindConfirm {
 		if updateErr := resolveSupportAIConversation(ctx, supportAI.conversationRepo.DB(), conv, "confirmed", time.Now().UTC()); updateErr != nil {
 			slog.WarnContext(ctx, "mark confirmed resolution failed", "error", updateErr, "conversation_id", conversationID)
+		} else if conv.AnonymousID != nil && strings.TrimSpace(*conv.AnonymousID) != "" {
+			// The visitor is usually still in the widget: show the new status
+			// (and the satisfaction prompt) without a reconnect.
+			supportAI.publishVisitorConversationsRefresh(ctx, meta.WorkspaceID, *conv.AnonymousID)
 		}
 	}
 
 	if progressState != "" {
 		supportAI.publishProgress(meta.WorkspaceID, conversationID, progressState)
-		return mustJSON(map[string]any{"status": "awaiting_result", "message_id": message.ID, "next_action": supportProgressNextAction}), nil
+		return mustJSON(map[string]any{"status": progressStatus, "message_id": message.ID, "next_action": progressNextAction}), nil
 	}
 
 	triggerMessageID := turn.SourceMessageID
@@ -441,7 +560,7 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 	// by search_knowledge; this one records the delivered outcome).
 	supportAI.recordSupportAIAnswerTrace(ctx, meta.WorkspaceID, conversationID, message.ID,
 		triggerMessageID, agentID, SupportQueryPlanContract{}, evidence, contract,
-		supportEvidenceCoverage{}, supportAnswerValidation{Outcome: gate.ValidationOutcome},
+		supportEvidenceCoverage{}, supportAnswerValidation{Outcome: gate.ValidationOutcome, Reasons: gate.ValidationReasons, UnsupportedClaims: gate.UnsupportedClaims},
 		gate.Confidence, kind, "runtime_tool", false, nil)
 	supportAI.publishTypingIndicator(ctx, meta.WorkspaceID, conversationID, false)
 
@@ -454,6 +573,11 @@ func (s *InternalCommandService) executeSupportSendReply(ctx context.Context, me
 }
 
 const supportProgressNextAction = "Acknowledgment delivered; the customer is still waiting for an answer. End this runtime turn and wait for the child result. When it arrives, call send_support_reply with the final answer; do not wait for another visitor message or repeat the acknowledgment."
+
+const (
+	supportEmailProgressNextAction       = "Nothing was sent: email customers get only the finished answer, never a progress message. Continue the investigation now using your assigned tools, then send_support_reply or escalate_to_human. Do not call send_support_progress again. If you launch child research, end this runtime turn after the launch and resume when its result arrives."
+	supportEmailAwaitingResultNextAction = "Nothing was sent: email customers get only the finished answer, never an acknowledgment. End this runtime turn without another reply and wait for the child result. When it arrives, call send_support_reply with the final answer or escalate_to_human."
+)
 
 func supportReplyInternalProcessDisclosures(content string) []string {
 	lower := strings.ToLower(content)
@@ -498,11 +622,20 @@ func (s *InternalCommandService) executeSupportEscalate(ctx context.Context, met
 		return nil, fmt.Errorf("escalate_to_human requires a support conversation target")
 	}
 	var req struct {
-		Reason              string   `json:"reason"`
-		IssueKey            string   `json:"issue_key"`
-		IssueSummary        string   `json:"issue_summary"`
-		AttemptedSteps      []string `json:"attempted_steps"`
-		UnresolvedQuestions []string `json:"unresolved_questions"`
+		Reason                string                  `json:"reason"`
+		ReasonNote            string                  `json:"reason_note"`
+		IssueKey              string                  `json:"issue_key"`
+		IssueSummary          string                  `json:"issue_summary"`
+		InvestigationKind     string                  `json:"investigation_kind"`
+		InvestigationQuestion string                  `json:"investigation_question"`
+		InvestigationFocus    string                  `json:"investigation_focus"`
+		Checked               []supportHandoffFinding `json:"checked"`
+		AttemptedSteps        []string                `json:"attempted_steps"`
+		UnresolvedQuestions   []string                `json:"unresolved_questions"`
+		UnavailableData       []string                `json:"unavailable_data"`
+		HelpArticleGap        string                  `json:"help_article_gap"`
+		CustomerUpdate        string                  `json:"customer_update"`
+		Claims                []AIResponseClaim       `json:"claims"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
 		return nil, fmt.Errorf("parse escalate input: %w", err)
@@ -511,7 +644,12 @@ func (s *InternalCommandService) executeSupportEscalate(ctx context.Context, met
 	if reason == "" {
 		reason = "agent_requested"
 	}
-	var escalationRunID string
+	sourceMessageID := s.supportTurnSourceMessageID(ctx, meta.WorkspaceID, conversationID, nil)
+	var escalationRunID, customerUpdate string
+	brief := SupportHandoffBrief{InvestigationKind: req.InvestigationKind, InvestigationQuestion: req.InvestigationQuestion, InvestigationFocus: req.InvestigationFocus, Issue: req.IssueSummary, AttemptedSteps: req.AttemptedSteps, UnresolvedQuestions: req.UnresolvedQuestions, ReasonNote: req.ReasonNote, UnavailableData: req.UnavailableData}
+	for _, item := range req.Checked {
+		brief.Checked = append(brief.Checked, SupportHandoffCheck{Finding: item.Finding})
+	}
 	if meta.TargetType != supportPreviewTarget && meta.RunID != "" {
 		conv, err := supportAI.conversationRepo.GetByID(ctx, meta.WorkspaceID, conversationID, "", model.RoleOwner)
 		if err != nil {
@@ -527,10 +665,26 @@ func (s *InternalCommandService) executeSupportEscalate(ctx context.Context, met
 		if conv == nil || model.SupportAIConversationBlocked(conv) || (conv.AIControlVersion > 0 && (run == nil || derefString(conv.AIActiveRunID) != run.ID)) {
 			return mustJSON(map[string]any{"status": "suppressed", "next_action": "Ownership changed. End your turn."}), nil
 		}
+		brief.ExpectedControlVersion = &conv.AIControlVersion
+		brief.ExpectedMessageID = derefString(conv.LastPublicMessageID)
+		customerUpdate = s.checkedSupportHandoffUpdate(ctx, meta, conv, sourceMessageID, req.CustomerUpdate, req.Claims)
+		var used map[string]bool
+		brief.Checked, used, brief.CheckedKnown = s.supportHandoffChecks(ctx, meta, req.Checked)
+		// A docs gap is only credible after the help articles were searched.
+		if used["search_knowledge"] {
+			brief.HelpArticleGap = req.HelpArticleGap
+		}
 	}
-	sourceMessageID := s.supportTurnSourceMessageID(ctx, meta.WorkspaceID, conversationID, nil)
-	if err := supportAI.EscalateToHumanForMessageWithIssue(ctx, meta.WorkspaceID, conversationID, sourceMessageID, reason, strings.TrimSpace(req.IssueKey), strings.TrimSpace(req.IssueSummary), SupportHandoffBrief{ExpectedRunID: escalationRunID, Issue: req.IssueSummary, AttemptedSteps: req.AttemptedSteps, UnresolvedQuestions: req.UnresolvedQuestions}); err != nil {
+	if meta.TargetType == supportPreviewTarget {
+		brief.InvestigationKind = ""
+		brief.InvestigationQuestion = ""
+	}
+	brief.ExpectedRunID, brief.CustomerUpdate = escalationRunID, customerUpdate
+	if err := supportAI.EscalateToHumanForMessageWithIssue(ctx, meta.WorkspaceID, conversationID, sourceMessageID, reason, strings.TrimSpace(req.IssueKey), strings.TrimSpace(req.IssueSummary), brief); err != nil {
 		return nil, fmt.Errorf("escalate: %w", err)
+	}
+	if outcome, err := s.checkSupportHandoffCommitted(ctx, meta, conversationID); err != nil || outcome != nil {
+		return outcome, err
 	}
 	s.settleSupportSource(ctx, meta.WorkspaceID, conversationID, sourceMessageID)
 	supportAI.publishTypingIndicator(ctx, meta.WorkspaceID, conversationID, false)
@@ -591,4 +745,17 @@ func (s *InternalCommandService) supportTurnSourceMessageID(ctx context.Context,
 // consumeSupportReplyBilling intentionally does not charge runtime-delivered
 // replies because their model work is already covered by the agent-run usage.
 func (s *InternalCommandService) consumeSupportReplyBilling(context.Context, string, string, string) {
+}
+
+func supportReplyCanRepairEvidence(gate supportReplyGateResult) bool {
+	if (gate.ValidationOutcome != supportValidationNumeric && gate.ValidationOutcome != supportValidationUngrounded) || len(gate.ValidationReasons) == 0 {
+		return false
+	}
+	for _, reason := range gate.ValidationReasons {
+		// unsupported_claim means no cited ID resolved, not a semantic verdict.
+		if reason != "unsupported_claim" && !strings.HasPrefix(reason, "unsupported_numeric:") && !strings.HasPrefix(reason, "numeric_qualifier_mismatch:") {
+			return false
+		}
+	}
+	return true
 }

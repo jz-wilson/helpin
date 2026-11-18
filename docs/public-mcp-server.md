@@ -200,7 +200,7 @@ Toolsets control which product-area tools are visible. Scopes control the author
 | `pm` | `helpin.pm.read` | `helpin.pm.write` |
 | `docs` | `helpin.docs.read` | `helpin.docs.write`; `helpin.docs.publish` for Help Center publishing |
 | `crm` | `helpin.crm.read` | `helpin.crm.write` |
-| `support` | `helpin.support.read` | `helpin.support.write` organizes conversations; replies are never sent through MCP |
+| `support` | `helpin.support.read` | `helpin.support.write` organizes conversations and adds internal notes; `helpin.support.reply` sends replies and starts conversations |
 | `agents` | `helpin.agents.read` | `helpin.agents.run` |
 
 The default workspace policy allows clients to request:
@@ -243,6 +243,7 @@ The [catalog](../server/internal/service/mcp_catalog.go) defines the available t
 | `create_task_batch` | Write | Creates up to 50 implementation-ready tasks in one accessible epic | `PermPMEdit` + PM module |
 | `update_task` | Write | Updates bounded editable task fields without deleting or archiving the task | `PermPMEdit` + PM module |
 | `add_task_comment` | Write | Adds a task comment with normal Helpin activity behavior | `PermPMEdit` + PM module |
+| `delete_task_comment` | Write | Permanently deletes a task comment; only the comment's author can delete it (same rule as the REST comment delete), and comments outside the workspace return `NOT_FOUND` | `PermPMEdit` + PM module |
 | `update_task_state` | Write | Moves a task through an allowed workflow transition | `PermPMEdit` + PM module |
 | `set_task_dependencies` | Write | Creates validated, cycle-free dependency links between accessible tasks | `PermPMEdit` + PM module |
 | `create_task_checklist_item` | Write | Adds a checklist item to an accessible task | `PermPMEdit` + PM module |
@@ -295,13 +296,97 @@ A proposal made through MCP is recorded with the connected user as its author, t
 
 | Tool | Mode | What it does | Helpin check |
 | --- | --- | --- | --- |
-| `list_contacts` | Read | Lists a bounded, minimized set of CRM contacts | `PermCRMRead` + CRM module |
-| `get_crm_contact` | Read | Loads one CRM contact and verifies workspace ownership | `PermCRMRead` + CRM module |
+| `list_contacts` | Read | Lists a bounded, minimized set of CRM contacts, optionally with a structured `filter` | `PermCRMRead` + CRM module |
+| `describe_crm_fields` | Read | Describes the fields contact or company filters accept, and the custom property keys and values in use | `PermCRMRead` + CRM module |
+| `get_crm_company` | Read | Loads one CRM company with its custom properties; `include` adds its activities, contacts, and deals | `PermCRMRead` + CRM module |
+| `get_crm_contact` | Read | Loads one CRM contact and verifies workspace ownership; `include` adds its activities | `PermCRMRead` + CRM module |
 | `list_deals` | Read | Lists a bounded set of deals with core pipeline context | `PermCRMRead` + CRM module |
-| `get_crm_deal` | Read | Loads one CRM deal and verifies workspace ownership | `PermCRMRead` + CRM module |
+| `get_crm_deal` | Read | Loads one CRM deal and verifies workspace ownership; `include` adds its activities | `PermCRMRead` + CRM module |
 | `list_crm_signals` | Read | Lists CRM signals with their existing Helpin provenance | `PermCRMRead` + CRM module |
+| `upsert_crm_records` | Write | Creates or updates up to 100 companies or contacts matched on a stable key, with a result per record | `PermCRMEdit` + CRM module |
 | `add_deal_note` | Write | Adds a note to a deal through the canonical CRM command | `PermCRMEdit` + CRM module |
 | `update_deal_stage` | Write | Updates a deal stage using existing pipeline validation | `PermCRMEdit` + CRM module |
+
+`include` returns up to 25 of each related record, newest first. Activity
+bodies longer than 4,000 characters are truncated and marked `body_truncated`.
+
+#### Importing and updating records with `upsert_crm_records`
+
+One call handles one object type and one match key:
+
+| Object | `match_on` values | Default |
+| --- | --- | --- |
+| `company` | `domain`, `external_id`, `id` | `domain` |
+| `contact` | `email`, `id` | `email` |
+
+- Domains are normalized before matching, so `https://www.Acme.com/pricing`
+  matches a company stored as `acme.com`, `www.acme.com`, or
+  `https://acme.com/`. Emails match case-insensitively.
+- `mode` is `upsert` (default), `create_only`, or `update_only`. Records that
+  the mode does not allow are returned as `skipped` with reason `exists` or
+  `not_found`.
+- `fill_only: true` writes only empty native fields and missing custom
+  properties. Values that were kept are listed in the record's `kept` result.
+- `fields` holds native fields. Omit a field to leave it unchanged; `null` is
+  rejected. `custom_properties` keys must be snake_case and values must be a
+  string, number, boolean, or list of strings. They are merged into existing
+  properties, and `null` removes a key. `agent_enrichment` is reserved.
+  Reuse keys `describe_crm_fields` reports; the response lists keys the batch
+  introduced to the workspace in `new_custom_property_keys`.
+- `note` logs evidence as a note activity. A note with the same subject and
+  body that this tool already logged on the record is not repeated, so rerunning
+  a batch does not duplicate notes.
+- Each record returns `created`, `updated`, `unchanged`, `skipped`, or `error`,
+  with the fields it changed. A record error does not stop the rest of the
+  batch. Problems with the request as a whole, such as an unsupported
+  `match_on`, fail the call with `INVALID_INPUT`.
+
+Use a stable `external_id` such as `leads:<source id>` when importing from
+another system, so reruns update the same companies. Matching does not take a
+database lock: two different batches upserting the same new key at the same
+moment can still create two records.
+
+#### Filtering CRM lists
+
+`list_crm_companies` and `list_contacts` accept a `filter` object with `logic`
+(`and` or `or`) and up to 20 `rules`, each with a `field`, an `operator`, and a
+`value` or `values`. Native fields are listed in each tool's schema, and
+`custom_properties.<key>` filters any custom property as case-insensitive text.
+
+Call `describe_crm_fields` with `object_type` `contact` or `company` before
+filtering. It lists each native field's type, operators, and allowed values,
+and each custom property key in use with its value type, record count, most
+common values, numeric range, and the operators that can match it. Pass `key`
+(and optionally `value_query`) to list one property's values. The scan covers
+the 20,000 most recently updated records; `truncated` says when more exist. An
+unknown key matches nothing rather than failing, so check it first.
+
+`first_seen_at`, `last_seen_at`, and `sessions_30d` come from tracked product
+events, synced hourly onto contacts and companies (see
+[behavior profiles](crm-overview.md#behavior-profiles)). Records with no
+matching events are empty for these fields. `describe_crm_fields` reports how
+many records have behavior data in `behavior`.
+
+- `is_any_of` and `is_none_of` take a `values` list. On a custom property holding
+  a list, such as `support_tools`, they also match list elements. `is_none_of`
+  includes records without a value.
+- `gt`, `gte`, `lt`, `lte`, and `between` compare a custom property as a number.
+  JSON numbers and strings holding only a number (such as `"40"`) are compared;
+  other values (such as `"11-50"` or `"unknown"`) never match, and do not count
+  as empty.
+
+```json
+{"filter": {"rules": [
+  {"field": "custom_properties.fit", "operator": "is", "value": "yes"},
+  {"field": "custom_properties.country", "operator": "is", "value": "DE"},
+  {"field": "custom_properties.support_tools", "operator": "is_any_of", "values": ["zendesk", "intercom"]},
+  {"field": "custom_properties.employees_est", "operator": "gt", "value": "50"}
+]}}
+```
+
+`list_crm_companies` also accepts `offset` and returns `total`, `has_more`,
+and `next_offset` for paging. Through the REST API, pass `filter` as one
+URL-encoded JSON value.
 
 ### 7.5 Support
 
@@ -423,16 +508,23 @@ These tools expose existing Helpin commands that in-app agents already use, with
 
 | Area | Read tools | Write tools |
 | --- | --- | --- |
-| Tasks | `list_task_comments` (authors by ID and name only) | `archive_task`, `restore_task` |
+| Tasks | `list_task_comments` (authors by ID and name only) | `archive_task`, `restore_task`, `delete_task_comment` |
 | Epics | `list_epics`, `get_epic` | `update_epic` |
 | Sprints | `list_sprints`, `get_sprint`, `list_sprint_tasks` | `create_sprint`, `update_sprint` |
 | Objectives | `list_objectives`, `get_objective` | `create_objective`, `update_objective`, `update_key_result` |
 | Labels and workflows | `list_pm_labels`, `list_team_workflows_with_stages` | `ensure_task_label` |
 | Members | `list_workspace_members` (`workspace.members.read`) | — |
-| CRM | `get_crm_company`, `list_crm_companies`, `list_crm_pipelines`, `list_crm_associations` | `add_crm_activity`, `update_crm_contact`, `update_crm_company`, `update_crm_deal`, `link_crm_objects`, `unlink_crm_association`, `set_primary_contact_company` |
-| Support | `list_support_inboxes`, `list_support_tags`, `list_support_assignees` | `assign_support_conversation`, `move_support_conversation`, `add_support_conversation_tag`, `remove_support_conversation_tag`, `link_support_conversation_task`, `link_support_conversation_contact`, `update_support_conversation_subject` (`helpin.support.write` + `support.edit`) |
+| CRM | `list_crm_companies`, `describe_crm_fields`, `list_crm_pipelines`, `list_crm_associations` | `add_crm_activity`, `update_crm_contact`, `update_crm_company`, `update_crm_deal`, `link_crm_objects`, `unlink_crm_association`, `set_primary_contact_company` |
+| Support | `list_support_inboxes`, `list_support_tags`, `list_support_assignees`, `list_support_sla_tiers`, `list_support_request_types` | `assign_support_conversation`, `move_support_conversation`, `add_support_conversation_tag`, `remove_support_conversation_tag`, `link_support_conversation_task`, `link_support_conversation_contact`, `update_support_conversation_subject`, `set_support_conversation_status`, `set_support_conversation_priority`, `set_support_conversation_fields`, `snooze_support_conversation`, `unsnooze_support_conversation`, `add_support_conversation_note` (`helpin.support.write` + `support.edit`); `set_company_sla_tier` (`helpin.support.write` + `support.admin`); `reply_to_support_conversation`, `create_support_conversation` (`helpin.support.reply` + `support.edit`) |
 
-Not exposed: sending support replies, CRM enrichment, and deleting records.
+Customer-visible sends need `helpin.support.reply`. It is never granted with
+`helpin.support.write`: a workspace manager allows it under **Permissions**,
+and an automation account gets it only when **Allow sending replies** is on.
+Replies and notes are attributed to the authenticated person (for an
+automation account, the teammate who created it) and are delivered exactly as
+replies from the inbox.
+
+Not exposed: CRM enrichment and deleting records.
 
 ### 7.8 Help Center operations
 
@@ -754,15 +846,14 @@ Workspace policies, connections, service principals, audit events, and run attri
 The public v1 server does not expose:
 
 - deleting Helpin records
-- sending customer support replies
+- sending customer support replies without the explicit `helpin.support.reply` scope
 - creating a public support reply draft through the run-scoped internal draft contract
-- changing support conversation status (assignment, inbox moves, tags, links, and subject are available with `helpin.support.write`)
 - deleting documentation (archive and restore are available)
 - publishing without the explicit `helpin.docs.publish` scope and `docs.publish` permission
 - broad document-content replacement through `write_document_content` (use version-checked `edit_document` instead)
 - applying document change proposals without a reviewer who holds `docs.edit`
 - sending CRM email
-- CRM enrichment, merge, or bulk mutation
+- CRM enrichment, merge, or bulk deletion (bounded batch create and update is available through `upsert_crm_records`)
 - member, role, workspace-security, or billing administration
 - integration installation or credential management
 - raw Git, GitHub, storage, OAuth, or provider credentials

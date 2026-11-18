@@ -92,6 +92,7 @@ func (s *SupportChatService) closeSupportChatRunIfTerminal(ctx context.Context, 
 	if err != nil {
 		return true
 	}
+	*settings = effectiveSupportAISettings(*settings, conversation)
 	closeRun, reason := supportChatRunClosureDecision(run, conversation, now, *settings)
 	if conversation != nil && conversation.AIControlVersion > 0 && derefString(conversation.AIActiveRunID) != run.ID {
 		closeRun, reason = true, "ownership_changed"
@@ -157,7 +158,11 @@ func (s *SupportChatService) enforceTurnSettlement(ctx context.Context, run *mod
 			slog.WarnContext(ctx, "support chat: mark nudge failed", "error", err, "conversation_id", conversationID)
 			return false
 		}
-		if _, err := s.agentService.SendRunMessage(ctx, run.WorkspaceID, run.ID, "", model.SendAgentRunMessageRequest{Content: supportChatNudgeContent}); err != nil {
+		nudge := supportChatNudgeContent
+		if row.Status == "waiting_for_result" {
+			nudge = "System correction: the customer has received an acknowledgment but still needs an answer. Continue the necessary scoped checks now, then send_support_reply or escalate_to_human. Do not repeat the acknowledgment or wait for another visitor message."
+		}
+		if _, err := s.agentService.SendRunMessage(ctx, run.WorkspaceID, run.ID, "", model.SendAgentRunMessageRequest{Content: nudge}); err != nil {
 			slog.WarnContext(ctx, "support chat: nudge resume failed", "error", err, "conversation_id", conversationID)
 			return false
 		}
@@ -165,11 +170,13 @@ func (s *SupportChatService) enforceTurnSettlement(ctx context.Context, run *mod
 		return true
 	}
 	// Already nudged once — give up and hand off.
-	if err := s.supportAIService.EscalateToHumanForMessage(ctx, run.WorkspaceID, conversationID, row.SourceMessageID, "agent_no_reply"); err != nil {
+	if err := s.supportAIService.EscalateToHumanForMessageWithIssue(ctx, run.WorkspaceID, conversationID, row.SourceMessageID, "agent_no_reply", "", "", SupportHandoffBrief{ExpectedRunID: run.ID}); err != nil {
 		slog.ErrorContext(ctx, "support chat: agent_no_reply escalation failed", "error", err, "conversation_id", conversationID)
 		return false
 	}
-	_ = s.processingRepo.MarkCompleted(ctx, row.ID, nil, 0)
+	if err := s.processingRepo.MarkCompleted(ctx, row.ID, nil, 0); err != nil {
+		slog.WarnContext(ctx, "support chat: settle unanswered turn failed", "conversation_id", conversationID, "error", err)
+	}
 	return false
 }
 
@@ -255,6 +262,12 @@ func (s *SupportChatService) SweepSupportChat(ctx context.Context, staleAfter ti
 			s.reviveDeferredConversation(ctx, conv, run)
 		}
 	}
+	if err := s.sweepUnstartedSupportTurns(ctx, limit); err != nil {
+		return err
+	}
+	if err := s.sweepAcknowledgedSupportTurns(ctx, staleAfter, limit); err != nil {
+		return err
+	}
 	return s.sweepClosableSupportChatRuns(ctx, staleAfter, limit)
 }
 
@@ -326,6 +339,7 @@ func (s *SupportChatService) reviveDeferredConversation(ctx context.Context, con
 	if err != nil {
 		return
 	}
+	*settings = effectiveSupportAISettings(*settings, conv)
 	agentID := strings.TrimSpace(derefString(settings.AIAgentID))
 	if agentID == "" {
 		return
@@ -380,6 +394,9 @@ func (s *SupportChatService) StartSupportChatSweep(ctx context.Context, interval
 		if err := s.SweepUnnotifiedSupportChatResults(ctx, limit); err != nil {
 			slog.ErrorContext(ctx, "support chat result sweep failed", "error", err)
 		}
+		if err := s.sweepSupportInvestigations(ctx); err != nil {
+			slog.ErrorContext(ctx, "support investigation sweep failed", "error", err)
+		}
 	}
 }
 
@@ -398,6 +415,7 @@ func (s *SupportChatService) filterChatDeferredMessages(ctx context.Context, row
 		if err != nil {
 			continue
 		}
+		*settings = effectiveSupportAISettings(*settings, conv)
 		if message == nil || model.SupportAIConversationBlocked(conv) || !model.SupportAIReplyAllowed(*settings, conv, message) {
 			_ = s.processingRepo.MarkCompleted(ctx, row.ID, nil, 0)
 			continue

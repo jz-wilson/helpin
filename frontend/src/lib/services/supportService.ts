@@ -1,4 +1,5 @@
-import type { WidgetOriginSettings, WidgetSigningSecretResponse } from '@/lib/pmTypes';
+import type { CustomerPortalCompanyRole, ConversationPriority, SupportActionResult, SupportBulkActionResponse, SupportCompanySLA, SupportConversationActions, SupportSLAPolicy, SupportSLAPolicyInput, SupportSLATier, WidgetOriginSettings, WidgetSigningSecretResponse } from '@/lib/pmTypes';
+import type { SupportAttachmentPolicy } from '@/lib/supportAttachmentFiles';
 import { api } from '../api';
 import type { AssignableMember } from '../types';
 import type {
@@ -6,6 +7,7 @@ import type {
   SupportConversationUserState,
   SupportMessage,
   SupportMessagePage,
+  SupportSharedItem,
   CreateConversationRequest,
   CreateConversationWithMessageRequest,
   CreateConversationWithMessageResponse,
@@ -23,6 +25,12 @@ import type {
   ConversationStatus,
   SupportInstallationResponse,
   SupportInboxSettings,
+  CustomerPortalAccessSummary,
+  CustomerPortalCompanyAccess,
+  CustomerPortalConversationContext,
+  CustomerPortalRole,
+  CustomerPortalContactAccess,
+  CustomerPortalContactAccessValue,
   SupportRoutingUsageStatus,
   ConversationListResponse,
   UnreadStats,
@@ -64,6 +72,8 @@ import type {
   SupportConversationSearchParams,
   SupportConversationSearchResponse,
   SendSupportConversationTranscriptResponse,
+  RecordSupportInboxClearRequest,
+  SupportInboxClearStats,
 } from '../pmTypes';
 
 const qs = (workspaceId: string) => `?workspace_id=${encodeURIComponent(workspaceId)}`;
@@ -96,6 +106,8 @@ export const supportService = {
       sort?: string;
       tag_ids?: string;
       system_tags?: string;
+      sla?: string;
+      request_type_ids?: string;
       page?: number;
       per_page?: number;
     },
@@ -115,6 +127,8 @@ export const supportService = {
     if (filters?.sort) path += `&sort=${encodeURIComponent(filters.sort)}`;
     if (filters?.tag_ids) path += `&tag_ids=${encodeURIComponent(filters.tag_ids)}`;
     if (filters?.system_tags) path += `&system_tags=${encodeURIComponent(filters.system_tags)}`;
+    if (filters?.sla) path += `&sla=${encodeURIComponent(filters.sla)}`;
+    if (filters?.request_type_ids) path += `&request_type_ids=${encodeURIComponent(filters.request_type_ids)}`;
     if (filters?.page) path += `&page=${encodeURIComponent(String(filters.page))}`;
     if (filters?.per_page) path += `&per_page=${encodeURIComponent(String(filters.per_page))}`;
     return api.get<ConversationListResponse>(path);
@@ -227,6 +241,8 @@ export const supportService = {
       `/support/inbox/conversations/${conversationId}/message-pages${qs(workspaceId)}&limit=${limit}${cursorQuery}`,
     );
   },
+  listConversationSharedItems: (workspaceId: string, conversationId: string) =>
+    api.get<SupportSharedItem[]>(`/support/inbox/conversations/${conversationId}/shared-items${qs(workspaceId)}`),
   sendConversationTranscript: (workspaceId: string, conversationId: string, payload: { email?: string; update_customer_email?: boolean }) =>
     api.post<SendSupportConversationTranscriptResponse>(`/support/inbox/conversations/${conversationId}/transcript${qs(workspaceId)}`, payload),
   createConversationMessage: (workspaceId: string, conversationId: string, payload: CreateMessageRequest) =>
@@ -259,6 +275,50 @@ export const supportService = {
 
   updateConversationStatus: (workspaceId: string, conversationId: string, status: ConversationStatus) =>
     api.put<SupportConversation>(`/support/inbox/conversations/${conversationId}/status${qs(workspaceId)}`, { status }),
+  updateConversationPriority: (workspaceId: string, conversationId: string, priority: ConversationPriority) =>
+    api.put<SupportConversation>(`/support/inbox/conversations/${conversationId}/priority${qs(workspaceId)}`, { priority }),
+  snoozeConversation: (workspaceId: string, conversationId: string, until: string) =>
+    api.post<SupportConversation>(`/support/inbox/conversations/${conversationId}/snooze${qs(workspaceId)}`, { until }),
+  unsnoozeConversation: (workspaceId: string, conversationId: string) =>
+    api.del<SupportConversation>(`/support/inbox/conversations/${conversationId}/snooze${qs(workspaceId)}`),
+  applyMacro: (workspaceId: string, conversationId: string, macroId: string) =>
+    api.post<{ conversation: SupportConversation; result: SupportActionResult }>(
+      `/support/inbox/conversations/${conversationId}/macros/${macroId}/apply${qs(workspaceId)}`,
+    ),
+  bulkConversationActions: (workspaceId: string, conversationIds: string[], actions: SupportConversationActions) =>
+    api.post<SupportBulkActionResponse>(`/support/inbox/conversations/bulk${qs(workspaceId)}`, { conversation_ids: conversationIds, actions }),
+  listSLAPolicies: (workspaceId: string) =>
+    api.get<SupportSLAPolicy[]>(`/support/sla-policies${qs(workspaceId)}`),
+  createSLAPolicy: (workspaceId: string, input: SupportSLAPolicyInput) =>
+    api.post<SupportSLAPolicy>(`/support/sla-policies${qs(workspaceId)}`, input),
+  updateSLAPolicy: (workspaceId: string, policyId: string, input: SupportSLAPolicyInput) =>
+    api.put<SupportSLAPolicy>(`/support/sla-policies/${policyId}${qs(workspaceId)}`, input),
+  deleteSLAPolicy: (workspaceId: string, policyId: string) =>
+    api.del<void>(`/support/sla-policies/${policyId}${qs(workspaceId)}`),
+  reorderSLAPolicies: (workspaceId: string, policyIds: string[]) =>
+    api.post<SupportSLAPolicy[]>(`/support/sla-policies/reorder${qs(workspaceId)}`, { policy_ids: policyIds }),
+  listSLATeammates: (workspaceId: string) =>
+    api.get<AssignableMember[]>(`/support/sla-teammates${qs(workspaceId)}`),
+  listSLATiers: (workspaceId: string) =>
+    api.get<SupportSLATier[]>(`/support/sla-tiers${qs(workspaceId)}`),
+  createSLATier: (workspaceId: string, input: { name: string; description: string }) =>
+    api.post<SupportSLATier>(`/support/sla-tiers${qs(workspaceId)}`, input),
+  updateSLATier: (workspaceId: string, tierId: string, input: { name: string; description: string }) =>
+    api.put<SupportSLATier>(`/support/sla-tiers/${tierId}${qs(workspaceId)}`, input),
+  deleteSLATier: (workspaceId: string, tierId: string) =>
+    api.del<void>(`/support/sla-tiers/${tierId}${qs(workspaceId)}`),
+  reorderSLATiers: (workspaceId: string, tierIds: string[]) =>
+    api.post<SupportSLATier[]>(`/support/sla-tiers/reorder${qs(workspaceId)}`, { tier_ids: tierIds }),
+  setCompanySLATier: (workspaceId: string, companyIds: string[], tierId: string | null) =>
+    api.put<{ updated: number }>(`/support/sla-companies/tier${qs(workspaceId)}`, { company_ids: companyIds, tier_id: tierId }),
+  companySLA: (workspaceId: string, companyId: string) =>
+    api.get<SupportCompanySLA>(`/support/sla-companies/${companyId}${qs(workspaceId)}`),
+  customizeCompanySLA: (workspaceId: string, companyId: string) =>
+    api.post<SupportSLAPolicy[]>(`/support/sla-companies/${companyId}/custom-sla${qs(workspaceId)}`),
+  removeCompanySLA: (workspaceId: string, companyId: string) =>
+    api.del<void>(`/support/sla-companies/${companyId}/custom-sla${qs(workspaceId)}`),
+  recordInboxClear: (workspaceId: string, payload: RecordSupportInboxClearRequest) =>
+    api.post<SupportInboxClearStats>(`/support/inbox-clears${qs(workspaceId)}`, payload),
   linkConversationTask: (workspaceId: string, conversationId: string, payload: LinkTaskRequest) =>
     api.post(`/support/inbox/conversations/${conversationId}/link-task${qs(workspaceId)}`, payload),
   createTaskFromConversation: (
@@ -329,6 +389,35 @@ export const supportService = {
     api.post<WidgetSigningSecretResponse>(`/support/inbox/installations/reveal-secret${qs(workspaceId)}`, {}),
   rotateWidgetSigningSecret: (workspaceId: string) =>
     api.post<WidgetSigningSecretResponse>(`/support/inbox/installations/rotate-secret${qs(workspaceId)}`, {}),
+
+  getAttachmentPolicy: (workspaceId: string) =>
+    api.get<SupportAttachmentPolicy>(`/support/inbox/attachments/policy${qs(workspaceId)}`),
+
+  // Customer portal access (support admins)
+  getPortalAccessSummary: (workspaceId: string) =>
+    api.get<CustomerPortalAccessSummary>(`/support/inbox/portal/access${qs(workspaceId)}`),
+  getContactPortalAccess: (workspaceId: string, contactId: string) =>
+    api.get<CustomerPortalContactAccess>(`/support/inbox/portal/contacts/${encodeURIComponent(contactId)}/access${qs(workspaceId)}`),
+  setContactPortalAccess: (workspaceId: string, contactId: string, portalAccess: CustomerPortalContactAccessValue | null) =>
+    api.put<CustomerPortalContactAccess>(`/support/inbox/portal/contacts/${encodeURIComponent(contactId)}/access${qs(workspaceId)}`, { portal_access: portalAccess }),
+  setContactPortalRole: (workspaceId: string, contactId: string, portalRole: CustomerPortalRole | null) =>
+    api.put<CustomerPortalContactAccess>(`/support/inbox/portal/contacts/${encodeURIComponent(contactId)}/role${qs(workspaceId)}`, { portal_role: portalRole }),
+  getCompanyPortalAccess: (workspaceId: string, companyId: string) =>
+    api.get<CustomerPortalCompanyAccess>(`/support/inbox/portal/companies/${encodeURIComponent(companyId)}${qs(workspaceId)}`),
+  setCompanyPortalRole: (workspaceId: string, companyId: string, defaultRole: CustomerPortalRole | null) =>
+    api.put<CustomerPortalCompanyAccess>(`/support/inbox/portal/companies/${encodeURIComponent(companyId)}${qs(workspaceId)}`, { default_role: defaultRole }),
+  setCompanyMemberRole: (workspaceId: string, companyId: string, contactId: string, role: CustomerPortalCompanyRole | null) =>
+    api.put<CustomerPortalCompanyAccess>(`/support/inbox/portal/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(contactId)}/role${qs(workspaceId)}`, { role }),
+  setCompanyTeamSettings: (workspaceId: string, companyId: string, settings: { admin_invites: boolean; invite_any_domain: boolean }) =>
+    api.put<CustomerPortalCompanyAccess>(`/support/inbox/portal/companies/${encodeURIComponent(companyId)}/team-settings${qs(workspaceId)}`, settings),
+  addCompanyPortalDomainMembers: (workspaceId: string, companyId: string) =>
+    api.post<{ added: number; company: CustomerPortalCompanyAccess }>(`/support/inbox/portal/companies/${encodeURIComponent(companyId)}/members/from-domain${qs(workspaceId)}`, {}),
+  setCompanyPortalMember: (workspaceId: string, companyId: string, contactId: string, member: boolean) =>
+    api.put<CustomerPortalCompanyAccess>(`/support/inbox/portal/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(contactId)}${qs(workspaceId)}`, { member }),
+  getConversationPortalContext: (workspaceId: string, conversationId: string) =>
+    api.get<CustomerPortalConversationContext>(`/support/inbox/conversations/${encodeURIComponent(conversationId)}/portal-context${qs(workspaceId)}`),
+  resendPortalConfirmation: (workspaceId: string, conversationId: string) =>
+    api.post<void>(`/support/inbox/conversations/${encodeURIComponent(conversationId)}/portal-confirmation${qs(workspaceId)}`, {}),
   /**
    * @deprecated Use WebSocket `support:typing:start` / `support:typing:stop` messages instead.
    * Kept as HTTP fallback for clients without an active WebSocket connection.

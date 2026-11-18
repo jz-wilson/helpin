@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EMAIL_BODY_IFRAME_STYLES } from '../EmailBodyRenderer';
-import { measureVisibleEmailContentHeight, prepareCollapsedEmailLayout } from '../EmailBodyRendererLayout';
+import { COLLAPSIBLE_SELECTOR, measureVisibleEmailContentHeight, prepareCollapsedEmailLayout } from '../EmailBodyRendererLayout';
 
 function mockStyleForCollapsedEmail() {
   return vi.spyOn(window, 'getComputedStyle').mockImplementation((el: Element) => ({
@@ -61,9 +61,10 @@ describe('EmailBodyRenderer collapsed quote layout', () => {
       </div>
     `;
 
-    vi.spyOn(document.body, 'scrollHeight', 'get').mockReturnValue(96);
-    vi.spyOn(document.documentElement, 'scrollHeight', 'get').mockReturnValue(96);
-    vi.spyOn(document.documentElement, 'clientHeight', 'get').mockReturnValue(window.innerHeight - scrollbarHeight);
+    // Spy on the prototype: restoring a spy on an element's inherited getter
+    // leaves a self-recursive getter that breaks later tests.
+    vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(96);
+    vi.spyOn(Element.prototype, 'clientHeight', 'get').mockReturnValue(window.innerHeight - scrollbarHeight);
     vi.spyOn(window, 'getComputedStyle').mockImplementation((el: Element) => ({
       display: 'block',
       visibility: 'visible',
@@ -126,6 +127,78 @@ describe('EmailBodyRenderer collapsed quote layout', () => {
 
     expect(document.getElementById('word-quote-header')?.getAttribute('data-helpin-quote')).toBe('true');
     expect(document.getElementById('word-old-thread')?.getAttribute('data-helpin-quote')).toBe('true');
+  });
+
+  it('keeps new Outlook content after appendonsend visible until the actual reply header', () => {
+    document.body.innerHTML = `
+      <div id="appendonsend" data-helpin-quote="true"></div>
+      <p id="new-reply">New reply.</p>
+      <hr id="quote-rule" />
+      <div id="actual-header"><b>From:</b> Support<br /><b>Sent:</b> Tuesday<br />
+        <b>To:</b> Customer<br /><b>Subject:</b> Original question</div>
+      <p id="old-reply">Old reply.</p>
+    `;
+
+    prepareCollapsedEmailLayout(document, true);
+
+    expect(document.getElementById('new-reply')?.hasAttribute('data-helpin-quote')).toBe(false);
+    expect(document.getElementById('quote-rule')?.getAttribute('data-helpin-quote')).toBe('true');
+    expect(document.getElementById('actual-header')?.getAttribute('data-helpin-quote')).toBe('true');
+    expect(document.getElementById('old-reply')?.getAttribute('data-helpin-quote')).toBe('true');
+  });
+
+  it('does not hide new content after an Outlook placeholder without a quote header', () => {
+    document.body.innerHTML = `<div id="appendonsend" data-helpin-quote="true"></div><p id="new-reply">New reply.</p>`;
+
+    prepareCollapsedEmailLayout(document, true);
+
+    expect(document.getElementById('new-reply')?.hasAttribute('data-helpin-quote')).toBe(false);
+  });
+
+  it('collapses the Outlook mobile quoted thread in emails stored without quote markers', () => {
+    document.body.innerHTML = `
+      <div id="new-reply">Can you charge this via card?</div>
+      <div id="mail-editor-reference-message-container">
+        <div style="padding: 3pt 0in 0in; border-width: 1pt medium medium; border-style: solid none none">
+          <b>From: </b>Support &lt;support@example.com&gt;<br />
+          <b>Date: </b>Friday, 23 October 2026 at 16:29<br />
+          <b>To: </b>customer@example.com<br />
+          <b>Subject: </b>Earlier question<br />
+        </div>
+        <div id="mail-editor-reference-message-body"><p>Older reply content.</p></div>
+      </div>
+    `;
+
+    mockStyleForCollapsedEmail();
+
+    let selectedText: Text | null = null;
+    vi.spyOn(document, 'createRange').mockImplementation(() => ({
+      selectNodeContents: (node: Node) => {
+        selectedText = node as Text;
+      },
+      getClientRects: () => {
+        const bottom = selectedText?.textContent?.includes('charge this via card') ? 32 : 260;
+        return [{ bottom }] as unknown as DOMRectList;
+      },
+      detach: vi.fn(),
+    } as unknown as Range));
+
+    prepareCollapsedEmailLayout(document, true);
+
+    expect(document.querySelector(COLLAPSIBLE_SELECTOR)?.id).toBe('mail-editor-reference-message-container');
+    expect(document.getElementById('new-reply')?.closest(COLLAPSIBLE_SELECTOR)).toBeNull();
+    expect(measureVisibleEmailContentHeight(document, true)).toBe(40);
+  });
+
+  it('does not mistake the whole email wrapper for its nested quote header', () => {
+    document.body.innerHTML = `<hr /><div id="email-wrapper"><p>New reply.</p><hr />
+      <div><b>From:</b> Support<br /><b>Sent:</b> Tuesday<br /><b>Subject:</b> Old question</div>
+      <p id="old-reply">Old reply.</p></div>`;
+
+    prepareCollapsedEmailLayout(document, true);
+
+    expect(document.getElementById('email-wrapper')?.hasAttribute('data-helpin-quote')).toBe(false);
+    expect(document.getElementById('old-reply')?.getAttribute('data-helpin-quote')).toBe('true');
   });
 });
 

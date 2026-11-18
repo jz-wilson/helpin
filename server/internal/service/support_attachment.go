@@ -44,19 +44,19 @@ func (s *SupportAttachmentService) Create(
 		return nil, fmt.Errorf("file storage is not configured")
 	}
 	if strings.TrimSpace(req.FileName) == "" {
-		return nil, fmt.Errorf("file_name is required")
+		return nil, rejectSupportAttachment("file_name is required")
 	}
 	if req.FileSize <= 0 {
-		return nil, fmt.Errorf("file_size must be positive")
+		return nil, rejectSupportAttachment("%s is empty", req.FileName)
 	}
 	if req.FileSize > maxSupportFileSize {
-		return nil, fmt.Errorf("file exceeds maximum size of %s", formatByteLimit(maxSupportFileSize))
+		return nil, rejectSupportAttachment("%s exceeds the maximum size of %s", req.FileName, formatByteLimit(maxSupportFileSize))
 	}
 	if req.ContentType == "" {
-		return nil, fmt.Errorf("content_type is required")
+		return nil, rejectSupportAttachment("the file type of %s could not be determined", req.FileName)
 	}
-	if !allowedMIMETypes[req.ContentType] {
-		return nil, fmt.Errorf("file type %s is not allowed", req.ContentType)
+	if !supportAttachmentTypeAllowed(req.ContentType, uploaderType) {
+		return nil, refuseSupportAttachmentType(req.FileName, req.ContentType)
 	}
 
 	conversationID = strings.TrimSpace(conversationID)
@@ -132,6 +132,9 @@ func (s *SupportAttachmentService) ConfirmUpload(ctx context.Context, id, upload
 	if attachment.IsUploaded {
 		return nil // idempotent for the owning uploader
 	}
+	if err := s.checkUploadedContent(ctx, attachment); err != nil {
+		return err
+	}
 	return s.attachmentRepo.ConfirmUpload(ctx, id)
 }
 
@@ -167,6 +170,18 @@ func (s *SupportAttachmentService) LinkWidgetAttachments(
 	)
 }
 
+func (s *SupportAttachmentService) ValidatePortalAttachments(ctx context.Context, ids []string, workspaceID, sessionID, conversationID string) error {
+	return s.attachmentRepo.ValidatePortalAttachments(ctx, ids, workspaceID, sessionID, conversationID)
+}
+
+func (s *SupportAttachmentService) PortalAttachmentOwned(ctx context.Context, id, workspaceID, sessionID, conversationID string) bool {
+	return s.attachmentRepo.PortalAttachmentOwned(ctx, id, workspaceID, sessionID, conversationID)
+}
+
+func (s *SupportAttachmentService) LinkPortalAttachments(ctx context.Context, ids []string, workspaceID, sessionID, conversationID, messageID string) error {
+	return s.attachmentRepo.LinkPortalAttachments(ctx, ids, workspaceID, sessionID, conversationID, conversationID, messageID)
+}
+
 // LinkToMessage associates uploaded attachments with a message.
 func (s *SupportAttachmentService) LinkToMessage(ctx context.Context, attachmentIDs []string, messageID string) error {
 	if len(attachmentIDs) == 0 {
@@ -189,8 +204,11 @@ func (s *SupportAttachmentService) StoreInboundEmailAttachment(ctx context.Conte
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	if !allowedMIMETypes[contentType] {
-		return nil, fmt.Errorf("file type %s is not allowed", contentType)
+	if !supportAttachmentTypeAllowed(contentType, supportUploaderCustomer) {
+		if contentType == "image/svg+xml" {
+			return nil, rejectSupportAttachment("%s was not saved because SVG files from customers aren't accepted", fileName)
+		}
+		return nil, rejectSupportAttachment("%s was not saved because this file type isn't accepted", fileName)
 	}
 	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(req.Base64Content))
 	if err != nil {
@@ -202,6 +220,11 @@ func (s *SupportAttachmentService) StoreInboundEmailAttachment(ctx context.Conte
 	fileSize := int64(len(data))
 	if fileSize > maxSupportFileSize {
 		return nil, fmt.Errorf("file exceeds maximum size of %s", formatByteLimit(maxSupportFileSize))
+	}
+	if !supportAttachmentContentMatches(contentType, data[:min(len(data), supportAttachmentSniffBytes)]) {
+		slog.WarnContext(ctx, "inbound support attachment refused: content does not match its type",
+			"workspace_id", req.WorkspaceID, "attachment_id", req.AttachmentID, "content_type", contentType)
+		return nil, rejectSupportAttachment("%s was not saved because its contents don't match its file type", fileName)
 	}
 
 	messageID := strings.TrimSpace(req.MessageID)
@@ -271,15 +294,29 @@ func (s *SupportAttachmentService) HydrateMessages(ctx context.Context, messages
 		messageIDs[i] = m.ID
 	}
 
-	attachments, err := s.attachmentRepo.ListByMessageIDs(ctx, messageIDs)
+	byMsg, err := s.PayloadsByMessage(ctx, messageIDs)
 	if err != nil {
 		return err
 	}
-	if len(attachments) == 0 {
-		return nil
+
+	for i := range messages {
+		if payloads, ok := byMsg[messages[i].ID]; ok {
+			messages[i].Attachments = payloads
+		}
+	}
+	return nil
+}
+
+// PayloadsByMessage returns signed attachment payloads grouped by message ID.
+func (s *SupportAttachmentService) PayloadsByMessage(ctx context.Context, messageIDs []string) (map[string][]model.SupportAttachmentPayload, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	attachments, err := s.attachmentRepo.ListByMessageIDs(ctx, messageIDs)
+	if err != nil {
+		return nil, err
 	}
 
-	// Group by message_id.
 	byMsg := make(map[string][]model.SupportAttachmentPayload, len(attachments))
 	for _, a := range attachments {
 		if a.MessageID == nil {
@@ -287,10 +324,9 @@ func (s *SupportAttachmentService) HydrateMessages(ctx context.Context, messages
 		}
 		attachmentURL := a.PublicURL
 		if s.s3Client != nil && a.IsUploaded && a.StorageKey != "" {
-			var err error
 			attachmentURL, err = s.s3Client.GeneratePresignedInlineGetURL(a.StorageKey)
 			if err != nil {
-				return fmt.Errorf("sign support attachment: %w", err)
+				return nil, fmt.Errorf("sign support attachment: %w", err)
 			}
 		}
 		byMsg[*a.MessageID] = append(byMsg[*a.MessageID], model.SupportAttachmentPayload{
@@ -303,13 +339,7 @@ func (s *SupportAttachmentService) HydrateMessages(ctx context.Context, messages
 			URL:      attachmentURL,
 		})
 	}
-
-	for i := range messages {
-		if payloads, ok := byMsg[messages[i].ID]; ok {
-			messages[i].Attachments = payloads
-		}
-	}
-	return nil
+	return byMsg, nil
 }
 
 // Delete deletes a support attachment (S3 object + DB record).

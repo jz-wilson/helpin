@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { QuietTextAction } from '@/components/design-system/quiet';
 import { requestSupportTranslation, useSupportTranslationOptions } from '@/hooks/queries/useSupportTranslation';
+import { isMessageInOtherLanguage, isMessageInReadingLanguage, isMostlyCommonWords, normalizeReadingLanguage } from './messageReadingLanguage';
 import type { SupportTranslation } from '@/lib/pmTypes';
 import { MessageBubble, type MessageBubbleProps } from './MessageBubble';
 
@@ -26,8 +27,26 @@ export function TranslatedMessageBubble({ workspaceId, cachedTranslation, ...pro
   const result = outgoing ?? (candidate?.source_text === message.content && candidate.target_language === language ? candidate : undefined);
   const eligible = (!!options?.available || result?.status === 'ready') && !message.pending_send &&
     (message.sender_type === 'customer' || message.sender_type === 'ai' || !!outgoing) && !message.is_internal && message.message_type === 'reply' && !!message.content.trim();
-  const translated = result?.status === 'ready' && result.translated_text !== result.source_text;
-  const same = result?.status === 'ready' && result.translated_text === result.source_text;
+  // Only completed language evidence overrides the local hint. Failed/pending
+  // artifacts must not reintroduce Translate for text already in the reading language.
+  const sourceLanguage = result?.status === 'ready' ? normalizeReadingLanguage(result.source_language || '') : '';
+  const hasSourceLanguage = !!sourceLanguage && sourceLanguage !== 'und';
+  // Once the conversation language is known to match, short or unclear text
+  // stays untranslated; only a message that clearly differs offers Translate.
+  const conversationLanguage = options?.conversation?.customer_language || options?.detected_customer_language || '';
+  const conversationInReadingLanguage = !!conversationLanguage &&
+    normalizeReadingLanguage(conversationLanguage) === normalizeReadingLanguage(language);
+  const locallySame = useMemo(
+    () => eligible && !outgoing && !hasSourceLanguage && (conversationInReadingLanguage
+      ? !isMessageInOtherLanguage(message.content, language)
+      : isMessageInReadingLanguage(message.content, language) ||
+        // Everyday words never hide Translate in a conversation known to differ.
+        (!conversationLanguage && isMostlyCommonWords(message.content, language))),
+    [eligible, outgoing, hasSourceLanguage, conversationInReadingLanguage, conversationLanguage, message.content, language],
+  );
+  const same = (result?.status === 'ready' && result.translated_text === result.source_text) ||
+    (!outgoing && (locallySame || (hasSourceLanguage && sourceLanguage === normalizeReadingLanguage(language))));
+  const translated = !same && result?.status === 'ready' && result.translated_text !== result.source_text;
   const pending = request.isPending || result?.status === 'pending';
   const failed = request.isError || result?.status === 'failed' || result?.status === 'expired';
   const sourceName = result && options?.languages[result.source_language];

@@ -181,6 +181,9 @@ type SupportAIService struct {
 	mailboxRepo                    *repository.SupportMailboxRepository
 	workspaceRepo                  *repository.WorkspaceRepository
 	statusOverrideRepo             *repository.SupportTeammateStatusOverrideRepository
+	responderDirectory             *SupportResponderDirectory
+	sessionRepo                    *repository.SupportInboxSessionRepository
+	noticeTranslator               supportCustomerNoticeTranslator
 	triageService                  *SupportInboxTriageService
 	linkPreviewService             SupportMessageLinkPreviewer
 	assignmentSystemMessageEmitter func(ctx context.Context, workspaceID, conversationID, targetUserID string)
@@ -191,6 +194,12 @@ type SupportAIService struct {
 	db                             *gorm.DB
 	supportEventRecorder           SupportEventRecorder
 	traceRecorder                  SupportAIRetrievalTraceRecorder
+	portalReplyNotifier            *EmailFallbackService
+}
+
+// SetPortalReplyNotifier uses the same delivery policy as teammate replies.
+func (s *SupportAIService) SetPortalReplyNotifier(notifier *EmailFallbackService) {
+	s.portalReplyNotifier = notifier
 }
 
 // NewSupportAIService creates a new SupportAIService with all dependencies.
@@ -259,6 +268,20 @@ func (s *SupportAIService) SetSupportRoutingDependencies(
 	s.workspaceRepo = workspaceRepo
 	s.presence = presence
 	s.statusOverrideRepo = statusOverrideRepo
+	return s
+}
+
+// SetSupportAvailabilitySources injects who answers customers and the widget
+// sessions that carry each customer's timezone.
+func (s *SupportAIService) SetSupportAvailabilitySources(
+	responderDirectory *SupportResponderDirectory,
+	sessionRepo *repository.SupportInboxSessionRepository,
+) *SupportAIService {
+	if s == nil {
+		return nil
+	}
+	s.responderDirectory = responderDirectory
+	s.sessionRepo = sessionRepo
 	return s
 }
 
@@ -347,6 +370,10 @@ func (s *SupportAIService) recordSupportAIAnswerTrace(
 ) {
 	canAnswer := "true"
 	canResolve := "true"
+	if answerValidation.Outcome != supportValidationPass {
+		canAnswer = "false"
+		canResolve = "false"
+	}
 	trace, err := BuildSupportAIRetrievalTrace(SupportAIRetrievalTraceInput{
 		WorkspaceID:    workspaceID,
 		ConversationID: conversationID,
@@ -372,6 +399,8 @@ func (s *SupportAIService) recordSupportAIAnswerTrace(
 			"evidence_missing":   evidenceCoverage.Missing,
 			"validation_outcome": answerValidation.Outcome,
 			"validation_reasons": answerValidation.Reasons,
+			"repair_decision":    answerValidation.RepairDecision,
+			"unsupported_claims": answerValidation.UnsupportedClaims,
 			"retrieval_retried":  retrievalRetried,
 			"stage_latency_ms":   stageLatencies,
 		},

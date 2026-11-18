@@ -1,6 +1,7 @@
 package service
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -367,5 +368,49 @@ func TestSyncManagedSystemPromptForPresetMergesLegacyPlanningNotes(t *testing.T)
 	}
 	if version != "" {
 		t.Fatalf("expected merged legacy planning notes to clear template version, got %q", version)
+	}
+}
+
+func TestPersistedEchoFallbackSnapshotUpgradesWithoutLosingCustomText(t *testing.T) {
+	for _, snapshot := range []string{"testdata/legacy_echo_prompt.txt", "testdata/echo_prompt_2026_10.txt", "testdata/echo_prompt_2026_10_26.txt"} {
+		t.Run(snapshot, func(t *testing.T) {
+			raw, err := os.ReadFile(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacy := string(raw)
+			prompt, version := syncManagedSystemPromptForPreset(model.AgentPresetSupportAgent, &legacy, nil, "")
+			if prompt != nil || version == "" {
+				t.Fatal("shipped Echo snapshot did not become managed")
+			}
+			custom := legacy + "\nWorkspace-specific billing instruction."
+			prompt, _ = syncManagedSystemPromptForPreset(model.AgentPresetSupportAgent, &custom, nil, "")
+			if prompt == nil || *prompt != custom {
+				t.Fatal("custom instructions lost")
+			}
+		})
+	}
+}
+
+func TestWorkspaceEchoPresetUpgradesPromptPreservingConfiguration(t *testing.T) {
+	raw, err := os.ReadFile("testdata/legacy_echo_prompt.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := string(raw)
+	base, _ := workspacePresetBaseDefinition(model.AgentPresetSupportAgent)
+	version := model.WorkspaceAgentPresetVersion{FamilyKey: model.AgentPresetSupportAgent, VersionKey: "support_agent_workspace_test", SystemPrompt: &legacy, AllowedTools: []byte(`["search_knowledge","mcp__example__lookup"]`)}
+	got := workspacePresetDefinition(base, version)
+	if got.SystemPrompt == nil || *got.SystemPrompt != *base.SystemPrompt {
+		t.Fatal("workspace preset retained legacy prompt")
+	}
+	if !strings.Contains(strings.Join(got.AllowedTools, ","), "mcp__example__lookup") {
+		t.Fatal("workspace tool configuration lost")
+	}
+	custom := legacy + "\nWorkspace-specific guidance."
+	version.SystemPrompt = &custom
+	got = workspacePresetDefinition(base, version)
+	if got.SystemPrompt == nil || *got.SystemPrompt != custom {
+		t.Fatal("custom prompt was overwritten")
 	}
 }

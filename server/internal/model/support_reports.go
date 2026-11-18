@@ -1,0 +1,226 @@
+package model
+
+import "time"
+
+// SupportReportMaxRange bounds how much history one report reads.
+const SupportReportMaxRange = 366 * 24 * time.Hour
+
+// SupportReportRequest selects the period and inboxes a report covers.
+type SupportReportRequest struct {
+	WorkspaceID string
+	From        time.Time
+	To          time.Time
+	// Timezone is an IANA name used for the daily series.
+	Timezone   string
+	MailboxIDs []string
+	Channels   []string
+}
+
+// SupportReportDuration summarizes a set of elapsed times in seconds.
+type SupportReportDuration struct {
+	Count         int    `json:"count"`
+	MedianSeconds *int64 `json:"median_seconds"`
+	P90Seconds    *int64 `json:"p90_seconds"`
+}
+
+// SupportReportSummary is the headline metrics for one period.
+type SupportReportSummary struct {
+	ConversationsCreated  int `json:"conversations_created"`
+	ConversationsResolved int `json:"conversations_resolved"`
+	ResolvedByAI          int `json:"resolved_by_ai"`
+	ResolvedByHuman       int `json:"resolved_by_human"`
+	// FirstResponse counts any first reply, including the AI agent's.
+	FirstResponse      SupportReportDuration `json:"first_response"`
+	FirstHumanResponse SupportReportDuration `json:"first_human_response"`
+	Resolution         SupportReportDuration `json:"resolution"`
+	AIInvolved         int                   `json:"ai_involved"`
+	AIResolved         int                   `json:"ai_resolved"`
+	AIResolvedConfirm  int                   `json:"ai_resolved_confirmed"`
+	AIResolvedAssumed  int                   `json:"ai_resolved_assumed"`
+	AIHandoffs         int                   `json:"ai_handoffs"`
+	AIInvolvementRate  *float64              `json:"ai_involvement_rate"`
+	AIResolutionRate   *float64              `json:"ai_resolution_rate"`
+	AIHandoffRate      *float64              `json:"ai_handoff_rate"`
+	CSATResponses      int                   `json:"csat_responses"`
+	CSATAverage        *float64              `json:"csat_average"`
+	CSATPositiveRate   *float64              `json:"csat_positive_rate"`
+}
+
+// SupportReportSLATarget counts met and missed targets of one SLA metric.
+type SupportReportSLATarget struct {
+	Met     int      `json:"met"`
+	Missed  int      `json:"missed"`
+	HitRate *float64 `json:"hit_rate"`
+}
+
+// SupportReportSLA summarizes SLA outcomes of conversations created in the
+// period. Targets still running are not counted yet.
+type SupportReportSLA struct {
+	Conversations int                    `json:"conversations"`
+	FirstResponse SupportReportSLATarget `json:"first_response"`
+	NextResponse  SupportReportSLATarget `json:"next_response"`
+	Resolution    SupportReportSLATarget `json:"resolution"`
+}
+
+// SupportReportSLAConversation is one conversation behind an SLA report
+// count. OutcomeAt is when the target was met or missed; it is empty for met
+// next-response targets, which finish over several replies.
+type SupportReportSLAConversation struct {
+	ID                   string     `json:"id"`
+	DisplayID            int        `json:"display_id"`
+	Subject              string     `json:"subject"`
+	Status               string     `json:"status"`
+	Priority             string     `json:"priority"`
+	CustomerName         *string    `json:"customer_name"`
+	CustomerEmail        *string    `json:"customer_email"`
+	CompanyName          *string    `json:"company_name"`
+	PolicyName           string     `json:"policy_name"`
+	AssigneeName         *string    `json:"assignee_name"`
+	CreatedAt            time.Time  `json:"created_at"`
+	OutcomeAt            *time.Time `json:"outcome_at"`
+	NextResponseBreaches int        `json:"next_response_breaches"`
+}
+
+// SupportReportSLAConversations is one page of an SLA report drill-down.
+type SupportReportSLAConversations struct {
+	Data    []SupportReportSLAConversation `json:"data"`
+	Total   int64                          `json:"total"`
+	Page    int                            `json:"page"`
+	PerPage int                            `json:"per_page"`
+}
+
+// SupportReportDay is one calendar day in the report timezone.
+type SupportReportDay struct {
+	Date                      string `json:"date"`
+	ConversationsCreated      int    `json:"conversations_created"`
+	ConversationsResolved     int    `json:"conversations_resolved"`
+	ResolvedByAI              int    `json:"resolved_by_ai"`
+	MedianFirstHumanResponseS *int64 `json:"median_first_human_response_seconds"`
+}
+
+// SupportReportChannel breaks the period down by channel.
+type SupportReportChannel struct {
+	Channel               string                `json:"channel"`
+	ConversationsCreated  int                   `json:"conversations_created"`
+	ConversationsResolved int                   `json:"conversations_resolved"`
+	FirstHumanResponse    SupportReportDuration `json:"first_human_response"`
+}
+
+// SupportReportTopic breaks the period down by conversation tag, with the
+// same rules as the headline summary. A conversation with several tags counts
+// under each; the row with an empty TagID holds conversations without a tag.
+type SupportReportTopic struct {
+	TagID                string                `json:"tag_id"`
+	Name                 string                `json:"name"`
+	Color                *string               `json:"color"`
+	ConversationsCreated int                   `json:"conversations_created"`
+	PreviousCreated      int                   `json:"previous_conversations_created"`
+	AIInvolved           int                   `json:"ai_involved"`
+	AIResolutionRate     *float64              `json:"ai_resolution_rate"`
+	AIHandoffRate        *float64              `json:"ai_handoff_rate"`
+	FirstHumanResponse   SupportReportDuration `json:"first_human_response"`
+	Resolution           SupportReportDuration `json:"resolution"`
+	CSATResponses        int                   `json:"csat_responses"`
+	CSATAverage          *float64              `json:"csat_average"`
+}
+
+// SupportReportTeammate is one teammate's activity in the period.
+type SupportReportTeammate struct {
+	UserID             string                `json:"user_id"`
+	Name               string                `json:"name"`
+	AvatarURL          *string               `json:"avatar_url,omitempty"`
+	Resolved           int                   `json:"resolved"`
+	RepliesSent        int                   `json:"replies_sent"`
+	FirstHumanResponse SupportReportDuration `json:"first_human_response"`
+	CSATResponses      int                   `json:"csat_responses"`
+	CSATAverage        *float64              `json:"csat_average"`
+}
+
+// SupportReportCSATComment is a recent rating with a comment.
+type SupportReportCSATComment struct {
+	ConversationID string    `json:"conversation_id"`
+	DisplayID      int       `json:"display_id"`
+	Subject        string    `json:"subject"`
+	Rating         int       `json:"rating"`
+	Comment        string    `json:"comment"`
+	Channel        string    `json:"channel"`
+	ResolvedBy     string    `json:"resolved_by"`
+	SubmittedAt    time.Time `json:"submitted_at"`
+}
+
+// SupportReportCSAT details satisfaction ratings for the period.
+type SupportReportCSAT struct {
+	// Distribution counts ratings 1 through 5 (index 0 is rating 1).
+	Distribution   [5]int                     `json:"distribution"`
+	AIAverage      *float64                   `json:"ai_average"`
+	AIResponses    int                        `json:"ai_responses"`
+	HumanAverage   *float64                   `json:"human_average"`
+	HumanResponses int                        `json:"human_responses"`
+	RecentComments []SupportReportCSATComment `json:"recent_comments"`
+}
+
+// SupportReportRange echoes the periods the report compares.
+type SupportReportRange struct {
+	From         time.Time `json:"from"`
+	To           time.Time `json:"to"`
+	PreviousFrom time.Time `json:"previous_from"`
+	PreviousTo   time.Time `json:"previous_to"`
+	Timezone     string    `json:"timezone"`
+}
+
+// SupportReportOverview is the support reports page.
+type SupportReportOverview struct {
+	Range     SupportReportRange      `json:"range"`
+	Summary   SupportReportSummary    `json:"summary"`
+	Previous  SupportReportSummary    `json:"previous"`
+	Daily     []SupportReportDay      `json:"daily"`
+	Topics    []SupportReportTopic    `json:"topics"`
+	Channels  []SupportReportChannel  `json:"channels"`
+	Teammates []SupportReportTeammate `json:"teammates"`
+	CSAT      SupportReportCSAT       `json:"csat"`
+	SLA       SupportReportSLA        `json:"sla"`
+	// PortalIntake is present for workspace-wide reports with portal intake
+	// activity in the period; requests are not in an inbox while written.
+	PortalIntake *SupportReportPortalIntake `json:"portal_intake,omitempty"`
+	// HelpAssistant is present for workspace-wide reports when visitors asked
+	// the help assistant questions in the period.
+	HelpAssistant *SupportReportHelpAssistant `json:"help_assistant,omitempty"`
+}
+
+// SupportReportPortalIntake counts portal request forms by what customers
+// did with suggested help center articles.
+// SupportReportHelpAssistant summarizes help assistant conversations.
+type SupportReportHelpAssistant struct {
+	Conversations int `json:"conversations"`
+	Questions     int `json:"questions"`
+	Answered      int `json:"answered"`
+	// HandedOff counts questions the articles did not answer, where the
+	// assistant offered to contact support.
+	HandedOff  int `json:"handed_off"`
+	Failed     int `json:"failed"`
+	Helpful    int `json:"helpful"`
+	NotHelpful int `json:"not_helpful"`
+	// Unanswered lists the latest questions the articles did not answer.
+	Unanswered []SupportReportUnansweredQuestion `json:"unanswered"`
+}
+
+// SupportReportUnansweredQuestion is a question the help articles did not answer.
+type SupportReportUnansweredQuestion struct {
+	Question string    `json:"question"`
+	AskedAt  time.Time `json:"asked_at"`
+}
+
+type SupportReportPortalIntake struct {
+	// WithSuggestions counts forms that showed at least one article.
+	WithSuggestions int `json:"with_suggestions"`
+	// Opened counts forms where the customer opened an article.
+	Opened int `json:"opened"`
+	// SubmittedAfterOpening counts forms submitted after opening an article.
+	SubmittedAfterOpening int `json:"submitted_after_opening"`
+	// LikelyDeflected counts forms with an opened article and no request
+	// within 30 minutes of the last opening.
+	LikelyDeflected int `json:"likely_deflected"`
+	// SubmittedWithoutSuggestions counts requests written after the help
+	// center suggested nothing.
+	SubmittedWithoutSuggestions int `json:"submitted_without_suggestions"`
+}

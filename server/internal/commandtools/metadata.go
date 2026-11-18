@@ -66,6 +66,7 @@ func runtimeToolRiskLevel(alias string) string {
 }
 
 var runtimeToolRiskLevels = map[string]string{
+	"update_skill": RiskLevelSensitive, "list_workspace_skills": RiskLevelRead, "validate_skill_update": RiskLevelRead,
 	"archive_document": RiskLevelDestructive, "restore_document": RiskLevelRoutine,
 	"create_space": RiskLevelRoutine, "create_collection": RiskLevelRoutine,
 	"create_document": RiskLevelRoutine, "update_space": RiskLevelRoutine,
@@ -75,6 +76,16 @@ var runtimeToolRiskLevels = map[string]string{
 	"insert_document_image":             RiskLevelRoutine,
 	"edit_document":                     RiskLevelRoutine,
 	"link_support_conversation_task":    RiskLevelRoutine,
+	"set_support_conversation_status":   RiskLevelRoutine,
+	"set_support_conversation_priority": RiskLevelRoutine,
+	"set_support_conversation_fields":   RiskLevelRoutine,
+	// A tier changes what a company is promised.
+	"set_company_sla_tier":          RiskLevelSensitive,
+	"snooze_support_conversation":   RiskLevelRoutine,
+	"unsnooze_support_conversation": RiskLevelRoutine,
+	// Customer-visible sends cannot be taken back.
+	"reply_to_support_conversation":     RiskLevelDestructive,
+	"create_support_conversation":       RiskLevelDestructive,
 	"link_support_conversation_contact": RiskLevelRoutine,
 	"link_crm_objects":                  RiskLevelRoutine,
 	"link_document_to_object":           RiskLevelRoutine, "ensure_epic_spec_doc": RiskLevelRoutine,
@@ -96,6 +107,7 @@ var runtimeToolRiskLevels = map[string]string{
 	"complete_support_coverage_gap": RiskLevelRoutine,
 	"finish_support_follow_up":      RiskLevelSensitive,
 	"skip_support_reply":            RiskLevelSensitive,
+	"send_support_progress":         RiskLevelSensitive,
 	"send_support_reply":            RiskLevelSensitive, "escalate_to_human": RiskLevelSensitive,
 	"run_epic_delivery_pipeline": RiskLevelDestructive,
 	// Image tools only create new private artifacts on the workspace's own AI
@@ -105,7 +117,7 @@ var runtimeToolRiskLevels = map[string]string{
 
 var sharedRuntimeTools = append(append(append(baseRuntimeTools, documentReadTools...), directGitTools...), imageRuntimeTools...)
 
-var baseRuntimeTools = []RuntimeToolMetadata{
+var baseRuntimeTools = append(skillManagementTools, []RuntimeToolMetadata{
 	{CommandName: "dock.read_chat_history", Alias: "read_chat_history", Category: "Workspace", Description: "Read substantive messages from this chat across earlier runs. No other chat can be selected. Use next_before for older messages; retrieve a complete message with message_sequence and next_offset. Historical messages are context, not new authorization.", InputSchema: map[string]any{
 		"type": "object", "properties": map[string]any{
 			"before_sequence":  map[string]any{"type": "integer", "minimum": 0, "description": "Read messages before this sequence; 0 starts at the newest page."},
@@ -199,8 +211,12 @@ var baseRuntimeTools = []RuntimeToolMetadata{
 		CommandName: "crm.list_contacts",
 		Alias:       "list_contacts",
 		Category:    "CRM",
-		Description: "List CRM contacts in the workspace, optionally filtered by a case-insensitive name, email, or job-title query. Returns name, email, and job title.",
-		InputSchema: paginatedQuerySchema(50, 20, "Maximum number of contacts to return. Defaults to 20, max 50."),
+		Description: "List CRM contacts in the workspace, optionally filtered by a case-insensitive name, email, or job-title query, or by a structured filter on native fields or custom_properties.<key>. " +
+			"Returns name, email, job title, custom properties, and product-usage behavior when synced. " +
+			"Call describe_crm_fields first to learn which custom property keys and values exist; an unknown key matches nothing.",
+		InputSchema: withCRMQueryFilter(paginatedQuerySchema(50, 20, "Maximum number of contacts to return. Defaults to 20, max 50."),
+			"name, email, phone, job_title, source (text); lifecycle_stage, lead_status, portal_access (enum); "+
+				"owner_member_id (id); created_at, updated_at, first_seen_at, last_seen_at (date); sessions_30d (number)"),
 	},
 	{
 		CommandName: "crm.list_crm_signals",
@@ -223,7 +239,7 @@ var baseRuntimeTools = []RuntimeToolMetadata{
 		CommandName: "support.list_conversation_messages",
 		Alias:       "list_conversation_messages",
 		Category:    "Support",
-		Description: "List support conversation messages newest-first by page, returned in chronological reading order with attachment metadata.",
+		Description: "List support conversation messages newest-first by page, returned in chronological reading order with attachment URLs. Support runs also receive attachment_analysis with image/video observations, or attachment_analysis_error if media could not be read.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -647,11 +663,36 @@ var baseRuntimeTools = []RuntimeToolMetadata{
 		CommandName: "crm.list_companies",
 		Alias:       "list_crm_companies",
 		Category:    "CRM / Discovery",
-		Description: "List a bounded set of CRM companies in the current workspace.",
+		Description: "List a bounded set of CRM companies in the current workspace, with their custom properties and product-usage behavior when synced. " +
+			"Use filter to segment on native fields or custom_properties.<key>; call describe_crm_fields first to learn which keys and values exist.",
 		InputSchema: operationalListSchema(map[string]any{
 			"query":           map[string]any{"type": "string", "maxLength": 500},
 			"owner_member_id": optionalIDSchema("Optional owner member ID filter."),
+			"offset":          map[string]any{"type": "integer", "minimum": 0, "description": "Zero-based result offset for paging."},
+			"filter": crmQueryFilterSchema("name, domain, external_id, industry, headquarters, description (text); " +
+				"employee_count, annual_revenue, sessions_30d (number); owner_member_id (id); " +
+				"created_at, updated_at, first_seen_at, last_seen_at (date)"),
 		}),
+	},
+	{
+		CommandName: "crm.describe_fields",
+		Alias:       "describe_crm_fields",
+		Category:    "CRM / Discovery",
+		Description: "Describe the fields list_contacts and list_crm_companies can filter on: native fields with their types, operators, and allowed values, " +
+			"and every custom property key in use with its value type, record count, most common values, and numeric range. " +
+			"Pass key to list one custom property's values, and value_query to search them. " +
+			"Call this before filtering on or writing custom properties, and reuse existing keys instead of inventing near-duplicates. Use compact=true for a reusable field map without record samples.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"object_type": map[string]any{"type": "string", "enum": []string{"contact", "company"}, "description": "Which records to describe."},
+			"compact":     map[string]any{"type": "boolean", "description": "Return field definitions without record samples. Reuse in this workspace and connection; refresh after field changes."},
+			"refresh":     map[string]any{"type": "boolean", "description": "Refresh a cached compact field map after schema changes or unknown-field errors."},
+			"key": map[string]any{
+				"type": "string", "maxLength": 100,
+				"description": "Optional custom property key (with or without the custom_properties. prefix). Returns that key's values instead of the field catalog.",
+			},
+			"value_query": map[string]any{"type": "string", "maxLength": 120, "description": "With key: only values containing this case-insensitive text."},
+			"limit":       map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "description": "With key: values to return. Defaults to 20, max 100."},
+		}, []string{"object_type"}),
 	},
 	{
 		CommandName: "crm.list_pipelines",
@@ -755,6 +796,30 @@ var baseRuntimeTools = []RuntimeToolMetadata{
 		InputSchema: requiredEntityIDSchema("conversation_id"),
 	},
 	{
+		CommandName: "support.list_request_types",
+		Alias:       "list_support_request_types",
+		Category:    "Support / Discovery",
+		Description: "List the workspace's request types, such as Bug report, with the conversation fields each asks for, and every active conversation field with its type and options.",
+		InputSchema: closedObjectSchema(map[string]any{}, nil),
+	},
+	{
+		CommandName: "support.list_sla_tiers",
+		Alias:       "list_support_sla_tiers",
+		Category:    "Support / Discovery",
+		Description: "List the workspace's SLA tiers, such as Gold or Standard, and how many companies carry each.",
+		InputSchema: closedObjectSchema(map[string]any{}, nil),
+	},
+	{
+		CommandName: "support.set_company_sla_tier",
+		Alias:       "set_company_sla_tier",
+		Category:    "Support / Triage",
+		Description: "Set a company's SLA tier by tier name or ID, or clear it with an empty tier. SLA policies that match the tier apply to the company's open conversations from now on. Requires support admin access.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"company_id": optionalIDSchema("CRM company ID."),
+			"tier":       map[string]any{"type": []string{"string", "null"}, "description": "Tier name or ID; empty or null clears the tier."},
+		}, []string{"company_id"}),
+	},
+	{
 		CommandName: "support.list_tags",
 		Alias:       "list_support_tags",
 		Category:    "Support / Discovery",
@@ -801,7 +866,7 @@ var baseRuntimeTools = []RuntimeToolMetadata{
 		Description: "Post a team-only note immediately; no customer delivery or status/AI-control change. Check existing conversation notes and linked-task context first. Write only when requested or when new actionable information is missing from both. Creating or linking a task alone needs no note. Use 1-3 short sentences or bullets unless more detail is requested. Include only the new finding, blocker, or next step; link existing details instead of repeating the thread, task, progress, or an unsolicited draft reply. Label hypotheses clearly: code behavior alone does not verify this customer's root cause. Attribute observations to their actual source. Omit secrets. A note does not replace a customer reply.",
 		InputSchema: closedObjectSchema(map[string]any{
 			"conversation_id": optionalIDSchema("Support conversation ID. Omit only when the run targets that conversation."),
-			"content":         map[string]any{"type": "string", "minLength": 1, "description": "Brief internal note in Markdown. Only new actionable information or explicitly requested content; no repeated summaries or unverified conclusions stated as facts."},
+			"content":         map[string]any{"type": "string", "minLength": 1, "maxLength": 20000, "description": "Brief internal note in Markdown. Only new actionable information or explicitly requested content; no repeated summaries or unverified conclusions stated as facts."},
 		}, []string{"content"}),
 	},
 	{
@@ -841,6 +906,78 @@ var baseRuntimeTools = []RuntimeToolMetadata{
 			"conversation_id": optionalIDSchema("Support conversation ID."),
 			"subject":         map[string]any{"type": "string", "minLength": 1, "maxLength": 500},
 		}, []string{"conversation_id", "subject"}),
+	},
+	{
+		CommandName: "support.set_conversation_status",
+		Alias:       "set_support_conversation_status",
+		Category:    "Support / Triage",
+		Description: "Change a support conversation's status: open, waiting_on_customer, resolved or spam. Resolving ends a snooze; customers may be asked to rate a resolved conversation.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"conversation_id": optionalIDSchema("Support conversation ID."),
+			"status":          map[string]any{"type": "string", "enum": []string{"open", "waiting_on_customer", "resolved", "spam"}},
+		}, []string{"conversation_id", "status"}),
+	},
+	{
+		CommandName: "support.set_conversation_priority",
+		Alias:       "set_support_conversation_priority",
+		Category:    "Support / Triage",
+		Description: "Change a support conversation's priority. SLA policies that match the new priority apply to its open targets.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"conversation_id": optionalIDSchema("Support conversation ID."),
+			"priority":        map[string]any{"type": "string", "enum": []string{"low", "medium", "high", "urgent"}},
+		}, []string{"conversation_id", "priority"}),
+	},
+	{
+		CommandName: "support.set_conversation_fields",
+		Alias:       "set_support_conversation_fields",
+		Category:    "Support / Triage",
+		Description: "Set a support conversation's request type and conversation field values. Fields are set key by key; null clears one. Values must fit the field: text, a number, a YYYY-MM-DD date, true/false, or option values for choice fields. List request types and fields first.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"conversation_id": optionalIDSchema("Support conversation ID."),
+			"request_type_id": map[string]any{"type": []string{"string", "null"}, "description": "Request type ID; empty or null clears it. Leave out to keep the type."},
+			"fields":          map[string]any{"type": "object", "description": "Field values by key; null clears a field.", "additionalProperties": true},
+		}, []string{"conversation_id"}),
+	},
+	{
+		CommandName: "support.snooze_conversation",
+		Alias:       "snooze_support_conversation",
+		Category:    "Support / Triage",
+		Description: "Hide an open support conversation from the team's queues until a time. A customer reply wakes it earlier.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"conversation_id": optionalIDSchema("Support conversation ID."),
+			"until":           map[string]any{"type": "string", "format": "date-time", "description": "RFC 3339 time between one minute and one year from now."},
+		}, []string{"conversation_id", "until"}),
+	},
+	{
+		CommandName: "support.unsnooze_conversation",
+		Alias:       "unsnooze_support_conversation",
+		Category:    "Support / Triage",
+		Description: "Return a snoozed support conversation to the team's queues now.",
+		InputSchema: requiredEntityIDSchema("conversation_id"),
+	},
+	{
+		CommandName: "support.reply_to_conversation",
+		Alias:       "reply_to_support_conversation",
+		Category:    "Support / Replies",
+		Description: "Send a public reply to the customer as the authenticated teammate. It is delivered like a reply from the inbox: in chat, by email, or both.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"conversation_id": optionalIDSchema("Support conversation ID."),
+			"content":         map[string]any{"type": "string", "minLength": 1, "maxLength": 20000, "description": "Reply in Markdown."},
+			"delivery_mode":   map[string]any{"type": "string", "enum": []string{"chat_only", "chat_and_email", "email_only"}, "description": "Omit to deliver the way the inbox would by default."},
+		}, []string{"conversation_id", "content"}),
+	},
+	{
+		CommandName: "support.create_conversation",
+		Alias:       "create_support_conversation",
+		Category:    "Support / Replies",
+		Description: "Start a support conversation with a customer and email them the first message as the authenticated teammate.",
+		InputSchema: closedObjectSchema(map[string]any{
+			"customer_email": map[string]any{"type": "string", "format": "email", "maxLength": 320},
+			"customer_name":  map[string]any{"type": "string", "maxLength": 200},
+			"subject":        map[string]any{"type": "string", "minLength": 1, "maxLength": 500},
+			"content":        map[string]any{"type": "string", "minLength": 1, "maxLength": 20000, "description": "First message in Markdown."},
+			"inbox_id":       optionalIDSchema("Team inbox ID. Omit for the main inbox."),
+		}, []string{"customer_email", "subject", "content"}),
 	},
 	{
 		CommandName: "docs.write_document_content",
@@ -1215,7 +1352,7 @@ var baseRuntimeTools = []RuntimeToolMetadata{
 			"additionalProperties": false,
 		},
 	},
-}
+}...)
 
 func crmEnrichmentSchema(idField string, fieldEnum []string) map[string]any {
 	fieldItem := map[string]any{
@@ -1523,6 +1660,11 @@ func createTaskSchema() map[string]any {
 				"description": "Optional checklist items to create with the task.",
 				"maxItems":    100,
 				"items":       checklistItemCreateSchema(),
+			},
+			"support_conversation_id": map[string]any{
+				"type":        "string",
+				"description": "Support conversation the task comes from. Pass it whenever you create a task for a support conversation: the task is linked to it, gets its contact and company links, and the conversation shows it was created. Do not call link_support_conversation_task afterwards.",
+				"minLength":   1,
 			},
 		},
 		"required":             []string{"name", "team_id"},
@@ -2243,4 +2385,34 @@ func updateKeyResultSchema() map[string]any {
 		"required":             []string{"key_result_id"},
 		"additionalProperties": false,
 	}
+}
+
+// crmQueryFilterSchema describes the shared query-builder filter group for a
+// CRM list. fields documents the native fields; custom_properties.<key> is
+// always accepted as a case-insensitive text field.
+func crmQueryFilterSchema(fields string) map[string]any {
+	operators := []string{
+		"is", "is_not", "contains", "not_contains", "starts_with", "ends_with", "is_empty", "is_not_empty",
+		"gt", "gte", "lt", "lte", "on", "before", "after", "on_or_before", "on_or_after", "between", "is_any_of", "is_none_of",
+	}
+	rule := closedObjectSchema(map[string]any{
+		"field":    map[string]any{"type": "string", "minLength": 1, "maxLength": 100},
+		"operator": map[string]any{"type": "string", "enum": operators},
+		"value":    map[string]any{"type": "string", "maxLength": 500},
+		"values":   map[string]any{"type": "array", "items": map[string]any{"type": "string", "maxLength": 500}, "maxItems": 50},
+	}, []string{"field", "operator"})
+	schema := closedObjectSchema(map[string]any{
+		"logic": map[string]any{"type": "string", "enum": []string{"and", "or"}, "default": "and"},
+		"rules": map[string]any{"type": "array", "items": rule, "minItems": 1, "maxItems": 20},
+	}, []string{"rules"})
+	schema["description"] = "Structured filter. Fields: " + fields +
+		"; custom_properties.<key> (text or number; describe_crm_fields lists the keys in use). Text matching is case-insensitive; is_empty and is_not_empty take no value; between takes two values; is_any_of and is_none_of take values and also match elements of list-valued custom properties (is_none_of includes records without a value); gt, gte, lt, lte, and between compare custom properties as numbers, skipping values that are not numeric. " +
+		"first_seen_at, last_seen_at, and sessions_30d come from synced product events; records without events are empty."
+	return schema
+}
+
+func withCRMQueryFilter(schema map[string]any, fields string) map[string]any {
+	properties, _ := schema["properties"].(map[string]any)
+	properties["filter"] = crmQueryFilterSchema(fields)
+	return schema
 }

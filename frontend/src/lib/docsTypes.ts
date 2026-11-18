@@ -4,6 +4,8 @@
 
 export type DocStatus = 'draft' | 'published' | 'archived';
 export type SpaceType = 'internal' | 'external_capable';
+/** Who can read an external space: everyone, or customers signed in to the portal. */
+export type HelpcenterAudience = 'public' | 'customers';
 
 export type DocsAPIReferenceSourceType = 'url' | 'upload';
 export type DocsAPIReferenceSyncStatus = 'ready' | 'failed';
@@ -76,6 +78,7 @@ export interface DocsSpace {
   icon?: string;
   visibility: SpaceVisibility;
   type: SpaceType;
+  helpcenter_audience?: HelpcenterAudience;
   default_review_days?: number;
   is_system: boolean;
   position: number;
@@ -137,6 +140,7 @@ export interface DocsDocument {
   updated_at: string;
   deleted_at?: string;
   hc_slug?: string;
+  hc_public_id?: string;
   hc_og_title?: string;
   hc_og_description?: string;
   hc_og_image_url?: string;
@@ -338,6 +342,7 @@ export interface DocsLink {
 
 export type HelpcenterThemeMode = 'light' | 'dark' | 'system';
 export type HelpcenterPublicUrlMode = 'hosted_subdomain' | 'custom_domain' | 'reverse_proxy';
+export type HelpcenterCustomDomainStatus = 'pending' | 'verified' | 'failing';
 
 export type HelpcenterHeaderLinkStyle = 'text' | 'button';
 
@@ -403,10 +408,24 @@ export interface HelpcenterSpaceNavConfig {
 }
 
 export interface DocsHelpcenterConfig {
+  demo_mode?: boolean;
+  search_indexing_enabled?: boolean;
+  official_docs_url?: string;
   id: string;
   workspace_id: string;
   subdomain: string;
   custom_domain?: string;
+  /** Verification of the custom domain; it serves only when verified or failing. */
+  custom_domain_status?: HelpcenterCustomDomainStatus;
+  custom_domain_verified_at?: string;
+  custom_domain_checked_at?: string;
+  custom_domain_last_error?: string;
+  custom_domain_failing_since?: string;
+  /** Where the custom domain must CNAME to; empty when domains aren't verified. */
+  custom_domain_target?: string;
+  /** The TXT record that proves the workspace owns the domain. */
+  custom_domain_challenge_name?: string;
+  custom_domain_challenge_value?: string;
   public_url_mode: HelpcenterPublicUrlMode;
   reverse_proxy_host?: string;
   reverse_proxy_base_path?: string;
@@ -662,6 +681,7 @@ export interface CreateDocsSpaceRequest {
   icon?: string;
   visibility: SpaceVisibility;
   type: SpaceType;
+  helpcenter_audience?: HelpcenterAudience;
   default_review_days?: number;
 }
 
@@ -670,6 +690,7 @@ export interface UpdateDocsSpaceRequest {
   slug?: string;
   icon?: string;
   type?: SpaceType;
+  helpcenter_audience?: HelpcenterAudience;
   visibility?: SpaceVisibility;
   default_review_days?: number;
   team_ids?: string[];
@@ -770,6 +791,9 @@ export interface CreateDocsLinkRequest {
 }
 
 export interface UpdateDocsHelpcenterConfigRequest {
+  demo_mode?: boolean;
+  search_indexing_enabled?: boolean;
+  official_docs_url?: string;
   subdomain?: string;
   custom_domain?: string;
   public_url_mode?: HelpcenterPublicUrlMode;

@@ -2,7 +2,7 @@
 
 export type ConversationStatus = 'open' | 'waiting_on_customer' | 'resolved' | 'spam';
 export type ConversationPriority = 'low' | 'medium' | 'high' | 'urgent';
-export type TicketSource = 'widget' | 'internal' | 'email' | 'api';
+export type TicketSource = 'widget' | 'internal' | 'email' | 'api' | 'portal';
 export type MessageSenderType = 'customer' | 'user' | 'agent' | 'ai';
 export type SupportConversationTriageStatus = 'not_run' | 'suggested' | 'auto_moved' | 'dismissed' | 'overridden';
 export type SupportConversationTriageSource = 'rule' | 'ai';
@@ -45,6 +45,12 @@ export interface SupportConversation {
   merge_participants?: string[];
   list_last_message_preview?: string;
   anonymized_at?: string | null;
+  /** Whether the request appears in the customer portal. */
+  portal_visible?: boolean;
+  /** The request type, and conversation field values by key. */
+  request_type_id?: string | null;
+  custom_fields?: Record<string, unknown>;
+  portal_visibility_changed_at?: string | null;
   id: string;
   workspace_id: string;
   mailbox_id?: string | null;
@@ -114,8 +120,132 @@ export interface SupportConversation {
   triage?: SupportConversationTriage | null;
   tags?: SupportTag[];
   system_tags?: SupportSystemTag[];
+  /** The customer's satisfaction rating once the conversation was rated. */
+  csat?: SupportConversationCSAT | null;
+  /** Hidden from team queues until this time, a customer reply, or a wake-up. */
+  snoozed_until?: string | null;
+  snoozed_by_user_id?: string | null;
+  sla?: SupportConversationSLA | null;
   created_at: string;
   updated_at: string;
+}
+
+export type SupportSLAMetric = 'first_response' | 'next_response' | 'resolution';
+export type SupportSLAState = 'pending' | 'paused' | 'achieved' | 'breached' | 'cancelled';
+
+export interface SupportConversationSLAItem {
+  metric: SupportSLAMetric;
+  state: SupportSLAState;
+  due_at?: string | null;
+  achieved_at?: string | null;
+  breached_at?: string | null;
+}
+
+export interface SupportConversationSLA {
+  policy_id?: string | null;
+  policy_name: string;
+  metrics: SupportConversationSLAItem[];
+  /** Earliest due time of a target still open, including overdue ones. */
+  next_due_at?: string | null;
+  /** An open target is overdue right now. */
+  breached: boolean;
+  /** The AI still owns the conversation; targets start at the handoff. */
+  ai_handling?: boolean;
+  /** No policy applies any more; open targets were stopped. */
+  ended?: boolean;
+}
+
+export interface SupportSLAPolicy {
+  id: string;
+  workspace_id: string;
+  name: string;
+  enabled: boolean;
+  position: number;
+  priorities: ConversationPriority[];
+  mailbox_ids: string[];
+  channels: string[];
+  /** SLA tier ids, or "none" for conversations whose company has no tier. */
+  company_tier_ids: string[];
+  company_ids: string[];
+  /** Names of the companies in company_ids. */
+  companies: { id: string; name: string }[];
+  request_type_ids?: string[];
+  first_response_minutes?: number | null;
+  next_response_minutes?: number | null;
+  resolution_minutes?: number | null;
+  business_hours: boolean;
+  pause_while_waiting: boolean;
+  /** Minutes before a target is due to warn; null when warnings are off. */
+  warn_before_minutes?: number | null;
+  /** Teammates notified on warnings and breaches, besides the usual ones. */
+  notify_user_ids: string[];
+  /** Also notify the company's customer success owner. */
+  notify_cs_owner: boolean;
+  /** Who takes an unassigned conversation when a warning fires. */
+  assign_unassigned_user_id?: string | null;
+  active_since: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SupportSLAPolicyInput {
+  name: string;
+  enabled?: boolean;
+  priorities: string[];
+  mailbox_ids: string[];
+  channels: string[];
+  company_tier_ids: string[];
+  company_ids: string[];
+  request_type_ids: string[];
+  first_response_minutes?: number | null;
+  next_response_minutes?: number | null;
+  resolution_minutes?: number | null;
+  business_hours: boolean;
+  pause_while_waiting: boolean;
+  warn_before_minutes: number | null;
+  notify_user_ids: string[];
+  notify_cs_owner: boolean;
+  assign_unassigned_user_id: string | null;
+}
+
+/** In a policy's company_tier_ids: companies without a tier, and conversations without a company. */
+export const SUPPORT_SLA_NO_TIER = 'none';
+
+/** A level of support promised to companies, such as Gold. */
+export interface SupportSLATier {
+  id: string;
+  workspace_id: string;
+  name: string;
+  description: string;
+  position: number;
+  company_count: number;
+  policy_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A company's tier and the enabled policies that can apply to it, in order. */
+export interface SupportCompanySLA {
+  company_id: string;
+  tier_id: string | null;
+  tier_name: string | null;
+  has_custom: boolean;
+  policies: {
+    id: string;
+    name: string;
+    custom: boolean;
+    priorities: ConversationPriority[];
+    first_response_minutes?: number | null;
+    next_response_minutes?: number | null;
+    resolution_minutes?: number | null;
+    business_hours: boolean;
+  }[];
+}
+
+export interface SupportConversationCSAT {
+  rating: number;
+  comment?: string | null;
+  submitted_at: string;
 }
 
 export interface SupportConversationUserState {
@@ -227,6 +357,7 @@ export interface SupportMailbox {
   description?: string | null;
   routing_prompt?: string | null;
   triage_eligible: boolean;
+  ai_replies_disabled?: boolean;
   linked_team_id?: string | null;
   linked_team_name?: string | null;
   visibility_mode: 'members_only';
@@ -335,6 +466,7 @@ export interface CreateSupportEmailSenderRequest {
 }
 
 export interface SetSupportEmailSenderDefaultRequest {
+  single_mailbox?: boolean;
   default_scope: 'none' | 'workspace' | 'mailbox';
   mailbox_id?: string | null;
   mailbox_ids?: string[];
@@ -383,6 +515,7 @@ export interface CreateSupportMailboxRequest {
   description?: string | null;
   routing_prompt?: string | null;
   triage_eligible?: boolean;
+  ai_replies_disabled?: boolean;
   linked_team_id?: string | null;
   workspace_member_ids: string[];
   assignment_mode: 'manual' | 'specific_member' | 'round_robin';
@@ -397,6 +530,7 @@ export interface UpdateSupportMailboxRequest {
   description?: string | null;
   routing_prompt?: string | null;
   triage_eligible?: boolean;
+  ai_replies_disabled?: boolean;
   linked_team_id?: string | null;
   workspace_member_ids?: string[];
   assignment_mode?: 'manual' | 'specific_member' | 'round_robin';
@@ -441,12 +575,39 @@ export interface CreateSupportTriageRuleRequest {
   target_mailbox_id: string;
 }
 
+/** Changes a macro or bulk action applies to a conversation; unset fields are left alone. */
+export interface SupportConversationActions {
+  status?: 'open' | 'waiting_on_customer' | 'resolved';
+  priority?: ConversationPriority;
+  /** A teammate's user ID, or an empty string to unassign. */
+  assign_user_id?: string;
+  /** An inbox ID, or "shared" for the main inbox. */
+  mailbox_id?: string;
+  add_tag_ids?: string[];
+  remove_tag_ids?: string[];
+  snooze_minutes?: number;
+}
+
+export interface SupportActionResult {
+  conversation_id: string;
+  applied: string[];
+  error?: string;
+}
+
+export interface SupportBulkActionResponse {
+  results: SupportActionResult[];
+  succeeded: number;
+  failed: number;
+}
+
 export interface SupportCannedResponse {
   id: string;
   workspace_id: string;
   short_code: string;
   content: string;
   tag: string;
+  /** Actions that make this shortcut a macro. */
+  actions?: SupportConversationActions;
   created_by_id: string | null;
   created_at: string;
   updated_at: string;
@@ -457,6 +618,7 @@ export interface CreateCannedResponseRequest {
   content: string;
   tag?: string;
   title?: string;
+  actions?: SupportConversationActions;
 }
 
 export interface UpdateCannedResponseRequest {
@@ -464,6 +626,7 @@ export interface UpdateCannedResponseRequest {
   content: string;
   tag?: string;
   title?: string;
+  actions?: SupportConversationActions;
 }
 
 export interface UpdateSupportTriageRuleRequest {
@@ -485,6 +648,25 @@ export interface SupportTeammatePresenceStatus {
 
 export interface ConversationListMeta {
   unread: UnreadStats;
+}
+
+/** Records that the viewer's own action left an inbox with nothing to reply to. */
+export interface RecordSupportInboxClearRequest {
+  conversation_id: string;
+  /** A team inbox, the main shared inbox, or the viewer's own queue. */
+  scope: 'mailbox' | 'shared' | 'mine';
+  mailbox_id: string | null;
+  /** Viewer's local date, YYYY-MM-DD. */
+  local_date: string;
+  /** Viewer's local midnight as an instant. */
+  day_start: string;
+}
+
+export interface SupportInboxClearStats {
+  streak_days: number;
+  clears_today: number;
+  resolved_today: number;
+  cleared_count: number;
 }
 
 export interface ConversationListResponse {
@@ -550,7 +732,7 @@ export interface SupportConversationSearchParams {
 }
 
 export interface SupportAttachmentPayload {
-  processing_status?: 'processing' | 'failed' | '';
+  processing_status?: 'processing' | 'failed' | 'rejected' | '';
   processing_error?: string;
   id: string;
   file_key: string;
@@ -603,9 +785,20 @@ export const SUPPORT_SYSTEM_EVENT_TYPES = [
   'reopened',
   'closed',
   'email_recipients_updated',
+  'visitor_email_requested',
+  'visitor_email_provided',
   'tag_added',
   'tag_removed',
   'task_created',
+  'csat_rated',
+  'priority_changed',
+  'snoozed',
+  'unsnoozed',
+  'sla_breached',
+  'task_linked',
+  'task_unlinked',
+  'request_type_changed',
+  'field_changed',
 ] as const;
 
 export type SupportSystemEventType = (typeof SUPPORT_SYSTEM_EVENT_TYPES)[number];
@@ -629,7 +822,7 @@ export interface SupportMessage {
   system_event_type?: SupportSystemEventType;
   is_internal: boolean;
   metadata?: string;
-  via_channel?: 'email' | 'widget' | null;
+  via_channel?: 'email' | 'widget' | 'portal' | null;
   email_notified_at?: string;
   widget_read_at?: string | null;
   email_read_at?: string;
@@ -669,6 +862,18 @@ export interface SupportMessagePage {
   data: SupportMessage[];
   has_more: boolean;
   next_cursor?: string;
+}
+
+/** A help-center article or file the team sent to the customer in a reply. */
+export interface SupportSharedItem {
+  kind: 'doc' | 'file';
+  id: string;
+  title: string;
+  url: string;
+  file_type?: string;
+  file_size?: number;
+  message_id: string;
+  shared_at: string;
 }
 
 export interface UpdateSupportNoteRequest {
@@ -1090,6 +1295,9 @@ export interface LinkTaskRequest {
 }
 
 export interface CreateTaskFromConversationRequest {
+  owner_member_ids?: string[];
+  assigned_agent_id?: string;
+  run_on_create?: boolean;
   reviewed_draft?: boolean;
   source_hash?: string;
   team_id: string;
@@ -1120,6 +1328,7 @@ export interface CreateTaskFromConversationRequest {
 }
 
 export interface CreateTaskFromConversationResponse {
+  agent_run_error?: string;
   task_id: string;
   display_id: number;
   task_key: string;
@@ -1159,10 +1368,18 @@ export interface UpdateConversationEmailRecipientsRequest {
 
 // ── Support Installation Settings ───────────────────────────────────
 
+/** One open time range as "HH:MM"; end may be "24:00" for midnight. */
+export interface BusinessHoursSlot {
+  start: string;
+  end: string;
+}
+
 export interface BusinessHoursDay {
+  /** Mirrors the first slot for settings saved before slots existed. */
   start: string;
   end: string;
   enabled: boolean;
+  slots?: BusinessHoursSlot[];
 }
 
 export interface SupportInboxSettings {
@@ -1172,6 +1389,7 @@ export interface SupportInboxSettings {
  translation_outgoing_enabled?: boolean;
  translation_customer_language?: string;
  default_agent_language?: string;
+  email_capture_timing: 'after_ai_reply' | 'before_handoff' | 'never';
   require_email_before_chat: boolean;
   require_phone_after_email: boolean;
   welcome_message: string;
@@ -1185,6 +1403,8 @@ export interface SupportInboxSettings {
   ai_reply_channels?: 'chat' | 'email' | 'both';
   ai_max_followups: number;
   ai_follow_up_enabled: boolean;
+  /** Lets the AI check a connected repository before replying by email. */
+  ai_email_code_check_enabled?: boolean;
   ai_follow_up_delay_hours: number;
   ai_follow_up_second_delay_hours: number;
   ai_follow_up_close_hours: number;
@@ -1194,6 +1414,8 @@ export interface SupportInboxSettings {
   escalation_message: string;
   escalation_message_busy?: string;
   escalation_message_after_hours?: string;
+  email_handoff_message?: string;
+  email_handoff_message_after_hours?: string;
   delayed_team_reply_minutes?: number;
   delayed_team_reply_message?: string;
   delayed_team_reply_message_no_email?: string;
@@ -1212,6 +1434,7 @@ export interface SupportInboxSettings {
   triage_daily_budget: number;
   triage_skip_spam_conversations: boolean;
   triage_deduplicate_first_message: boolean;
+  ai_priority_enabled: boolean;
   business_hours_enabled: boolean;
   business_hours_timezone: string;
   business_hours_schedule: Record<string, BusinessHoursDay>;
@@ -1234,9 +1457,23 @@ export interface SupportInboxSettings {
   logo_url: string;
   launcher_position: string;
   launcher_icon: string;
+  ai_display_name?: string;
   widget_name: string;
   widget_avatar_url: string;
   widget_help_space_ids: string[];
+  portal_enabled: boolean;
+  portal_requests_only: boolean;
+  portal_anonymous_intake_enabled: boolean;
+  portal_intake_enabled: boolean;
+  /** Show customers when the team's reply is due on portal requests. */
+  portal_show_reply_by?: boolean;
+  /** Whom requesters may copy on portal requests; empty turns copying off. */
+  portal_cc_mode?: '' | 'colleagues' | 'any';
+  /** Ask AI help assistant on the help center and in the customer portal. */
+  help_assistant_enabled?: boolean;
+  portal_access_mode?: CustomerPortalAccessMode;
+  portal_ai_mode?: 'off' | 'internal_note';
+  portal_ai_agent_id?: string | null;
   csat_enabled: boolean;
   file_uploads_enabled: boolean;
   force_visitor_identity: boolean;
@@ -1260,6 +1497,8 @@ export interface SupportInstallationResponse extends WidgetOriginSettings {
   id: string;
   workspace_id: string;
   widget_key: string;
+  /** Origins from the workspace website, offered only while `allowed_origins` is empty. Not saved. */
+  suggested_allowed_origins?: string[];
   /** Whether an identity signing secret exists. The secret is only returned by reveal/rotate. */
   signing_secret_configured?: boolean;
   settings: SupportInboxSettings;
@@ -1310,6 +1549,93 @@ export interface SupportTranslation {
  expires_at?: string;
 }
 
+export type CustomerPortalAccessMode = 'approved_contacts' | 'company_members' | 'any_verified_email';
+export type CustomerPortalContactAccessValue = 'allowed' | 'blocked';
+
+export interface CustomerPortalAccessSummary {
+  access_mode: CustomerPortalAccessMode;
+  allowed_contacts: number;
+  conflicts: number;
+  conflict_emails: string[];
+  anonymous_intake_delivery_available: boolean;
+  /** Where customers reach the portal: the help center at /requests, or the app. */
+  public_url?: string;
+}
+
+export interface CustomerPortalContactAccess {
+  portal_access: CustomerPortalContactAccessValue | null;
+  /** Overrides the default role of the contact's companies; null follows them. */
+  portal_role?: CustomerPortalRole | null;
+  shared_email_contacts: number;
+}
+
+/** Requesters see their own requests; members see every request from their company. */
+export type CustomerPortalRole = 'requester' | 'member';
+/** A role in one company; admin exists only there. */
+export type CustomerPortalCompanyRole = CustomerPortalRole | 'admin';
+
+export interface CustomerPortalCompanyContact {
+  id: string;
+  first_name: string;
+  last_name?: string | null;
+  email?: string | null;
+  portal_access: CustomerPortalContactAccessValue | null;
+  portal_role: CustomerPortalRole | null;
+  /** The contact's role in this company, which wins over portal_role here. */
+  company_role?: CustomerPortalCompanyRole | null;
+  /** A support admin gave this contact access to the company's portal requests. */
+  member: boolean;
+  shared_email_contacts: number;
+  last_signed_in_at?: string | null;
+}
+
+export interface CustomerPortalCompanyAccess {
+  /** Null keeps the portal personal for this company's contacts. */
+  default_role: CustomerPortalRole | null;
+  /** The company's email domain; bulk adding needs it. */
+  domain?: string | null;
+  contacts: CustomerPortalCompanyContact[];
+  access_mode: CustomerPortalAccessMode;
+  portal_enabled: boolean;
+  /** How many of the company's requests members could see. */
+  request_count: number;
+  /** Company admins may invite colleagues; any_domain lifts the company domain rule. */
+  admin_invites?: boolean;
+  invite_any_domain?: boolean;
+  /** Recent changes company admins made to the company's people. */
+  activity?: CustomerPortalCompanyEvent[];
+}
+
+export interface CustomerPortalCompanyEvent {
+  id: string;
+  event_type: 'invited' | 'role_changed' | 'removed';
+  subject_email: string;
+  before?: string | null;
+  after?: string | null;
+  actor_name?: string;
+  occurred_at: string;
+}
+
+export interface CustomerPortalCompanyAudience {
+  company_id: string;
+  company_name: string;
+  /** Allowed company members besides the requester who can read the conversation. */
+  members: number;
+}
+
+/** What a teammate should know about a conversation's portal side. */
+export interface CustomerPortalConversationContext {
+  company: CustomerPortalCompanyAudience | null;
+  /** Help center articles the customer saw while writing the request. */
+  intake: {
+    /** Public articles carry their help center url; articles for signed-in customers carry portal_article_id instead. */
+    opened_articles: Array<{ id: string; title: string; space_name?: string; url?: string; portal_article_id?: string }>;
+    /** The help assistant conversation that handed the customer off, if any. */
+    assistant?: Array<{ role: 'user' | 'assistant'; content: string; status: string; citations: Array<{ article_id: string; title: string; url?: string }> }>;
+    suggested_count: number;
+  } | null;
+}
+
 export interface SupportConversationMerge {
   id: string;
   operation_id: string;
@@ -1340,4 +1666,65 @@ export interface SupportMergeResult {
   conversation_id: string;
   affected_ids: string[];
   merges: SupportConversationMerge[];
+}
+
+export type WebhookEventType =
+  | 'conversation.created'
+  | 'conversation.status_changed'
+  | 'conversation.assigned'
+  | 'conversation.priority_changed'
+  | 'conversation.snoozed'
+  | 'message.created'
+  | 'sla.warning'
+  | 'sla.breached'
+  | 'csat.submitted';
+
+export interface WebhookEndpoint {
+  id: string;
+  workspace_id: string;
+  url: string;
+  description: string;
+  /** Subscribed events; empty means every event. */
+  events: WebhookEventType[];
+  /** Inboxes to send events for; empty means every inbox. */
+  mailbox_ids: string[];
+  secret_hint: string;
+  enabled: boolean;
+  disabled_reason: string;
+  failure_count: number;
+  last_success_at?: string | null;
+  last_failure_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebhookEndpointInput {
+  url: string;
+  description: string;
+  events: WebhookEventType[];
+  mailbox_ids: string[];
+  enabled?: boolean;
+}
+
+/** Returned once when a webhook is created or its secret rotated. */
+export interface WebhookEndpointSecret {
+  endpoint: WebhookEndpoint;
+  secret: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  endpoint_id: string;
+  event_id: string;
+  event_type: WebhookEventType | 'ping';
+  payload: unknown;
+  status: 'pending' | 'succeeded' | 'failed';
+  attempts: number;
+  next_attempt_at: string;
+  last_status_code?: number | null;
+  last_error: string;
+  last_attempt_at?: string | null;
+  duration_ms?: number | null;
+  delivered_at?: string | null;
+  created_at: string;
 }

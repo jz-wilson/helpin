@@ -21,6 +21,7 @@ import { Button } from '@/components/ui/button';
 import { QuietSearchInput } from '@/components/design-system/quiet';
 import { UserAvatar } from '@/components/pm/UserAvatar';
 import { CreateContactDialog } from '@/components/crm/CreateContactDialog';
+import { openTaskPanelFromLink } from '@/components/pm/task-detail/taskRouteNavigation';
 import { useContact, useContactAssociations, useContactSupportConversations, useUpdateContact } from '@/hooks/queries/useCRM';
 import { crmSearchService } from '@/lib/services/crmService';
 import { supportService } from '@/lib/services/supportService';
@@ -28,6 +29,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import { cn } from '@/lib/utils';
 import type { CRMContact, CRMAssociationEnriched, CRMSearchResult, CreateCRMContactRequest, LeadStatus, LifecycleStage, UpdateCRMContactRequest } from '@/lib/crmTypes';
 import type { SupportConversation } from '@/lib/pmTypes';
+import { LIFECYCLE_STAGE_OPTIONS } from '@/lib/crmLifecycle';
 
 interface CustomerProfileDrawerProps {
   workspaceId: string;
@@ -36,16 +38,6 @@ interface CustomerProfileDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
-
-const lifecycleOptions: Array<{ value: LifecycleStage; label: string }> = [
-  { value: 'subscriber', label: 'Subscriber' },
-  { value: 'lead', label: 'Lead' },
-  { value: 'marketing_qualified', label: 'Marketing Qualified' },
-  { value: 'sales_qualified', label: 'Sales Qualified' },
-  { value: 'opportunity', label: 'Opportunity' },
-  { value: 'customer', label: 'Customer' },
-  { value: 'evangelist', label: 'Evangelist' },
-];
 
 const leadStatusOptions: Array<{ value: LeadStatus; label: string }> = [
   { value: 'new', label: 'New' },
@@ -301,7 +293,7 @@ export function CustomerProfileDrawer({
                   <ProfileRow icon={Tag01Icon} label="Stage">
                     <ProfileSelect
                       value={contact.lifecycle_stage}
-                      options={lifecycleOptions}
+                      options={LIFECYCLE_STAGE_OPTIONS}
                       disabled={updateContact.isPending}
                       onChange={(value) => patchContact({ lifecycle_stage: value as LifecycleStage })}
                     />
@@ -575,7 +567,12 @@ function AssociationLink({ item, icon: Icon, workspaceSlug }: { item: LinkedAsso
   }
 
   return (
-    <Link to={href.to as never} params={href.params as never} className="flex items-center gap-2 rounded-md px-1 py-1.5 text-xs transition-colors hover:bg-muted/40">
+    <Link
+      to={href.to as never}
+      params={href.params as never}
+      onClick={item.linkedType === 'task' ? (event) => openTaskPanelFromLink(event, item.linkedId) : undefined}
+      className="flex items-center gap-2 rounded-md px-1 py-1.5 text-xs transition-colors hover:bg-muted/40"
+    >
       {content}
     </Link>
   );

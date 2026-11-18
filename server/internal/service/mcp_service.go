@@ -126,6 +126,9 @@ type MCPService struct {
 	checklists     mcpPMChecklistService
 	crmContacts    *CRMContactService
 	crmDeals       *CRMDealService
+	crmCompanies   *CRMCompanyService
+	crmActivities  *CRMActivityService
+	crmUpserter    *CRMRecordUpsertService
 	supportSetup   mcpSupportSetupReader
 	workspaceSetup mcpWorkspaceSetupReader
 	support        *SupportInboxService
@@ -138,10 +141,13 @@ type MCPService struct {
 	attachments      mcpAttachmentService
 	docsContent      mcpDocsContentReader
 	pmComments       mcpPMCommentLister
+	pmCommentDeleter mcpPMCommentDeleter
 	fetchImage       mcpImageFetcher
 	config           MCPServiceConfig
 	tools            map[string]MCPToolDefinition
 	toolSchemas      map[string]*jsonschema.Resolved
+	// extensions holds tools added by RegisterToolExtensions, by name.
+	extensions map[string]MCPToolExtension
 }
 
 // NewMCPService creates the public MCP service boundary.
@@ -462,6 +468,9 @@ func (s *MCPService) CreateServicePrincipal(ctx context.Context, workspaceID, us
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := serviceAccountWriteGrantError(req.ReadOnly, readOnly, policy); err != nil {
+		return nil, nil, err
+	}
 	principal := &model.MCPServicePrincipal{
 		ID:          uuid.NewString(),
 		WorkspaceID: workspaceID,
@@ -628,7 +637,7 @@ func (s *MCPService) resolveEffectivePrincipal(ctx context.Context, principal *m
 }
 
 func (s *MCPService) canUseTool(ctx context.Context, principal *model.MCPPrincipal, actor *authorization.Actor, tool MCPToolDefinition) bool {
-	if !s.platformToolEnabled(tool) {
+	if !s.platformToolEnabled(tool) || !s.extensionToolAvailable(tool.Name, principal.WorkspaceID) {
 		return false
 	}
 	if !containsMCPValue(principal.Toolsets, tool.Toolset) || !containsMCPValue(principal.Scopes, tool.Scope) {
@@ -872,7 +881,7 @@ func hasMCPWriteGrant(scopes, toolsets []string) bool {
 }
 
 func isMCPWriteScope(scope string) bool {
-	return strings.HasSuffix(scope, ".write") || scope == MCPScopeAgentsRun || scope == MCPScopeDocsPublish
+	return strings.HasSuffix(scope, ".write") || scope == MCPScopeAgentsRun || scope == MCPScopeDocsPublish || scope == MCPScopeSupportReply
 }
 
 func decodeMCPStrings(raw json.RawMessage) []string {
@@ -920,4 +929,17 @@ func resolveMCPToolSchema(input map[string]any) (*jsonschema.Resolved, error) {
 		return nil, fmt.Errorf("resolve MCP tool schema: %w", err)
 	}
 	return resolved, nil
+}
+
+// serviceAccountWriteGrantError refuses an explicit request for write access
+// that the policy reduced to read-only, so a service account never silently
+// loses the access its creator asked for and only fails later on writes.
+func serviceAccountWriteGrantError(requestedReadOnly, grantedReadOnly bool, policy *model.MCPWorkspacePolicy) error {
+	if requestedReadOnly || !grantedReadOnly {
+		return nil
+	}
+	if policy.EnforceReadOnly {
+		return fmt.Errorf("write access is not allowed: turn on bounded writes in the workspace MCP policy, or create a read-only account")
+	}
+	return fmt.Errorf("write access needs a write scope that the workspace MCP policy allows for one of the selected toolsets")
 }

@@ -1,3 +1,4 @@
+import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard';
 import { useEffect, useMemo, useState } from 'react';
 import { format, isThisMonth } from 'date-fns';
 import { toast } from 'sonner';
@@ -123,7 +124,7 @@ function MessageBlock({ message, workspaceId }: { message: CRMEmailMessage; work
         </div>
         <details className="mt-1 text-xs text-muted-foreground"><summary className="cursor-pointer">Message details</summary><div className="mt-2 space-y-1 break-all"><div>From: {message.from_address}</div><div>To: {message.to_addresses.join(', ')}</div>{message.cc_addresses.length > 0 && <div>Cc: {message.cc_addresses.join(', ')}</div>}</div></details>
         <div className="pm-rich-text mt-2 max-w-[680px]">
-          {message.body_html ? <EmailBodyRenderer html={message.body_html} collapsedByDefault constrainHeight={false} /> : <p className="whitespace-pre-wrap break-words">{message.body_text || 'No message body'}</p>}
+          {message.body_html ? <EmailBodyRenderer themeAware html={message.body_html} collapsedByDefault constrainHeight={false} /> : <p className="whitespace-pre-wrap break-words">{message.body_text || 'No message body'}</p>}
         </div>
         {message.attachments?.length ? (
           <div className="mt-3 flex flex-wrap gap-1.5">
@@ -190,12 +191,10 @@ export function EmailTimeline({
   const draftKey = `${workspaceId}:${selectedThreadId}`;
   const replyHTML = replyDrafts[draftKey] ?? '';
   const setReplyHTML = (html: string) => setReplyDrafts((drafts) => ({ ...drafts, [draftKey]: html }));
-  useEffect(() => {
-    if (!replyBusy && !Object.values(attachmentDrafts).some((draft) => draft.attachments.length > 0) && !Object.values(replyDrafts).some((html) => html.replace(/<[^>]+>/g, '').trim())) return;
-    const protect = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
-    window.addEventListener('beforeunload', protect);
-    return () => window.removeEventListener('beforeunload', protect);
-  }, [replyDrafts, attachmentDrafts, replyBusy]);
+  useUnsavedChangesGuard(
+    replyBusy || Object.values(attachmentDrafts).some(draft => draft.attachments.length > 0) || Object.values(replyDrafts).some(html => Boolean(html.replace(/<[^>]+>/g, '').trim())),
+    'Send or discard your email drafts before refreshing.',
+  );
 
   useEffect(() => {
     if (!dealOpen || dealQuery.trim().length < 2) return;

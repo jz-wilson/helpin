@@ -15,6 +15,7 @@ import { AIThinkingMark } from './AIThinkingMark';
 import { CsatRating } from './CsatRating';
 import { ChevronLeftIcon, MoreVerticalIcon, XIcon } from './icons';
 import { resolveWelcomeMessage } from '../welcomeMessage';
+import { availabilityStatusText } from '../utils';
 
 
 interface ConversationViewProps {
@@ -43,13 +44,13 @@ interface ConversationViewProps {
   showPreChatForm?: boolean;
   contactCaptureCompleted?: boolean;
   onCaptureEmail?: (email: string) => Promise<void>;
-  onPreChatSubmit?: (data: { phone: string; email: string }) => void;
+  onPreChatSubmit?: (data: { phone: string; email: string }) => void | Promise<void>;
   onImageClick?: (src: string, alt: string) => void;
   onAnswerFeedback?: (messageId: string, helpful: boolean) => Promise<boolean>;
   connectionStatus?: 'idle' | 'connecting' | 'connected' | 'disconnected' | 'failed';
   queuedMessageCount?: number;
   csatSubmitted?: boolean;
-  onCsatSubmit?: (rating: number, feedback?: string) => void;
+  onCsatSubmit?: (rating: number, feedback?: string) => void | Promise<void>;
 }
 
 export const ConversationView: FunctionComponent<ConversationViewProps> = ({
@@ -95,6 +96,11 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
   );
   const [introCreatedAt] = useState(() => new Date().toISOString());
   const [preChatDone, setPreChatDone] = useState(false);
+  const emailDismissalKey = `helpin_email_dismissed_${config.workspaceId}_${conversationKey}`;
+  const readEmailDismissal = () => {
+    try { return sessionStorage.getItem(emailDismissalKey) === '1'; } catch { return false; }
+  };
+  const [emailDismissed, setEmailDismissed] = useState(readEmailDismissal);
   const [showHumanContactForm, setShowHumanContactForm] = useState(false);
   const uploads = useAttachmentUploads(conversationKey, onUploadAttachment);
   const { pendingAttachments } = uploads;
@@ -112,7 +118,10 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
   const autoExpandedConversationRef = useRef<string | null>(null);
 
   const workspaceName = config.workspaceName || 'Support';
+  const aiDisplayName = config.aiDisplayName?.trim() || 'Helpin AI';
   const logoUrl = config.branding?.logoUrl;
+  const avatarUrl = config.branding?.avatarUrl;
+  const identityAvatar = avatarUrl || logoUrl;
   const brandColor = config.branding?.primaryColor || '#6366f1';
   const availability = config.availability;
   const aiFirst = Boolean(config.features?.aiFirst);
@@ -130,6 +139,20 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
       message.content.trim() === 'Let me connect you with a team member who can help further.'
     ),
   );
+  const emailTiming = config.features.emailCaptureTiming ?? (config.features.preChatForm ? 'before_handoff' : 'never');
+  const needsEmail = !transcriptEmail && !preChatDone;
+  const isFinished = ['resolved', 'closed', 'spam'].includes(conversation?.status || '')
+    || ['resolved_by_human', 'resolved_by_ai'].includes(conversation?.flowState || '');
+  // Explicit current flow takes priority over historical AI escalation state.
+  const hasCurrentHumanHandoff = conversation?.flowState
+    ? ['waiting_for_human', 'queued_for_human', 'after_hours_queue', 'assigned_to_human'].includes(conversation.flowState)
+    : conversation?.aiState === 'escalated';
+  const showRequiredHandoffEmailForm = emailTiming === 'before_handoff' && config.features.forceIdentify
+    && needsEmail && hasCurrentHumanHandoff && !isFinished;
+  const hasAIReply = messages.some(message => message.role === 'ai' && !message.isInternal && message.aiProgressState !== 'checking');
+  const showAIEmailForm = emailTiming === 'after_ai_reply' && needsEmail && hasAIReply && !isAIThinking
+    && (config.features.forceIdentify || (!emailDismissed && !contactCaptureCompleted));
+  const showEmailForm = showHumanContactForm || showAIEmailForm || showRequiredHandoffEmailForm;
   const fileUploadsEnabled = Boolean(config.features?.fileUploads && onUploadAttachment);
   const composeDisabled = connectionStatus === 'connecting';
   const composePlaceholder = connectionStatus === 'failed'
@@ -158,14 +181,14 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
   const delayedEmailCapture = delayedReplyIndex >= 0
     && messages[delayedReplyIndex].captureEmail === true
     && !messages.slice(delayedReplyIndex + 1).some((message) => message.role === 'agent');
-  const showEscalationEmailCapture = (nobodyAvailable || delayedEmailCapture)
+  const showEscalationEmailCapture = config.features.emailCaptureTiming !== 'never' && (nobodyAvailable || delayedEmailCapture)
     && Boolean(onCaptureEmail)
     && conversation?.status !== 'resolved'
     && conversation?.status !== 'closed'
     && !transcriptEmail
     && (delayedEmailCapture || !hasHumanReply)
     && (delayedEmailCapture || (!contactCaptureCompleted && !preChatDone))
-    && !showHumanContactForm
+    && !showEmailForm
     && emailCaptureStatus !== 'saved';
   const showTalkToHumanButton = Boolean(
     config.features?.showTalkToHuman &&
@@ -176,12 +199,6 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
       !isAIThinking &&
       !isTyping,
   );
-  const isFinished = ['resolved', 'closed', 'spam'].includes(conversation?.status || '')
-    || ['resolved_by_human', 'resolved_by_ai'].includes(conversation?.flowState || '');
-  // Explicit current flow takes priority over historical AI escalation state.
-  const hasCurrentHumanHandoff = conversation?.flowState
-    ? ['waiting_for_human', 'queued_for_human', 'after_hours_queue', 'assigned_to_human'].includes(conversation.flowState)
-    : conversation?.aiState === 'escalated';
   const latestCustomerIndex = messages.reduce((latest, message, index) =>
     !message.isInternal && message.role === 'customer' ? index : latest, -1);
   const latestHumanIndex = messages.reduce((latest, message, index) =>
@@ -217,18 +234,18 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (m.role === 'ai') {
-        return { name: 'Helpin AI', avatar: m.senderAvatar, isAI: true };
+        return { name: aiDisplayName, avatar: avatarUrl || m.senderAvatar, isAI: true };
       }
       if (m.role === 'agent' && m.senderName) {
         return { name: m.senderName, avatar: m.senderAvatar, isAI: false };
       }
     }
     return null;
-  }, [messages]);
+  }, [messages, aiDisplayName, avatarUrl]);
 
   const introRole = aiFirst ? 'ai' as const : 'agent' as const;
-  const introName = aiFirst ? 'Helpin AI' : workspaceName;
-  const introAvatar = aiFirst ? undefined : (logoUrl || undefined);
+  const introName = aiFirst ? aiDisplayName : workspaceName;
+  const introAvatar = aiFirst ? avatarUrl : (identityAvatar || undefined);
   const showActiveAgentHeader = Boolean(activeAgent?.name) && !showHumanHandoffState;
   const teammateStatus = activeTeammate?.status || 'online';
 
@@ -241,19 +258,21 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
     setEmailCaptureError('');
     setAutoExpandDismissed(false);
     setShowHumanContactForm(false);
+    setEmailDismissed(readEmailDismissal());
+    setPreChatDone(false);
     autoExpandedConversationRef.current = null;
   }, [conversationKey]);
 
   const requestHumanSupport = () => {
-    if (showPreChatForm && !preChatDone && onPreChatSubmit) {
+    if (emailTiming !== 'never' && needsEmail && onPreChatSubmit && (showPreChatForm || config.features.forceIdentify)) {
       setShowHumanContactForm(true);
       return;
     }
     onEscalateToHuman?.();
   };
 
-  const completeHumanSupportRequest = (data: { phone: string; email: string }) => {
-    onPreChatSubmit?.(data);
+  const completeHumanSupportRequest = async (data: { phone: string; email: string }) => {
+    await onPreChatSubmit?.(data);
     setPreChatDone(true);
     setShowHumanContactForm(false);
     onEscalateToHuman?.();
@@ -398,6 +417,12 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
                 />
               )}
             </div>
+          ) : avatarUrl ? (
+            <img
+              src={avatarUrl}
+              alt={aiFirst && !showHumanHandoffState ? aiDisplayName : workspaceName}
+              className="helpin-conversation-logo helpin-agent-avatar"
+            />
           ) : logoUrl ? (
             <div
               className="helpin-conversation-logo helpin-conversation-logo--brand"
@@ -405,7 +430,7 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
             >
               <img
                 src={logoUrl}
-                alt={workspaceName}
+                alt={aiFirst && !showHumanHandoffState ? aiDisplayName : workspaceName}
                 className="helpin-conversation-brand-logo"
               />
             </div>
@@ -426,14 +451,14 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
             ) : (
               <>
                 <span className="helpin-conversation-title">
-                  {showHumanHandoffState ? workspaceName : (aiFirst ? 'Helpin AI' : workspaceName)}
+                  {showHumanHandoffState ? workspaceName : (aiFirst ? aiDisplayName : workspaceName)}
                 </span>
                 <span className="helpin-conversation-subtitle">
                   {showHumanHandoffState
                     ? availability?.replyTimeText || availability?.outsideHoursMessage || 'Our team will follow up as soon as someone is available.'
                     : aiFirst
                       ? 'Our AI assistant will reply first'
-                      : availability?.statusText || 'Online now'}
+                      : availabilityStatusText(availability) || 'Online now'}
                 </span>
               </>
             )}
@@ -622,13 +647,7 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
           </span>
         </div>
       )}
-      {showHumanContactForm && (
-        <PreChatForm
-          config={config}
-          onSubmit={completeHumanSupportRequest}
-        />
-      )}
-      {showTalkToHumanButton && !showHumanContactForm && (
+      {showTalkToHumanButton && !showEmailForm && (
         <div className="helpin-talk-to-human">
           <button type="button" className="helpin-talk-to-human-btn" onClick={requestHumanSupport}>
             Talk to a person
@@ -669,7 +688,28 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
             : `${queuedMessageCount === 1 ? '1 message saved' : `${queuedMessageCount} messages saved`} — sending automatically when reconnected`}
         </div>
       )}
-      <ComposeBar
+      {showEmailForm ? (
+        <div className="helpin-email-composer">
+          <PreChatForm
+            config={config}
+            purpose={showHumanContactForm ? 'handoff' : 'chat'}
+            onDismiss={config.features.forceIdentify ? undefined : () => {
+              setEmailDismissed(true);
+              try { sessionStorage.setItem(emailDismissalKey, '1'); } catch { /* Storage may be unavailable. */ }
+              setShowHumanContactForm(false);
+            }}
+            onSubmit={async (data) => {
+              if (showHumanContactForm) {
+                await completeHumanSupportRequest(data);
+              } else {
+                if (onPreChatSubmit) await onPreChatSubmit(data);
+                else if (data.email && onCaptureEmail) await onCaptureEmail(data.email);
+                setPreChatDone(true);
+              }
+            }}
+          />
+        </div>
+      ) : <ComposeBar
         draftScope={conversationKey}
         notice={showPrivacyNotice && policyUrl ? (
           <PrivacyNotice
@@ -694,7 +734,7 @@ export const ConversationView: FunctionComponent<ConversationViewProps> = ({
         placeholder={composePlaceholder}
         workspaceId={config.workspaceId}
         workspaceName={config.workspaceName}
-      />
+      />}
 
       {lightboxImage && (
         <ImageLightbox

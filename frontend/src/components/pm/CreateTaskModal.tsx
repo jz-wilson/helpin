@@ -1,3 +1,6 @@
+import { mergePreparedTaskDraft, type PreparedTaskDraft, type DraftEdits } from './preparedTaskDraft';
+import type { ReactNode } from 'react';
+import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard';
 import { TeamColorMark } from '@/components/workspace/TeamLabel';
 import { TaskDraftSuggestions } from './TaskDraftSuggestions';
 import { EPIC_PICKER_WIDTH } from '@/components/pm/epicPickerGroups';
@@ -121,6 +124,12 @@ interface CreateTaskModalProps {
   initialEpicId?: string;
   initialOwnerMemberId?: string;
   initialSprintId?: string;
+  preparationContent?: ReactNode;
+  renderPreparation?: (state: { error: string; retry: () => void; cancel: () => void }) => ReactNode;
+  prepareDraft?: (teamId: string) => Promise<PreparedTaskDraft>;
+  onDraftPrepared?: (draft: PreparedTaskDraft, teamId: string) => void;
+  creationBlocked?: boolean;
+  supportSource?: boolean;
   onCreate?: (payload: CreateTaskRequest) => Promise<CreatedTaskResult | void>;
   stackedOverDrawer?: boolean;
   mode?: 'task' | 'template';
@@ -297,6 +306,7 @@ export function CreateTaskModal({
   initialOwnerMemberId,
   initialSprintId,
   onCreate,
+  preparationContent, renderPreparation, prepareDraft, onDraftPrepared, creationBlocked = false, supportSource = false,
   stackedOverDrawer = false,
   mode = 'task',
   editingTemplate,
@@ -306,6 +316,13 @@ export function CreateTaskModal({
   const { currentWorkspace } = useWorkspaceStore();
   const isTemplateMode = mode === 'template';
   const [form, setForm] = useState(defaultState);
+  const draftEdits = useRef<DraftEdits>({});
+  const supportInitialized = useRef(false);
+  const [draftPending, setDraftPending] = useState(false);
+  const [draftError, setDraftError] = useState('');
+  const [draftRetry, setDraftRetry] = useState(0);
+  const preparedCallback = useRef(onDraftPrepared);
+  useEffect(() => { preparedCallback.current = onDraftPrepared; }, [onDraftPrepared]);
   const initialDescRef = useRef('');
   const [stateId, setStateId] = useState(initialStateId ?? '');
   const [saveTaskAsTemplate, setSaveTaskAsTemplate] = useState(false);
@@ -401,7 +418,11 @@ export function CreateTaskModal({
   }, [form.team_id, open, showPlanningRepository, workspaceId]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) { supportInitialized.current = false; return; }
+    if (supportSource && supportInitialized.current) return;
+    supportInitialized.current = true;
+    draftEdits.current = {};
+    setDraftError('');
     setDescriptionEditorKey((current) => current + 1);
     if (isTemplateMode && editingTemplate) {
       const nextForm: CreateTaskFormState = {
@@ -468,7 +489,7 @@ export function CreateTaskModal({
     setRecurringDraft(null);
     setRecurringDialogOpen(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- `teams` excluded: only used to derive initial task type; including it causes form reset on background refetch
-  }, [open, initialStateId, initialName, initialTaskType, initialPriority, initialSeverity, initialTeamId, initialEpicId, initialOwnerMemberId, initialSprintId, currentMemberId, isTemplateMode, editingTemplate]);
+  }, [open, initialStateId, initialName, initialTaskType, initialPriority, initialSeverity, initialTeamId, initialEpicId, initialOwnerMemberId, initialSprintId, currentMemberId, isTemplateMode, editingTemplate, supportSource]);
 
   useEffect(() => {
     if (!open || !isTemplateMode) return;
@@ -504,7 +525,7 @@ export function CreateTaskModal({
 
   useEffect(() => {
     if (!open || isTemplateMode) return;
-    if (!workflow || !form.team_id || workflow.workflow.team_id === form.team_id) {
+    if (!form.team_id || workflow?.workflow.team_id === form.team_id) {
       setTaskWorkflowOverride(null);
       return;
     }
@@ -522,7 +543,7 @@ export function CreateTaskModal({
       setTaskWorkflowOverride(nextWorkflow);
       setStateId((current) => {
         if (current && nextWorkflow.states.some((state) => state.id === current)) return current;
-        const currentState = workflow.states.find((state) => state.id === current);
+        const currentState = workflow?.states.find((state) => state.id === current);
         return (
           (currentState
             ? nextWorkflow.states.find((state) => state.state_type === currentState.state_type)?.id ??
@@ -661,13 +682,41 @@ export function CreateTaskModal({
     };
   }, [form.epic_id, isTemplateMode, workspaceId]);
 
+  // Draft loading synchronizes the selected team with an external async source.
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    if (!open || !prepareDraft || !form.team_id) { setDraftPending(false); return; }
+    let cancelled = false;
+    setDraftPending(true);
+    setDraftError('');
+    void prepareDraft(form.team_id).then((draft) => {
+      if (cancelled) return;
+      setForm(current => mergePreparedTaskDraft(current, draft, draftEdits.current));
+      if (!draftEdits.current.description) {
+        setDescriptionEditorKey(key => key + 1);
+        setDescriptionMode('rich');
+      }
+      setTaskTypeDirty(true);
+      preparedCallback.current?.(draft, form.team_id);
+    }).catch((cause) => {
+      if (cancelled) return;
+      const reason = getUpgradeRequiredReason(cause);
+      if (reason) setUpgradeDialogReason(reason);
+      setDraftError(reason ? 'Draft preparation needs an upgrade.' : 'Couldn’t prepare the draft. Your edits are preserved.');
+    }).finally(() => { if (!cancelled) setDraftPending(false); });
+    return () => { cancelled = true; };
+  }, [open, prepareDraft, form.team_id, draftRetry]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
   const canSubmit = useMemo(
     () =>
+      !creationBlocked && !draftPending && !draftError &&
       descriptionPendingUploads === 0 &&
       form.name.trim().length > 0 &&
       form.team_id.trim().length > 0 &&
-      stateId.trim().length > 0,
-    [descriptionPendingUploads, form.name, form.team_id, stateId]
+      stateId.trim().length > 0 &&
+      (!supportSource || activeWorkflow?.workflow.team_id === form.team_id),
+    [creationBlocked, draftPending, draftError, descriptionPendingUploads, form.name, form.team_id, stateId, supportSource, activeWorkflow]
   );
 
   const currentStateName = useMemo(
@@ -754,6 +803,13 @@ export function CreateTaskModal({
     }
     const tmpl = templates.find((t) => t.id === templateId);
     if (!tmpl) return;
+    draftEdits.current = {
+      ...draftEdits.current,
+      name: true,
+      ...(tmpl.description && { description: true }),
+      ...(tmpl.task_type && { task_type: true }),
+      ...(tmpl.priority && { priority: true }),
+    };
     setSelectedTemplateId(tmpl.id);
     setTaskTypeDirty(Boolean(tmpl.task_type));
     setForm((prev) => ({
@@ -822,9 +878,8 @@ export function CreateTaskModal({
   }, [pendingFiles, workspaceId]);
 
   const resolveSubmitWorkflow = useCallback(async () => {
-    if (!workflow) {
-      throw new Error('Workflow is required');
-    }
+    if (!workflow && taskWorkflowOverride?.workflow.team_id === form.team_id) return { workflowId: taskWorkflowOverride.workflow.id, workflowStateId: stateId };
+    if (!workflow) throw new Error('Team workflow is still loading. Please try again.');
 
     if (!form.team_id || workflow.workflow.team_id === form.team_id) {
       return { workflowId: workflow.workflow.id, workflowStateId: stateId };
@@ -856,7 +911,7 @@ export function CreateTaskModal({
       workflowId: resolvedData.workflow.id,
       workflowStateId: nextState.id,
     };
-  }, [form.team_id, workflow, stateId, workspaceId]);
+  }, [form.team_id, workflow, taskWorkflowOverride, stateId, workspaceId]);
 
   const submit = useCallback(async (createAnother = false) => {
     if (!canSubmit || submitting) return;
@@ -1065,6 +1120,8 @@ export function CreateTaskModal({
     baselineStateId: initialStateIdRef.current,
   });
 
+  useUnsavedChangesGuard(open && (hasUnsavedChanges || submitting || descriptionPendingUploads > 0 || pendingFiles.length > 0), 'Save or discard your new task before refreshing.');
+
   const handleOpenChange = async (nextOpen: boolean) => {
     if (!nextOpen && hasUnsavedChanges) {
       const ok = await confirm({
@@ -1083,7 +1140,13 @@ export function CreateTaskModal({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <CreateEntityDialogContent>
+      <CreateEntityDialogContent className={renderPreparation ? 'w-[480px]' : undefined}>
+        {renderPreparation ? renderPreparation({
+          error: draftError,
+          retry: () => setDraftRetry(n => n + 1),
+          cancel: () => { void handleOpenChange(false); },
+        }) : <>
+        <DialogTitle className="sr-only">{isTemplateMode ? 'Task template' : 'Create task'}</DialogTitle>
         {stackedOverDrawer ? (
           <div
             aria-hidden="true"
@@ -1132,6 +1195,9 @@ export function CreateTaskModal({
               )}
           </CreateEntityModalHeader>
 
+          {preparationContent}
+          {draftPending && <p role="status" className="px-6 py-2 text-sm text-muted-foreground">Preparing title and description…</p>}
+          {draftError && <div role="alert" className="px-6 py-2 text-sm text-destructive">{draftError} <button type="button" className="underline" onClick={() => setDraftRetry(n => n + 1)}>Retry</button></div>}
           {/* Two-column grid */}
           <CreateEntityModalBody>
             {/* Left column — title + description */}
@@ -1143,9 +1209,7 @@ export function CreateTaskModal({
                   autoFocus
                   placeholder="Title..."
                   value={form.name}
-                  onChange={(event) =>
-                    setForm((prev) => ({ ...prev, name: event.target.value }))
-                  }
+                  onChange={(event) => { draftEdits.current.name = true; setForm((prev) => ({ ...prev, name: event.target.value })); }}
                   onKeyDown={(e) => {
                     if (e.key === 'Tab' && !e.shiftKey) {
                       e.preventDefault();
@@ -1187,7 +1251,7 @@ export function CreateTaskModal({
                     </div>
                     <textarea
                       value={sourceMarkdown}
-                      onChange={(event) => setSourceMarkdown(event.target.value)}
+                      onChange={(event) => { draftEdits.current.description = true; setSourceMarkdown(event.target.value); }}
                       className="min-h-0 flex-1 resize-none border-0 bg-transparent px-6 py-4 font-mono text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/40 focus:outline-none"
                       placeholder="## Write the task in Markdown"
                       spellCheck={false}
@@ -1197,9 +1261,10 @@ export function CreateTaskModal({
                   <TiptapEditor
                     key={descriptionEditorKey}
                     content={form.description}
-                    onChange={(html) =>
-                      setForm((prev) => ({ ...prev, description: html }))
-                    }
+                    onChange={(html) => {
+                      if (descriptionEditorRef.current?.isFocused || stripHtmlForCompare(html) !== stripHtmlForCompare(form.description)) draftEdits.current.description = true;
+                      setForm((prev) => ({ ...prev, description: html }));
+                    }}
                     placeholder="Add a description..."
                     variant="divider"
                     contentVariant="pm"
@@ -1287,7 +1352,7 @@ export function CreateTaskModal({
                 </div>
               </div>
 
-              {open && !isTemplateMode && currentWorkspace?.slug ? (
+              {open && !supportSource && !isTemplateMode && currentWorkspace?.slug ? (
                 <TaskDraftSuggestions
                   workspaceId={workspaceId}
                   workspaceSlug={currentWorkspace.slug}
@@ -1551,7 +1616,10 @@ export function CreateTaskModal({
                 </div>
               )}
 
-              {error ? <p className="border-t border-border/60 px-6 py-3 text-sm text-destructive">{error}</p> : null}
+              {error ? <div role="alert" className="border-t border-border/60 px-6 py-3 text-sm text-destructive">
+                {error}
+                {prepareDraft && <button type="button" disabled={draftPending} className="ml-2 underline" onClick={() => { setError(null); setDraftRetry(n => n + 1); }}>Refresh draft</button>}
+              </div> : null}
             </CreateEntityModalMain>
 
             {/* Right sidebar — metadata */}
@@ -1685,9 +1753,10 @@ export function CreateTaskModal({
                   <SidebarPopoverSelect
                     value={form.priority}
                     options={priorityOptions.map((p) => ({ value: p, label: PRIORITY_CONFIG[p].label }))}
-                    onChange={(value) =>
-                      setForm((prev) => ({ ...prev, priority: value as Priority }))
-                    }
+                    onChange={(value) => {
+                      draftEdits.current.priority = true;
+                      setForm((prev) => ({ ...prev, priority: value as Priority }));
+                    }}
                     renderTrigger={() => (
                       <span className="inline-flex min-w-0 items-center gap-1.5">
                         <PriorityIcon priority={form.priority} className="h-3.5 w-3.5 shrink-0" />
@@ -1727,6 +1796,7 @@ export function CreateTaskModal({
                     options={taskTypeOptions.map((t) => ({ value: t, label: TASK_TYPE_CONFIG[t].label }))}
                     onChange={(value) => {
                       setTaskTypeDirty(true);
+                      draftEdits.current.task_type = true;
                       setForm((prev) => ({ ...prev, task_type: value as TaskType }));
                     }}
                     renderTrigger={() => (
@@ -1889,7 +1959,7 @@ export function CreateTaskModal({
               </div>
             )}
 
-            {!isTemplateMode && (
+            {!isTemplateMode && !supportSource && (
               <Button
                 type="button"
                 variant="ghost"
@@ -1909,6 +1979,7 @@ export function CreateTaskModal({
             </Button>
           </CreateEntityModalFooter>
         </CreateEntityModalFrame>
+        </>}
 
         <UpgradeRequiredDialog
           open={upgradeDialogReason !== null}

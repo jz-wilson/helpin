@@ -8,13 +8,16 @@ import (
 	"log/slog"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/helpin-ai/helpin/server/internal/deployment"
 	"github.com/helpin-ai/helpin/server/internal/model"
+	"github.com/helpin-ai/helpin/server/internal/repository"
 	"github.com/helpin-ai/helpin/server/internal/websocket"
 )
 
@@ -101,11 +104,19 @@ Just checking in to see if you had a chance to review my last message.`,
 // parseSettings unmarshals the JSONB settings string, applying defaults for missing fields.
 func parseSettings(raw string) model.SupportInboxSettings {
 	defaults := model.DefaultSupportInboxSettings()
-	if raw == "" || raw == "{}" {
-		return defaults
+	// Existing installations without the timing field retain their handoff policy.
+	defaults.EmailCaptureTiming = ""
+	if raw == "" {
+		raw = "{}"
 	}
 	if err := json.Unmarshal([]byte(raw), &defaults); err != nil {
 		return model.DefaultSupportInboxSettings()
+	}
+	if defaults.EmailCaptureTiming == "" {
+		defaults.EmailCaptureTiming = "before_handoff"
+		if !defaults.RequireEmailBeforeChat {
+			defaults.EmailCaptureTiming = "never"
+		}
 	}
 	// Refresh saved copies of the original default while preserving custom messages.
 	if defaults.DelayedTeamReplyMessage == "Our team hasn’t been able to reply yet. You don’t need to keep this chat open. We’ll email you when someone responds." {
@@ -184,6 +195,16 @@ func mergeSettingsUpdate(current model.SupportInboxSettings, patch model.UpdateI
 	if patch.AIResponseMode != nil {
 		current.AIResponseMode = *patch.AIResponseMode
 	}
+	if patch.PortalAIMode != nil {
+		current.PortalAIMode = *patch.PortalAIMode
+	}
+	if patch.PortalAIAgentID != nil {
+		if value := strings.TrimSpace(*patch.PortalAIAgentID); value != "" {
+			current.PortalAIAgentID = &value
+		} else {
+			current.PortalAIAgentID = nil
+		}
+	}
 	if patch.AIPreRouterMode != nil {
 		current.AIPreRouterMode = *patch.AIPreRouterMode
 	}
@@ -192,6 +213,9 @@ func mergeSettingsUpdate(current model.SupportInboxSettings, patch model.UpdateI
 	}
 	if patch.AIFollowUpEnabled != nil {
 		current.AIFollowUpEnabled = *patch.AIFollowUpEnabled
+	}
+	if patch.AIEmailCodeCheckEnabled != nil {
+		current.AIEmailCodeCheckEnabled = *patch.AIEmailCodeCheckEnabled
 	}
 	if patch.AIFollowUpSecondDelayHours != nil {
 		current.AIFollowUpSecondDelayHours = *patch.AIFollowUpSecondDelayHours
@@ -228,6 +252,12 @@ func mergeSettingsUpdate(current model.SupportInboxSettings, patch model.UpdateI
 	}
 	if patch.EscalationMessageAfterHours != nil {
 		current.EscalationMessageAfterHours = *patch.EscalationMessageAfterHours
+	}
+	if patch.EmailHandoffMessage != nil {
+		current.EmailHandoffMessage = strings.TrimSpace(*patch.EmailHandoffMessage)
+	}
+	if patch.EmailHandoffMessageAfterHours != nil {
+		current.EmailHandoffMessageAfterHours = strings.TrimSpace(*patch.EmailHandoffMessageAfterHours)
 	}
 	if patch.HandoffBehavior != nil {
 		current.HandoffBehavior = *patch.HandoffBehavior
@@ -273,6 +303,9 @@ func mergeSettingsUpdate(current model.SupportInboxSettings, patch model.UpdateI
 	}
 	if patch.TriageDeduplicateFirstMessage != nil {
 		current.TriageDeduplicateFirstMessage = *patch.TriageDeduplicateFirstMessage
+	}
+	if patch.AIPriorityEnabled != nil {
+		current.AIPriorityEnabled = *patch.AIPriorityEnabled
 	}
 	if patch.BusinessHoursEnabled != nil {
 		current.BusinessHoursEnabled = *patch.BusinessHoursEnabled
@@ -324,6 +357,30 @@ func mergeSettingsUpdate(current model.SupportInboxSettings, patch model.UpdateI
 	if patch.ForwardedEmailMinConfidence != nil {
 		current.ForwardedEmailMinConfidence = *patch.ForwardedEmailMinConfidence
 	}
+	if patch.PortalEnabled != nil {
+		current.PortalEnabled = *patch.PortalEnabled
+	}
+	if patch.PortalAnonymousIntakeEnabled != nil {
+		current.PortalAnonymousIntakeEnabled = *patch.PortalAnonymousIntakeEnabled
+	}
+	if patch.PortalIntakeEnabled != nil {
+		current.PortalIntakeEnabled = *patch.PortalIntakeEnabled
+	}
+	if patch.PortalShowReplyBy != nil {
+		current.PortalShowReplyBy = *patch.PortalShowReplyBy
+	}
+	if patch.PortalCCMode != nil {
+		current.PortalCCMode = strings.TrimSpace(*patch.PortalCCMode)
+	}
+	if patch.HelpAssistantEnabled != nil {
+		current.HelpAssistantEnabled = *patch.HelpAssistantEnabled
+	}
+	if patch.PortalAccessMode != nil {
+		current.PortalAccessMode = strings.TrimSpace(*patch.PortalAccessMode)
+	}
+	if patch.AIDisplayName != nil {
+		current.AIDisplayName = strings.TrimSpace(*patch.AIDisplayName)
+	}
 	if patch.WidgetName != nil {
 		current.WidgetName = *patch.WidgetName
 	}
@@ -366,6 +423,17 @@ func mergeSettingsUpdate(current model.SupportInboxSettings, patch model.UpdateI
 	if patch.ForceVisitorIdentity != nil {
 		current.ForceVisitorIdentity = *patch.ForceVisitorIdentity
 	}
+	if patch.EmailCaptureTiming != nil {
+		current.EmailCaptureTiming = *patch.EmailCaptureTiming
+		current.RequireEmailBeforeChat = current.EmailCaptureTiming != "never"
+	} else if patch.RequireEmailBeforeChat != nil {
+		// Older settings clients can still turn capture on/off without losing the timing.
+		if !*patch.RequireEmailBeforeChat {
+			current.EmailCaptureTiming = "never"
+		} else if current.EmailCaptureTiming == "never" {
+			current.EmailCaptureTiming = "before_handoff"
+		}
+	}
 	return current
 }
 
@@ -373,6 +441,14 @@ var hexColorRegex = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 
 // validateSettings checks settings field constraints.
 func (s *SupportInboxService) validateSettings(ctx context.Context, workspaceID string, settings model.SupportInboxSettings) error {
+	if len([]rune(settings.AIDisplayName)) > 80 || strings.ContainsAny(settings.AIDisplayName, "\r\n") {
+		return fmt.Errorf("AI assistant name must be a single line of at most 80 characters")
+	}
+	switch settings.EmailCaptureTiming {
+	case "after_ai_reply", "before_handoff", "never":
+	default:
+		return fmt.Errorf("invalid email capture timing")
+	}
 	if settings.PrivacyNoticeEnabled {
 		policyURL, err := url.Parse(settings.PrivacyPolicyURL)
 		if err != nil || policyURL.Hostname() == "" || (policyURL.Scheme != "https" && policyURL.Scheme != "http") || policyURL.User != nil {
@@ -517,12 +593,6 @@ func isOnline(s model.SupportInboxSettings) bool {
 	return resolveSupportAvailability(s, time.Now()).IsWithinOfficeHours
 }
 
-func parseTimeToMinutes(t string) int {
-	var h, m int
-	fmt.Sscanf(t, "%d:%d", &h, &m)
-	return h*60 + m
-}
-
 func weekdayKey(day time.Weekday) string {
 	switch day {
 	case time.Monday:
@@ -550,40 +620,33 @@ func defaultOutsideHoursMessage(settings model.SupportInboxSettings) string {
 }
 
 func isWithinBusinessHours(settings model.SupportInboxSettings, localNow time.Time) bool {
-	day, ok := settings.BusinessHoursSchedule[weekdayKey(localNow.Weekday())]
-	if !ok || !day.Enabled {
-		return false
-	}
-
 	currentMinutes := localNow.Hour()*60 + localNow.Minute()
-	startMinutes := parseTimeToMinutes(day.Start)
-	endMinutes := parseTimeToMinutes(day.End)
-	return currentMinutes >= startMinutes && currentMinutes < endMinutes
+	for _, window := range businessHoursWindows(settings.BusinessHoursSchedule[weekdayKey(localNow.Weekday())]) {
+		if currentMinutes >= window.start && currentMinutes < window.end {
+			return true
+		}
+	}
+	return false
 }
 
 func nextBusinessHoursStart(settings model.SupportInboxSettings, localNow time.Time) *time.Time {
 	loc := localNow.Location()
 	for dayOffset := 0; dayOffset < 8; dayOffset += 1 {
 		candidateDay := localNow.AddDate(0, 0, dayOffset)
-		day, ok := settings.BusinessHoursSchedule[weekdayKey(candidateDay.Weekday())]
-		if !ok || !day.Enabled {
-			continue
-		}
-
-		startMinutes := parseTimeToMinutes(day.Start)
-		candidateStart := time.Date(
-			candidateDay.Year(),
-			candidateDay.Month(),
-			candidateDay.Day(),
-			startMinutes/60,
-			startMinutes%60,
-			0,
-			0,
-			loc,
-		)
-
-		if candidateStart.After(localNow) {
-			return &candidateStart
+		for _, window := range businessHoursWindows(settings.BusinessHoursSchedule[weekdayKey(candidateDay.Weekday())]) {
+			candidateStart := time.Date(
+				candidateDay.Year(),
+				candidateDay.Month(),
+				candidateDay.Day(),
+				window.start/60,
+				window.start%60,
+				0,
+				0,
+				loc,
+			)
+			if candidateStart.After(localNow) {
+				return &candidateStart
+			}
 		}
 	}
 
@@ -641,6 +704,7 @@ func (s *SupportInboxService) GetInstallation(ctx context.Context, workspaceID s
 		}
 
 		defaults := model.DefaultSupportInboxSettings()
+		defaults.AIAgentID = s.defaultSupportAgentID(ctx, workspaceID)
 		raw, err := json.Marshal(defaults)
 		if err != nil {
 			return nil, nil, fmt.Errorf("marshal default settings: %w", err)
@@ -650,6 +714,7 @@ func (s *SupportInboxService) GetInstallation(ctx context.Context, workspaceID s
 			WorkspaceID:              workspaceID,
 			WidgetKey:                widgetKey,
 			SecretKey:                secretKey,
+			AllowedOrigins:           model.DocsStringArray(s.websiteOriginDefaults(ctx, workspaceID)),
 			IdentityVerificationMode: deployment.WidgetIdentityMode,
 			Settings:                 string(raw),
 			Active:                   true,
@@ -720,11 +785,21 @@ func (s *SupportInboxService) UpdateInstallationSettings(ctx context.Context, wo
 
 	current := parseSettings(inst.Settings)
 	merged := mergeSettingsUpdate(current, req)
+	if req.BusinessHoursSchedule != nil {
+		schedule, err := normalizeBusinessHoursSchedule(merged.BusinessHoursSchedule)
+		if err != nil {
+			return nil, nil, err
+		}
+		merged.BusinessHoursSchedule = schedule
+	}
 	if merged.TranslationCustomerLanguage != "" && supportTranslationLanguages[merged.TranslationCustomerLanguage] == "" {
 		return nil, nil, fmt.Errorf("unsupported customer translation language")
 	}
 	if supportTranslationLanguages[merged.DefaultAgentLanguage] == "" {
 		return nil, nil, fmt.Errorf("unsupported default translation language")
+	}
+	if err := s.validatePortalSettings(ctx, workspaceID, merged, req); err != nil {
+		return nil, nil, err
 	}
 	if merged.DelayedTeamReplyMinutes < 1 || merged.DelayedTeamReplyMinutes > 1440 {
 		return nil, nil, fmt.Errorf("delayed team reply wait must be between 1 and 1440 minutes")
@@ -738,6 +813,15 @@ func (s *SupportInboxService) UpdateInstallationSettings(ctx context.Context, wo
 	}
 	if len([]rune(merged.DelayedTeamReplyMessage)) > 2000 || len([]rune(merged.DelayedTeamReplyMessageNoEmail)) > 2000 {
 		return nil, nil, fmt.Errorf("delayed team reply messages must be at most 2000 characters")
+	}
+	if strings.TrimSpace(merged.EmailHandoffMessage) == "" {
+		merged.EmailHandoffMessage = defaults.EmailHandoffMessage
+	}
+	if strings.TrimSpace(merged.EmailHandoffMessageAfterHours) == "" {
+		merged.EmailHandoffMessageAfterHours = defaults.EmailHandoffMessageAfterHours
+	}
+	if len([]rune(merged.EmailHandoffMessage)) > 2000 || len([]rune(merged.EmailHandoffMessageAfterHours)) > 2000 {
+		return nil, nil, fmt.Errorf("email handoff messages must be at most 2000 characters")
 	}
 
 	if req.AllowedOrigins != nil {
@@ -784,7 +868,39 @@ func (s *SupportInboxService) UpdateInstallationSettings(ctx context.Context, wo
 	}
 	inst.Settings = string(raw)
 
-	if err := s.installationRepo.Update(ctx, inst); err != nil {
+	stopPortalAI := current.PortalEnabled && current.PortalAIMode != "off" && (!merged.PortalEnabled || merged.PortalAIMode == "off")
+	if stopPortalAI {
+		var stopped []model.SupportConversation
+		err = s.conversationRepo.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := repository.NewSupportInboxInstallationRepository(tx).Update(ctx, inst); err != nil {
+				return err
+			}
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("workspace_id = ? AND channel = ? AND (ai_state = ? OR flow_state = ? OR ai_active_run_id IS NOT NULL)", workspaceID, "portal", "pending", model.SupportConversationFlowStateAIHandling).
+				Find(&stopped).Error; err != nil {
+				return err
+			}
+			if len(stopped) == 0 {
+				return nil
+			}
+			ids := make([]string, 0, len(stopped))
+			for _, conv := range stopped {
+				ids = append(ids, conv.ID)
+			}
+			return tx.Model(&model.SupportConversation{}).Where("workspace_id = ? AND id IN ?", workspaceID, ids).
+				Updates(map[string]any{"human_takeover": true, "assigned_agent_id": nil,
+					"ai_state": "escalated", "flow_state": model.SupportConversationFlowStateWaitingForHuman,
+					"ai_active_run_id": nil, "ai_control_version": gorm.Expr("ai_control_version + 1")}).Error
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if s.supportAIService != nil {
+			for _, conv := range stopped {
+				s.supportAIService.cancelControlledRun(ctx, workspaceID, conv.ID, derefString(conv.AIActiveRunID))
+			}
+		}
+	} else if err := s.installationRepo.Update(ctx, inst); err != nil {
 		return nil, nil, err
 	}
 
@@ -911,6 +1027,7 @@ func (s *SupportInboxService) SeedWorkspaceDefaults(ctx context.Context, workspa
 			}
 
 			defaults := model.DefaultSupportInboxSettings()
+			defaults.AIAgentID = s.defaultSupportAgentID(ctx, workspaceID)
 			raw, err := json.Marshal(defaults)
 			if err != nil {
 				return fmt.Errorf("marshal default settings: %w", err)
@@ -920,6 +1037,7 @@ func (s *SupportInboxService) SeedWorkspaceDefaults(ctx context.Context, workspa
 				WorkspaceID:              workspaceID,
 				WidgetKey:                widgetKey,
 				SecretKey:                secretKey,
+				AllowedOrigins:           model.DocsStringArray(s.websiteOriginDefaults(ctx, workspaceID)),
 				IdentityVerificationMode: deployment.WidgetIdentityMode,
 				Settings:                 string(raw),
 				Active:                   true,
@@ -934,6 +1052,59 @@ func (s *SupportInboxService) SeedWorkspaceDefaults(ctx context.Context, workspa
 	if err := s.seedDefaultCannedResponses(ctx, workspaceID, actorID); err != nil {
 		return fmt.Errorf("seed default shortcuts: %w", err)
 	}
+	return nil
+}
+
+// defaultSupportAgentID returns the workspace's built-in Support Agent, or nil
+// when it has not been seeded yet.
+func (s *SupportInboxService) defaultSupportAgentID(ctx context.Context, workspaceID string) *string {
+	if s.agentRepo == nil {
+		return nil
+	}
+	agent, err := s.agentRepo.GetSystemByPreset(ctx, workspaceID, model.AgentPresetSupportAgent)
+	if err != nil {
+		slog.WarnContext(ctx, "look up default support agent", "error", err, "workspace_id", workspaceID)
+		return nil
+	}
+	if agent == nil {
+		return nil
+	}
+	return &agent.ID
+}
+
+// BindDefaultSupportAgent points a new installation at the built-in Support
+// Agent when no agent has been chosen. AI replies stay off until an admin
+// turns them on; this only removes the "pick an agent" step in front of
+// that switch. It never replaces an agent that is already set.
+func (s *SupportInboxService) BindDefaultSupportAgent(ctx context.Context, workspaceID string) error {
+	if s.installationRepo == nil {
+		return nil
+	}
+	inst, err := s.installationRepo.GetByWorkspace(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("get widget installation: %w", err)
+	}
+	if inst == nil {
+		return nil
+	}
+	settings := parseSettings(inst.Settings)
+	if strings.TrimSpace(derefString(settings.AIAgentID)) != "" {
+		return nil
+	}
+	agentID := s.defaultSupportAgentID(ctx, workspaceID)
+	if agentID == nil {
+		return nil
+	}
+	settings.AIAgentID = agentID
+	raw, err := json.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("marshal support settings: %w", err)
+	}
+	inst.Settings = string(raw)
+	if err := s.installationRepo.Update(ctx, inst); err != nil {
+		return fmt.Errorf("bind default support agent: %w", err)
+	}
+	slog.InfoContext(ctx, "bound default support agent", "workspace_id", workspaceID, "agent_id", *agentID)
 	return nil
 }
 
@@ -977,14 +1148,28 @@ func (s *SupportInboxService) SearchCannedResponses(ctx context.Context, workspa
 	return s.cannedResponseRepo.Search(ctx, workspaceID, query)
 }
 
-func normalizeCannedResponseRequest(req model.CannedResponseRequest) (model.CannedResponseRequest, error) {
+// normalizeCannedResponseRequest validates a shortcut. requireBody checks
+// that it inserts text or runs actions; updates check that after merging in
+// the stored actions.
+func normalizeCannedResponseRequest(req model.CannedResponseRequest, requireBody bool) (model.CannedResponseRequest, error) {
 	req.ShortCode = strings.TrimSpace(req.ShortCode)
 	req.Content = strings.TrimSpace(req.Content)
 	if req.Tag != nil {
 		tag := strings.TrimSpace(*req.Tag)
 		req.Tag = &tag
 	}
-	if req.ShortCode == "" || req.Content == "" {
+	if req.Actions != nil {
+		actions, err := NormalizeSupportConversationActions(*req.Actions)
+		if err != nil {
+			return req, fmt.Errorf("%w: %s", ErrCannedResponseInvalid, strings.TrimPrefix(err.Error(), ErrSupportActionsInvalid.Error()+": "))
+		}
+		req.Actions = &actions
+	}
+	if req.ShortCode == "" {
+		return req, fmt.Errorf("%w: shortcut and content are required", ErrCannedResponseInvalid)
+	}
+	// A macro with actions may insert no text.
+	if requireBody && req.Content == "" && (req.Actions == nil || req.Actions.Empty()) {
 		return req, fmt.Errorf("%w: shortcut and content are required", ErrCannedResponseInvalid)
 	}
 	if !strings.HasPrefix(req.ShortCode, "!") || strings.ContainsAny(req.ShortCode, " \t\r\n") {
@@ -1016,8 +1201,11 @@ func isDuplicateCannedResponseError(err error) bool {
 
 // CreateCannedResponse creates a new canned response.
 func (s *SupportInboxService) CreateCannedResponse(ctx context.Context, workspaceID string, req model.CannedResponseRequest, createdByID string) (*model.SupportCannedResponse, error) {
-	req, err := normalizeCannedResponseRequest(req)
+	req, err := normalizeCannedResponseRequest(req, true)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.validateMacroReferences(ctx, workspaceID, req.Actions); err != nil {
 		return nil, err
 	}
 	existing, err := s.cannedResponseRepo.GetByShortCode(ctx, workspaceID, req.ShortCode)
@@ -1035,6 +1223,9 @@ func (s *SupportInboxService) CreateCannedResponse(ctx context.Context, workspac
 		Tag:         *req.Tag,
 		CreatedByID: createdByID,
 	}
+	if req.Actions != nil {
+		response.Actions = *req.Actions
+	}
 	if err := s.cannedResponseRepo.Create(ctx, response); err != nil {
 		if isDuplicateCannedResponseError(err) {
 			return nil, ErrCannedResponseDuplicate
@@ -1046,8 +1237,11 @@ func (s *SupportInboxService) CreateCannedResponse(ctx context.Context, workspac
 
 // UpdateCannedResponse updates an existing canned response.
 func (s *SupportInboxService) UpdateCannedResponse(ctx context.Context, workspaceID, id string, req model.CannedResponseRequest) (*model.SupportCannedResponse, error) {
-	req, err := normalizeCannedResponseRequest(req)
+	req, err := normalizeCannedResponseRequest(req, false)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.validateMacroReferences(ctx, workspaceID, req.Actions); err != nil {
 		return nil, err
 	}
 	response, err := s.cannedResponseRepo.GetByID(ctx, workspaceID, id)
@@ -1068,6 +1262,12 @@ func (s *SupportInboxService) UpdateCannedResponse(ctx context.Context, workspac
 	response.ShortCode = req.ShortCode
 	response.Content = req.Content
 	response.Tag = *req.Tag
+	if req.Actions != nil {
+		response.Actions = *req.Actions
+	}
+	if response.Content == "" && response.Actions.Empty() {
+		return nil, fmt.Errorf("%w: shortcut and content are required", ErrCannedResponseInvalid)
+	}
 
 	if err := s.cannedResponseRepo.Update(ctx, response); err != nil {
 		if isDuplicateCannedResponseError(err) {
@@ -1078,7 +1278,115 @@ func (s *SupportInboxService) UpdateCannedResponse(ctx context.Context, workspac
 	return response, nil
 }
 
+// validateMacroReferences checks that a macro's tags, inbox and assignee
+// exist in the workspace, so it does not fail halfway when used. Inbox
+// access for the assignee is checked when the macro runs.
+func (s *SupportInboxService) validateMacroReferences(ctx context.Context, workspaceID string, actions *model.SupportConversationActions) error {
+	if actions == nil || actions.Empty() {
+		return nil
+	}
+	invalid := func(message string) error { return fmt.Errorf("%w: %s", ErrCannedResponseInvalid, message) }
+	if len(actions.AddTagIDs)+len(actions.RemoveTagIDs) > 0 && s.tagRepo != nil {
+		tags, err := s.tagRepo.ListByWorkspace(ctx, workspaceID)
+		if err != nil {
+			return err
+		}
+		known := make(map[string]bool, len(tags))
+		for _, tag := range tags {
+			known[tag.ID] = true
+		}
+		for _, id := range append(append([]string{}, actions.AddTagIDs...), actions.RemoveTagIDs...) {
+			if !known[id] {
+				return invalid("a tag in the actions no longer exists")
+			}
+		}
+	}
+	if actions.MailboxID != nil && *actions.MailboxID != "shared" && s.mailboxRepo != nil {
+		mailboxes, err := s.mailboxRepo.ListByWorkspace(ctx, workspaceID, false)
+		if err != nil {
+			return err
+		}
+		if !slices.ContainsFunc(mailboxes, func(mailbox model.SupportMailbox) bool { return mailbox.ID == *actions.MailboxID }) {
+			return invalid("the inbox in the actions does not exist")
+		}
+	}
+	if actions.AssignUserID != nil && *actions.AssignUserID != "" && s.workspaceRepo != nil {
+		members, err := s.workspaceRepo.ListSupportAssignableMembers(ctx, workspaceID, nil)
+		if err != nil {
+			return err
+		}
+		if !slices.ContainsFunc(members, func(member model.AssignableMember) bool {
+			return member.UserID != nil && *member.UserID == *actions.AssignUserID
+		}) {
+			return invalid("the assignee cannot be assigned support conversations")
+		}
+	}
+	return nil
+}
+
 // DeleteCannedResponse deletes a canned response.
 func (s *SupportInboxService) DeleteCannedResponse(ctx context.Context, workspaceID, id string) error {
 	return s.cannedResponseRepo.Delete(ctx, workspaceID, id)
+}
+
+// ErrPortalReplyDeliveryUnavailable reports that anonymous portal intake
+// cannot be enabled because agents could not reply to submitters by email.
+var ErrPortalReplyDeliveryUnavailable = errors.New("requests without sign-in need outbound email: an application email sender for confirmations, plus Redis and the Postmark reply server so agents can reply")
+
+func (s *SupportInboxService) validatePortalSettings(ctx context.Context, workspaceID string, merged model.SupportInboxSettings, req model.UpdateInstallationSettingsRequest) error {
+	switch merged.PortalAccessMode {
+	case model.SupportPortalAccessModeApprovedContacts, model.SupportPortalAccessModeAnyVerifiedEmail, model.SupportPortalAccessModeCompanyMembers:
+	default:
+		return fmt.Errorf("unsupported portal access mode")
+	}
+	switch merged.PortalCCMode {
+	case "", model.SupportPortalCCColleagues, model.SupportPortalCCAny:
+	default:
+		return fmt.Errorf("portal_cc_mode must be empty, colleagues or any")
+	}
+	if merged.PortalAIMode != model.SupportPortalAIModeOff && merged.PortalAIMode != model.SupportPortalAIModeInternalNote {
+		return fmt.Errorf("portal_ai_mode must be off or internal_note: people answer portal requests, and AI can only suggest replies privately")
+	}
+	if merged.PortalAIMode != model.SupportPortalAIModeOff {
+		agentID := strings.TrimSpace(derefString(merged.PortalAIAgentID))
+		if agentID == "" {
+			agentID = strings.TrimSpace(derefString(merged.AIAgentID))
+		}
+		if agentID == "" || s.agentRepo == nil {
+			return fmt.Errorf("a support agent is required for portal AI")
+		}
+		agent, err := s.agentRepo.GetByID(ctx, workspaceID, agentID)
+		if err != nil || agent == nil {
+			return fmt.Errorf("selected portal AI agent was not found")
+		}
+		if err := validateAgentTarget(agent, "support_conversation"); err != nil {
+			return fmt.Errorf("selected portal AI agent must support conversations: %w", err)
+		}
+	}
+	// Only a request that turns anonymous intake on is refused, so unrelated
+	// saves keep working if delivery is later unconfigured; the portal itself
+	// stops offering intake at runtime in that case.
+	if req.PortalAnonymousIntakeEnabled != nil && *req.PortalAnonymousIntakeEnabled && !s.PortalIntakeEmailAvailable() {
+		return ErrPortalReplyDeliveryUnavailable
+	}
+	return nil
+}
+
+// PortalReplyDeliveryAvailable reports whether agent replies on portal
+// requests can reach customers by email.
+func (s *SupportInboxService) PortalReplyDeliveryAvailable() bool {
+	return s.emailFallbackService.ReplyDeliveryAvailable()
+}
+
+// SetPortalConfirmationEmailReady registers the check for the application
+// sender that emails portal confirmations and intake receipts.
+func (s *SupportInboxService) SetPortalConfirmationEmailReady(ready func() bool) {
+	s.portalConfirmationEmailReady = ready
+}
+
+// PortalIntakeEmailAvailable reports whether anonymous portal intake can
+// email its submitter: a confirmation or receipt from the application sender,
+// and later agent replies through support email.
+func (s *SupportInboxService) PortalIntakeEmailAvailable() bool {
+	return s.portalConfirmationEmailReady != nil && s.portalConfirmationEmailReady() && s.PortalReplyDeliveryAvailable()
 }

@@ -72,7 +72,11 @@ jobs:
           if echo "$CHANGED" | grep -qE '^help-center/|^packages/shared/src/docs-blocks\.css$'; then
             HELPCENTER=true
           fi
-          if echo "$CHANGED" | grep -qE '^(frontend/|packages/)'; then
+          # The help center image also serves the customer portal built from frontend/.
+          if echo "$CHANGED" | grep -qE '^frontend/(src/|portal\.html$|vite\.portal\.config\.ts$|package\.json$)|^packages/(shared|support-core)/'; then
+            HELPCENTER=true
+          fi
+          if echo "$CHANGED" | grep -qE '^(frontend/|packages/|netlify\.toml$)'; then
             FRONTEND=true
           fi
           if echo "$CHANGED" | grep -qE '^(pnpm-lock\.yaml|pnpm-workspace\.yaml|\.node-version)$'; then
@@ -154,41 +158,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Build and push server images
-        run: |
-          docker buildx build \
-            -f build-prod-server/server/Dockerfile \
-            --build-arg GO_BUILD_TAGS=ee \
-            --target api \
-            -t ${{ env.IMAGE_PREFIX }}/server:${{ needs.version.outputs.server_tag }} \
-            -t ${{ env.IMAGE_PREFIX }}/server:sha-${{ github.sha }} \
-            -t ${{ env.IMAGE_PREFIX }}/server:prod-latest \
-            --cache-from type=registry,ref=${{ env.IMAGE_PREFIX }}/server-buildcache:prod-api \
-            --cache-to type=registry,ref=${{ env.IMAGE_PREFIX }}/server-buildcache:prod-api,mode=max \
-            --push \
-            build-prod-server/server/
-          docker buildx build \
-            -f build-prod-server/server/Dockerfile \
-            --build-arg GO_BUILD_TAGS=ee \
-            --target temporal-worker \
-            -t ${{ env.IMAGE_PREFIX }}/temporal-worker:${{ needs.version.outputs.server_tag }} \
-            -t ${{ env.IMAGE_PREFIX }}/temporal-worker:sha-${{ github.sha }} \
-            -t ${{ env.IMAGE_PREFIX }}/temporal-worker:prod-latest \
-            --cache-from type=registry,ref=${{ env.IMAGE_PREFIX }}/server-buildcache:prod-temporal-worker \
-            --cache-to type=registry,ref=${{ env.IMAGE_PREFIX }}/server-buildcache:prod-temporal-worker,mode=max \
-            --push \
-            build-prod-server/server/
-          docker buildx build \
-            -f build-prod-server/server/Dockerfile \
-            --build-arg GO_BUILD_TAGS=ee \
-            --target migrate \
-            -t ${{ env.IMAGE_PREFIX }}/server-migrate:${{ needs.version.outputs.server_tag }} \
-            -t ${{ env.IMAGE_PREFIX }}/server-migrate:sha-${{ github.sha }} \
-            -t ${{ env.IMAGE_PREFIX }}/server-migrate:prod-latest \
-            --cache-from type=registry,ref=${{ env.IMAGE_PREFIX }}/server-buildcache:prod-migrate \
-            --cache-to type=registry,ref=${{ env.IMAGE_PREFIX }}/server-buildcache:prod-migrate,mode=max \
-            --push \
-            build-prod-server/server/
+      - name: Build or promote server images
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.server_tag }}
+        # Reuses images already built from identical server/ content (for
+        # example by the staging release of the same commits) instead of
+        # rebuilding them.
+        run: bash build-prod-server/.github/scripts/build-or-promote-image.sh build-prod-server prod server "$RELEASE_TAG"
 
   build-helpcenter:
     permissions:
@@ -217,15 +193,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-      - name: Build and push helpcenter image
-        run: |
-          docker buildx build \
-            -f build-prod-helpcenter/help-center/Dockerfile \
-            -t ${{ env.IMAGE_PREFIX }}/helpcenter:${{ needs.version.outputs.helpcenter_tag }} \
-            -t ${{ env.IMAGE_PREFIX }}/helpcenter:sha-${{ github.sha }} \
-            -t ${{ env.IMAGE_PREFIX }}/helpcenter:prod-latest \
-            --push \
-            build-prod-helpcenter/
+      # The registry build cache needs the buildx container driver.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build or promote helpcenter image
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.helpcenter_tag }}
+        run: bash build-prod-helpcenter/.github/scripts/build-or-promote-image.sh build-prod-helpcenter prod helpcenter "$RELEASE_TAG"
 
   deploy-netlify:
     name: Build & Deploy Frontend to Netlify
@@ -272,6 +247,8 @@ jobs:
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 10
+          cache: true
+          cache_dependency_path: build-prod-netlify/pnpm-lock.yaml
 
       - name: Install and build frontend
         run: |
@@ -286,12 +263,24 @@ jobs:
             build
           pnpm --dir frontend run build:ee
 
+      - name: Check open-tab release recovery
+        working-directory: build-prod-netlify/frontend
+        env:
+          SUPPORT_E2E_PREVIEW: '1'
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright test --config=playwright.support.config.ts --project=chromium support-release-recovery
+
       - name: Deploy to Netlify
         working-directory: build-prod-netlify
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID_PROD }}
         run: pnpm --package=netlify-cli@24.2.0 dlx netlify deploy --site "$NETLIFY_SITE_ID" --filter frontend --dir frontend/dist --no-build --prod
+
+      - name: Check deployed link previews
+        working-directory: build-prod-netlify
+        run: python3 scripts/ci/check_link_previews.py --app-url https://app.helpin.ai --api-url https://api.helpin.ai/api --attempts 12
 
   release:
     permissions:

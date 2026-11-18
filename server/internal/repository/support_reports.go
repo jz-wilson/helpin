@@ -1,0 +1,525 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"fmt"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/helpin-ai/helpin/server/internal/model"
+)
+
+// SupportReportScope selects the conversations a report covers. Facts include
+// every conversation created or resolved in [From, To); callers split that
+// window into the current and previous periods.
+type SupportReportScope struct {
+	WorkspaceID string
+	From        time.Time
+	To          time.Time
+	// MailboxIDs limits the report to these inboxes; "shared" selects
+	// conversations with no inbox. Empty means every inbox the actor can open.
+	MailboxIDs        []string
+	Channels          []string
+	WorkspaceMemberID string
+	Role              string
+}
+
+// SupportReportConversationFact is one conversation's timing and outcome.
+type SupportReportConversationFact struct {
+	ID                       string
+	DisplayID                int
+	Subject                  string
+	Channel                  string
+	MailboxID                *string
+	MailboxName              *string
+	Status                   string
+	FlowState                *string
+	Priority                 string
+	AssignedUserID           *string
+	CustomerName             *string
+	CustomerEmail            *string
+	CreatedAt                time.Time
+	ResolvedAt               *time.Time
+	AIState                  *string
+	AIResolutionType         *string
+	AIEscalatedAt            *time.Time
+	CustomerRequestedHumanAt *time.Time
+	HumanTakeover            *bool
+	// FirstCustomerAt is the first public customer message.
+	FirstCustomerAt *time.Time
+	// FirstResponseAt is the first public reply by anyone but the customer.
+	FirstResponseAt *time.Time
+	// FirstHumanReplyAt and FirstHumanReplyUserID describe the first public
+	// teammate reply.
+	FirstHumanReplyAt     *time.Time
+	FirstHumanReplyUserID *string
+	// ResolvedByUserID is the teammate behind the latest resolve event.
+	ResolvedByUserID *string
+	AIReplyCount     int
+}
+
+// SupportReportReplyCount is the number of public replies one teammate sent.
+type SupportReportReplyCount struct {
+	UserID  string
+	Replies int
+}
+
+// reportTime scans timestamps from aggregate expressions, which SQLite
+// returns as text and PostgreSQL as time values.
+type reportTime struct{ value *time.Time }
+
+func (t *reportTime) Scan(src any) error {
+	t.value = nil
+	switch v := src.(type) {
+	case nil:
+		return nil
+	case time.Time:
+		utc := v.UTC()
+		t.value = &utc
+		return nil
+	case string:
+		return t.parse(v)
+	case []byte:
+		return t.parse(string(v))
+	default:
+		return fmt.Errorf("scan report time from %T", src)
+	}
+}
+
+// Value lets GORM treat reportTime as a column type rather than a relation.
+func (t reportTime) Value() (driver.Value, error) {
+	if t.value == nil {
+		return nil, nil
+	}
+	return *t.value, nil
+}
+
+func (t *reportTime) parse(raw string) error {
+	raw = strings.TrimSpace(raw)
+	parsed, err := scanNullableTime(sql.NullString{String: raw, Valid: raw != ""})
+	if err != nil {
+		return err
+	}
+	t.value = parsed
+	return nil
+}
+
+func (r *SupportConversationRepository) reportCandidates(ctx context.Context, scope SupportReportScope) *gorm.DB {
+	query := r.db.WithContext(ctx).Table("support_conversations AS c").Select("c.id").
+		Where("c.workspace_id = ? AND c.merged_into_id IS NULL AND c.status <> ?", scope.WorkspaceID, model.SupportConversationStatusSpam).
+		Where("((c.created_at >= ? AND c.created_at < ?) OR (c.resolved_at >= ? AND c.resolved_at < ?))", scope.From, scope.To, scope.From, scope.To)
+	query = r.applyMailboxAccess(query, "c", scope.WorkspaceMemberID, scope.Role)
+	query = r.applyMailboxScopes(query, "c", nil, scope.MailboxIDs)
+	if channels := compactStrings(scope.Channels); len(channels) > 0 {
+		query = query.Where("c.channel IN ?", channels)
+	}
+	return query
+}
+
+// ListReportFacts returns one fact row per conversation created or resolved
+// in the scope's window.
+func (r *SupportConversationRepository) ListReportFacts(ctx context.Context, scope SupportReportScope) ([]SupportReportConversationFact, error) {
+	publicReplies := "deleted_at IS NULL AND is_internal = ? AND message_type = 'reply' AND workspace_id = ? AND conversation_id IN (?)"
+	firstCustomer := r.db.Table("support_messages").
+		Select("conversation_id, MIN(created_at) AS first_customer_at").
+		Where(publicReplies+" AND sender_type = 'customer'", false, scope.WorkspaceID, r.reportCandidates(ctx, scope)).
+		Group("conversation_id")
+	firstResponse := r.db.Table("support_messages").
+		Select("conversation_id, MIN(created_at) AS first_response_at, SUM(CASE WHEN sender_type IN ('ai', 'agent') THEN 1 ELSE 0 END) AS ai_reply_count").
+		Where(publicReplies+" AND sender_type <> 'customer'", false, scope.WorkspaceID, r.reportCandidates(ctx, scope)).
+		Group("conversation_id")
+	rankedHuman := r.db.Table("support_messages").
+		Select("conversation_id, created_at, sender_user_id, ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY created_at, id) AS reply_rank").
+		Where(publicReplies+" AND sender_type = 'user'", false, scope.WorkspaceID, r.reportCandidates(ctx, scope))
+	firstHuman := r.db.Table("(?) AS ranked", rankedHuman).
+		Select("conversation_id, created_at AS first_human_reply_at, sender_user_id AS first_human_reply_user_id").
+		Where("reply_rank = 1")
+	rankedResolve := r.db.Table("support_messages").
+		Select("conversation_id, sender_user_id, ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY created_at DESC, id DESC) AS resolve_rank").
+		Where("deleted_at IS NULL AND message_type = 'system' AND system_event_type = ? AND sender_user_id IS NOT NULL AND workspace_id = ? AND conversation_id IN (?)",
+			model.SystemEventResolved, scope.WorkspaceID, r.reportCandidates(ctx, scope))
+	lastResolve := r.db.Table("(?) AS ranked_resolve", rankedResolve).
+		Select("conversation_id, sender_user_id AS resolved_by_user_id").
+		Where("resolve_rank = 1")
+
+	type row struct {
+		ID                       string
+		DisplayID                int
+		Subject                  string
+		Channel                  string
+		MailboxID                *string
+		MailboxName              *string
+		Status                   string
+		FlowState                *string
+		Priority                 string
+		AssignedUserID           *string
+		CustomerName             *string
+		CustomerEmail            *string
+		CreatedAt                reportTime
+		ResolvedAt               reportTime
+		AIState                  *string
+		AIResolutionType         *string
+		AIEscalatedAt            reportTime
+		CustomerRequestedHumanAt reportTime
+		HumanTakeover            *bool
+		FirstCustomerAt          reportTime
+		FirstResponseAt          reportTime
+		FirstHumanReplyAt        reportTime
+		FirstHumanReplyUserID    *string
+		ResolvedByUserID         *string
+		AIReplyCount             int
+	}
+	var rows []row
+	err := r.db.WithContext(ctx).Table("support_conversations AS conv").
+		Select(`conv.id, conv.display_id, conv.subject, conv.channel, conv.mailbox_id, mailbox.name AS mailbox_name,
+			conv.status, conv.flow_state, conv.priority, conv.assigned_user_id, conv.customer_name, conv.customer_email,
+			conv.created_at, conv.resolved_at, conv.ai_state, conv.ai_resolution_type, conv.ai_escalated_at,
+			conv.customer_requested_human_at, conv.human_takeover,
+			first_customer.first_customer_at, first_response.first_response_at,
+			COALESCE(first_response.ai_reply_count, 0) AS ai_reply_count,
+			first_human.first_human_reply_at, first_human.first_human_reply_user_id,
+			last_resolve.resolved_by_user_id`).
+		Joins("LEFT JOIN support_mailboxes AS mailbox ON mailbox.id = conv.mailbox_id").
+		Joins("LEFT JOIN (?) AS first_customer ON first_customer.conversation_id = conv.id", firstCustomer).
+		Joins("LEFT JOIN (?) AS first_response ON first_response.conversation_id = conv.id", firstResponse).
+		Joins("LEFT JOIN (?) AS first_human ON first_human.conversation_id = conv.id", firstHuman).
+		Joins("LEFT JOIN (?) AS last_resolve ON last_resolve.conversation_id = conv.id", lastResolve).
+		Where("conv.id IN (?)", r.reportCandidates(ctx, scope)).
+		Order("conv.created_at, conv.id").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("list support report facts: %w", err)
+	}
+	facts := make([]SupportReportConversationFact, 0, len(rows))
+	for _, row := range rows {
+		created := time.Time{}
+		if row.CreatedAt.value != nil {
+			created = *row.CreatedAt.value
+		}
+		facts = append(facts, SupportReportConversationFact{
+			ID: row.ID, DisplayID: row.DisplayID, Subject: row.Subject, Channel: row.Channel,
+			MailboxID: row.MailboxID, MailboxName: row.MailboxName, Status: row.Status, FlowState: row.FlowState,
+			Priority: row.Priority, AssignedUserID: row.AssignedUserID, CustomerName: row.CustomerName,
+			CustomerEmail: row.CustomerEmail, CreatedAt: created, ResolvedAt: row.ResolvedAt.value,
+			AIState: row.AIState, AIResolutionType: row.AIResolutionType, AIEscalatedAt: row.AIEscalatedAt.value,
+			CustomerRequestedHumanAt: row.CustomerRequestedHumanAt.value, HumanTakeover: row.HumanTakeover,
+			FirstCustomerAt: row.FirstCustomerAt.value, FirstResponseAt: row.FirstResponseAt.value,
+			FirstHumanReplyAt: row.FirstHumanReplyAt.value, FirstHumanReplyUserID: row.FirstHumanReplyUserID,
+			ResolvedByUserID: row.ResolvedByUserID, AIReplyCount: row.AIReplyCount,
+		})
+	}
+	return facts, nil
+}
+
+// ListReportReplyCounts counts public teammate replies sent in [from, to) on
+// conversations the actor can open.
+func (r *SupportConversationRepository) ListReportReplyCounts(ctx context.Context, scope SupportReportScope, from, to time.Time) ([]SupportReportReplyCount, error) {
+	conversations := r.db.WithContext(ctx).Table("support_conversations AS c").Select("c.id").
+		Where("c.workspace_id = ? AND c.status <> ?", scope.WorkspaceID, model.SupportConversationStatusSpam)
+	conversations = r.applyMailboxAccess(conversations, "c", scope.WorkspaceMemberID, scope.Role)
+	conversations = r.applyMailboxScopes(conversations, "c", nil, scope.MailboxIDs)
+	if channels := compactStrings(scope.Channels); len(channels) > 0 {
+		conversations = conversations.Where("c.channel IN ?", channels)
+	}
+	var rows []SupportReportReplyCount
+	err := r.db.WithContext(ctx).Table("support_messages").
+		Select("sender_user_id AS user_id, COUNT(*) AS replies").
+		Where("workspace_id = ? AND deleted_at IS NULL AND is_internal = ? AND message_type = 'reply' AND sender_type = 'user' AND sender_user_id IS NOT NULL",
+			scope.WorkspaceID, false).
+		Where("created_at >= ? AND created_at < ? AND conversation_id IN (?)", from, to, conversations).
+		Group("sender_user_id").Scan(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("count support report replies: %w", err)
+	}
+	return rows, nil
+}
+
+// SupportReportTagLink is one tag on a conversation in a report.
+type SupportReportTagLink struct {
+	ConversationID string
+	TagID          string
+	Name           string
+	Color          *string
+}
+
+// ListReportTags returns the tags on every conversation created or resolved
+// in the scope's window.
+func (r *SupportConversationRepository) ListReportTags(ctx context.Context, scope SupportReportScope) ([]SupportReportTagLink, error) {
+	var links []SupportReportTagLink
+	err := r.db.WithContext(ctx).Table("support_conversation_tags AS ct").
+		Joins("JOIN support_tags AS t ON t.id = ct.tag_id").
+		Select("ct.conversation_id, t.id AS tag_id, t.name, t.color").
+		Where("t.workspace_id = ? AND ct.conversation_id IN (?)", scope.WorkspaceID, r.reportCandidates(ctx, scope)).
+		Scan(&links).Error
+	if err != nil {
+		return nil, fmt.Errorf("list support report tags: %w", err)
+	}
+	return links, nil
+}
+
+// SupportReportCSATRow is one rating with the conversation it belongs to.
+type SupportReportCSATRow struct {
+	ConversationID string
+	DisplayID      int
+	Subject        string
+	Rating         int
+	Comment        *string
+	Channel        string
+	ResolvedBy     string
+	AssignedUserID *string
+	SubmittedAt    time.Time
+}
+
+// ListReportCSAT returns ratings submitted in [from, to) on conversations the
+// actor can open, newest first.
+func (r *SupportConversationRepository) ListReportCSAT(ctx context.Context, scope SupportReportScope, from, to time.Time) ([]SupportReportCSATRow, error) {
+	query := r.db.WithContext(ctx).Table("support_csat_responses AS csat").
+		Joins("JOIN support_conversations AS c ON c.id = csat.conversation_id AND c.workspace_id = csat.workspace_id").
+		Where("csat.workspace_id = ? AND csat.submitted_at >= ? AND csat.submitted_at < ?", scope.WorkspaceID, from, to)
+	query = r.applyMailboxAccess(query, "c", scope.WorkspaceMemberID, scope.Role)
+	query = r.applyMailboxScopes(query, "c", nil, scope.MailboxIDs)
+	if channels := compactStrings(scope.Channels); len(channels) > 0 {
+		query = query.Where("c.channel IN ?", channels)
+	}
+	type row struct {
+		ConversationID string
+		DisplayID      int
+		Subject        string
+		Rating         int
+		Comment        *string
+		Channel        string
+		ResolvedBy     string
+		AssignedUserID *string
+		SubmittedAt    reportTime
+	}
+	var rows []row
+	err := query.Select(`csat.conversation_id, c.display_id, c.subject, csat.rating, csat.comment, csat.channel,
+		csat.resolved_by, csat.assigned_user_id, csat.submitted_at`).
+		Order("csat.submitted_at DESC, csat.id").Scan(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("list support report csat: %w", err)
+	}
+	result := make([]SupportReportCSATRow, 0, len(rows))
+	for _, row := range rows {
+		submitted := time.Time{}
+		if row.SubmittedAt.value != nil {
+			submitted = *row.SubmittedAt.value
+		}
+		result = append(result, SupportReportCSATRow{
+			ConversationID: row.ConversationID, DisplayID: row.DisplayID, Subject: row.Subject,
+			Rating: row.Rating, Comment: row.Comment, Channel: row.Channel, ResolvedBy: row.ResolvedBy,
+			AssignedUserID: row.AssignedUserID, SubmittedAt: submitted,
+		})
+	}
+	return result, nil
+}
+
+// SupportReportUser is a teammate shown in a report.
+type SupportReportUser struct {
+	ID        string
+	FullName  string
+	AvatarURL *string
+}
+
+// ListReportUsers returns the named users.
+func (r *SupportConversationRepository) ListReportUsers(ctx context.Context, ids []string) ([]SupportReportUser, error) {
+	ids = compactStrings(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var users []SupportReportUser
+	if err := r.db.WithContext(ctx).Table("users").Select("id, full_name, avatar_url").
+		Where("id IN ?", ids).Scan(&users).Error; err != nil {
+		return nil, fmt.Errorf("list support report users: %w", err)
+	}
+	return users, nil
+}
+
+// SupportReportSLARow is the SLA outcome of one conversation.
+type SupportReportSLARow struct {
+	ConversationID       string
+	FirstResponseState   string
+	NextResponseBreaches int
+	NextResponseState    string
+	ResolutionState      string
+}
+
+// reportSLAQuery selects SLA records of conversations created in [from, to)
+// that the actor can open.
+func (r *SupportConversationRepository) reportSLAQuery(ctx context.Context, scope SupportReportScope, from, to time.Time) *gorm.DB {
+	query := r.db.WithContext(ctx).Table("support_conversation_slas AS sla").
+		Joins("JOIN support_conversations AS c ON c.id = sla.conversation_id AND c.workspace_id = sla.workspace_id").
+		Where("sla.workspace_id = ? AND c.merged_into_id IS NULL AND c.status <> ? AND c.created_at >= ? AND c.created_at < ?",
+			scope.WorkspaceID, model.SupportConversationStatusSpam, from, to)
+	query = r.applyMailboxAccess(query, "c", scope.WorkspaceMemberID, scope.Role)
+	query = r.applyMailboxScopes(query, "c", nil, scope.MailboxIDs)
+	if channels := compactStrings(scope.Channels); len(channels) > 0 {
+		query = query.Where("c.channel IN ?", channels)
+	}
+	return query
+}
+
+// ListReportSLA returns SLA outcomes of conversations created in [from, to)
+// that the actor can open.
+func (r *SupportConversationRepository) ListReportSLA(ctx context.Context, scope SupportReportScope, from, to time.Time) ([]SupportReportSLARow, error) {
+	var rows []SupportReportSLARow
+	if err := r.reportSLAQuery(ctx, scope, from, to).Select(`sla.conversation_id, sla.first_response_state, sla.next_response_breaches,
+		sla.next_response_state, sla.resolution_state`).Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("list support report SLA outcomes: %w", err)
+	}
+	return rows, nil
+}
+
+// supportReportSLAOutcomes maps a metric and outcome to the condition that
+// summarizeSupportReportSLA counts, and to the time the outcome happened.
+// A next-response conversation is met only when it finished without a miss.
+var supportReportSLAOutcomes = map[string]map[string]struct{ where, at string }{
+	model.SupportSLAMetricFirstResponse: {
+		model.SupportSLAStateAchieved: {"sla.first_response_state = 'achieved'", "sla.first_response_achieved_at"},
+		model.SupportSLAStateBreached: {"sla.first_response_state = 'breached'", "sla.first_response_breached_at"},
+	},
+	model.SupportSLAMetricNextResponse: {
+		model.SupportSLAStateAchieved: {"sla.next_response_breaches = 0 AND sla.next_response_state = 'achieved'", "CAST(NULL AS timestamp)"},
+		model.SupportSLAStateBreached: {"sla.next_response_breaches > 0", "sla.next_response_breached_at"},
+	},
+	model.SupportSLAMetricResolution: {
+		model.SupportSLAStateAchieved: {"sla.resolution_state = 'achieved'", "sla.resolution_achieved_at"},
+		model.SupportSLAStateBreached: {"sla.resolution_state = 'breached'", "sla.resolution_breached_at"},
+	},
+}
+
+// ValidSupportReportSLAOutcome reports whether metric and outcome name a
+// count the SLA report shows.
+func ValidSupportReportSLAOutcome(metric, outcome string) bool {
+	_, ok := supportReportSLAOutcomes[metric][outcome]
+	return ok
+}
+
+// ListReportSLAConversations returns one page of the conversations behind
+// an SLA report count, newest outcome first, and the total count.
+func (r *SupportConversationRepository) ListReportSLAConversations(ctx context.Context, scope SupportReportScope, from, to time.Time, metric, outcome string, limit, offset int) ([]model.SupportReportSLAConversation, int64, error) {
+	spec, ok := supportReportSLAOutcomes[metric][outcome]
+	if !ok {
+		return nil, 0, fmt.Errorf("unknown SLA outcome %s/%s", metric, outcome)
+	}
+	var total int64
+	if err := r.reportSLAQuery(ctx, scope, from, to).Where(spec.where).Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("count support report SLA conversations: %w", err)
+	}
+	rows := []model.SupportReportSLAConversation{}
+	if total == 0 {
+		return rows, 0, nil
+	}
+	err := r.reportSLAQuery(ctx, scope, from, to).Where(spec.where).
+		Joins("LEFT JOIN crm_companies AS company ON company.id = c.crm_company_id AND company.workspace_id = c.workspace_id").
+		Joins("LEFT JOIN users AS assignee ON assignee.id = c.assigned_user_id").
+		Select(`c.id, c.display_id, c.subject, c.status, c.priority, c.customer_name, c.customer_email,
+			company.name AS company_name, sla.policy_name, assignee.full_name AS assignee_name,
+			c.created_at, ` + spec.at + ` AS outcome_at, sla.next_response_breaches`).
+		Order(spec.at + " IS NULL").Order(spec.at + " DESC").Order("c.created_at DESC").Order("c.id").
+		Limit(limit).Offset(offset).Scan(&rows).Error
+	if err != nil {
+		return nil, 0, fmt.Errorf("list support report SLA conversations: %w", err)
+	}
+	return rows, total, nil
+}
+
+// PortalIntakeDeflectionWindow is how long after opening an article a form
+// must stay unsubmitted to count as likely deflected.
+const PortalIntakeDeflectionWindow = 30 * time.Minute
+
+// ReportPortalIntake summarizes portal request forms started in [from, to).
+// It returns nil when there was no intake activity. now bounds deflection, so
+// forms still inside the window are not counted as deflected yet.
+func (r *SupportConversationRepository) ReportPortalIntake(ctx context.Context, workspaceID string, from, to, now time.Time) (*model.SupportReportPortalIntake, error) {
+	var row struct {
+		Forms                       int
+		WithSuggestions             int
+		Opened                      int
+		SubmittedAfterOpening       int
+		LikelyDeflected             int
+		SubmittedWithoutSuggestions int
+	}
+	err := r.db.WithContext(ctx).Raw(`WITH intakes AS (
+			SELECT intake_id,
+				MAX(CASE WHEN event_type = 'shown' THEN 1 ELSE 0 END) AS shown,
+				MAX(CASE WHEN event_type = 'opened' THEN 1 ELSE 0 END) AS opened,
+				MAX(CASE WHEN event_type = 'submitted' THEN 1 ELSE 0 END) AS submitted,
+				MAX(CASE WHEN event_type = 'submitted' AND search_completed = true AND article_count = 0 THEN 1 ELSE 0 END) AS submitted_without,
+				MAX(CASE WHEN event_type = 'opened' THEN occurred_at END) AS last_opened
+			FROM support_portal_intake_events
+			WHERE workspace_id = @workspace
+			GROUP BY intake_id
+			HAVING MIN(occurred_at) >= @from AND MIN(occurred_at) < @to)
+		SELECT COUNT(*) AS forms,
+			COALESCE(SUM(shown), 0) AS with_suggestions,
+			COALESCE(SUM(opened), 0) AS opened,
+			COALESCE(SUM(CASE WHEN opened = 1 AND submitted = 1 THEN 1 ELSE 0 END), 0) AS submitted_after_opening,
+			COALESCE(SUM(CASE WHEN opened = 1 AND submitted = 0 AND last_opened < @cutoff THEN 1 ELSE 0 END), 0) AS likely_deflected,
+			COALESCE(SUM(submitted_without), 0) AS submitted_without_suggestions
+		FROM intakes`,
+		map[string]any{"workspace": workspaceID, "from": from, "to": to, "cutoff": now.Add(-PortalIntakeDeflectionWindow)}).Scan(&row).Error
+	if err != nil || row.Forms == 0 {
+		return nil, err
+	}
+	return &model.SupportReportPortalIntake{
+		WithSuggestions: row.WithSuggestions, Opened: row.Opened, SubmittedAfterOpening: row.SubmittedAfterOpening,
+		LikelyDeflected: row.LikelyDeflected, SubmittedWithoutSuggestions: row.SubmittedWithoutSuggestions,
+	}, nil
+}
+
+// helpAssistantUnansweredLimit is how many unanswered questions a report lists.
+const helpAssistantUnansweredLimit = 5
+
+// ReportHelpAssistant summarizes help assistant questions asked in [from, to).
+// It returns nil when no question was asked.
+func (r *SupportConversationRepository) ReportHelpAssistant(ctx context.Context, workspaceID string, from, to time.Time) (*model.SupportReportHelpAssistant, error) {
+	var row struct {
+		Conversations int
+		Questions     int
+		Answered      int
+		HandedOff     int
+		Failed        int
+		Helpful       int
+		NotHelpful    int
+	}
+	err := r.db.WithContext(ctx).Raw(`SELECT
+			COUNT(DISTINCT CASE WHEN role = 'user' THEN session_id END) AS conversations,
+			COALESCE(SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END), 0) AS questions,
+			COALESCE(SUM(CASE WHEN role = 'assistant' AND status = 'answered' THEN 1 ELSE 0 END), 0) AS answered,
+			COALESCE(SUM(CASE WHEN role = 'assistant' AND status = 'handed_off' THEN 1 ELSE 0 END), 0) AS handed_off,
+			COALESCE(SUM(CASE WHEN role = 'assistant' AND status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+			COALESCE(SUM(CASE WHEN role = 'assistant' AND helpful = true THEN 1 ELSE 0 END), 0) AS helpful,
+			COALESCE(SUM(CASE WHEN role = 'assistant' AND helpful = false THEN 1 ELSE 0 END), 0) AS not_helpful
+		FROM help_assistant_messages
+		WHERE workspace_id = ? AND created_at >= ? AND created_at < ?`, workspaceID, from, to).Scan(&row).Error
+	if err != nil || row.Questions == 0 {
+		return nil, err
+	}
+	report := &model.SupportReportHelpAssistant{
+		Conversations: row.Conversations, Questions: row.Questions, Answered: row.Answered, HandedOff: row.HandedOff,
+		Failed: row.Failed, Helpful: row.Helpful, NotHelpful: row.NotHelpful, Unanswered: []model.SupportReportUnansweredQuestion{},
+	}
+	var handedOff []model.HelpAssistantMessage
+	if err := r.db.WithContext(ctx).Where("workspace_id = ? AND role = ? AND status = ? AND created_at >= ? AND created_at < ?",
+		workspaceID, model.HelpAssistantRoleAssistant, model.HelpAssistantStatusHandedOff, from, to).
+		Order("created_at DESC").Limit(helpAssistantUnansweredLimit).Find(&handedOff).Error; err != nil {
+		return nil, err
+	}
+	for _, answer := range handedOff {
+		var question model.HelpAssistantMessage
+		err := r.db.WithContext(ctx).Where("session_id = ? AND role = ? AND created_at <= ?", answer.SessionID, model.HelpAssistantRoleUser, answer.CreatedAt).
+			Order("created_at DESC").Limit(1).Find(&question).Error
+		if err != nil {
+			return nil, err
+		}
+		if question.ID != "" {
+			report.Unanswered = append(report.Unanswered, model.SupportReportUnansweredQuestion{Question: question.Content, AskedAt: question.CreatedAt})
+		}
+	}
+	return report, nil
+}

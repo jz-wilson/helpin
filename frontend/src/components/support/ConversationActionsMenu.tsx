@@ -8,6 +8,9 @@ function TranslationDialogControls({workspaceId, conversationId}: {workspaceId: 
 import { useSupportAIControl } from './SupportAIControl';
 import { isAIActiveConversation } from './helpers';
 import { type ReactNode, useEffect, useState } from 'react';
+import { useSnoozeConversation, useUnsnoozeConversation, useUpdateConversationPriority } from '@/hooks/queries/useSupportOperations';
+import { PriorityIcon } from '@/lib/pmConstants';
+import { SnoozeSubmenu } from './SnoozeMenu';
 import { toast } from 'sonner';
 import { useConfirm } from '@/components/ui/confirm-dialog';
 import { Button } from '@/components/ui/button';
@@ -42,6 +45,7 @@ import {
   MailOpenIcon,
   OctagonXIcon,
   PencilEdit01Icon,
+  Clock01Icon,
 } from '@/lib/icons';
 import type { ConversationStatus, SupportConversation } from '@/lib/pmTypes';
 import {
@@ -105,6 +109,10 @@ export function ConversationActionsMenu({
   const updateStatus = useUpdateConversationStatus(workspaceId);
   const deleteConversation = useDeleteConversation(workspaceId);
   const moveConversation = useMoveConversation(workspaceId);
+  const updatePriority = useUpdateConversationPriority(workspaceId);
+  const snooze = useSnoozeConversation(workspaceId);
+  const unsnooze = useUnsnoozeConversation(workspaceId);
+  const canSnooze = !conversation.merged_into_id && conversation.status !== 'resolved' && conversation.status !== 'spam';
   const aiHandling = !['resolved', 'spam'].includes(conversation.status) && isAIActiveConversation(conversation);
   const availableMoveOptions = moveOptions.filter((option) =>
     option.id !== (conversation.mailbox_id ?? 'shared') || (option.id === 'shared' && aiHandling),
@@ -272,6 +280,38 @@ export function ConversationActionsMenu({
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
             )}
+            {!conversation.merged_into_id && (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger className={itemClassName}>
+                  <PriorityIcon priority={conversation.priority ?? 'medium'} className={iconClassName} />
+                  Priority
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-40">
+                  {(['urgent', 'high', 'medium', 'low'] as const).map((priority) => (
+                    <DropdownMenuItem
+                      key={priority}
+                      className={itemClassName}
+                      disabled={updatePriority.isPending || conversation.priority === priority}
+                      onClick={() => updatePriority.mutate({ conversationId: conversation.id, priority })}
+                    >
+                      <PriorityIcon priority={priority} className={iconClassName} />
+                      <span className="capitalize">{priority}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            )}
+            {canSnooze && (conversation.snoozed_until ? (
+              <DropdownMenuItem className={itemClassName} disabled={unsnooze.isPending} onClick={() => unsnooze.mutate({ conversationId: conversation.id })}>
+                <Clock01Icon className={iconClassName} />
+                Wake from snooze
+              </DropdownMenuItem>
+            ) : (
+              <SnoozeSubmenu
+                disabled={snooze.isPending}
+                onSnooze={(until) => snooze.mutate({ conversationId: conversation.id, until })}
+              />
+            ))}
             {mergeAccess?.permissions.includes('support.merge') && !conversation.merged_into_id && !conversation.anonymized_at && (
               <DropdownMenuItem onSelect={() => setMergeOpen(true)} className={itemClassName}>
                 <Link01Icon className={iconClassName} />

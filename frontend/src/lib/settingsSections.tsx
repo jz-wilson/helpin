@@ -38,6 +38,9 @@ import {
   DashboardSpeed01Icon,
   ServerStack01Icon,
   UserSharingIcon,
+  Timer01Icon,
+  LeftToRightListBulletIcon,
+  WebhookIcon,
 } from '@hugeicons/core-free-icons';
 
 export type IconComponent = FC<{ className?: string; style?: CSSProperties }>;
@@ -75,6 +78,10 @@ const EmailAccounts = hi(Mail01Icon);
 const Meetings = hi(Calendar03Icon);
 const Autonomy = hi(SlidersHorizontalIcon);
 const ChatWidget = hi(BubbleChatIcon);
+const CustomerPortal = hi(Globe02Icon);
+const SLAPolicies = hi(Timer01Icon);
+const Fields = hi(LeftToRightListBulletIcon);
+const Webhooks = hi(WebhookIcon);
 const InboxesRouting = hi(Route01Icon);
 const Access = hi(Shield01Icon);
 const MCP = hi(PlugSocketIcon);
@@ -109,12 +116,17 @@ export type SettingsSection =
   | 'helpcenter'
   | 'redirects'
   | 'crm-pipelines'
+  | 'crm-fields'
   | 'crm-email'
   | 'crm-meetings'
   | 'crm-autonomy'
   | 'support-ai-assistant'
   | 'support-translation'
   | 'chat-general'
+  | 'customer-portal'
+  | 'support-sla'
+  | 'support-conversation-fields'
+  | 'support-webhooks'
   | 'inboxes-routing';
 
 export type SettingsRouteSection = SettingsSection | 'ai-connections' | 'profile' | 'security' | 'notifications' | 'account' | 'git-connections';
@@ -310,9 +322,9 @@ const allSettingsSections: SettingsSectionMeta[] = [
   },
   {
     id: 'import',
-    keywords: ["csv", "export", "migrate"],
+    keywords: ["csv", "export", "migrate", "intercom", "helpscout", "shortcut"],
     label: 'Import & export',
-    description: 'Import data from Shortcut and other project management tools.',
+    description: 'Import projects, help centers and support conversations from other tools.',
     icon: ImportExport,
     group: 'Integrations & data',
   },
@@ -375,6 +387,39 @@ const allSettingsSections: SettingsSectionMeta[] = [
     group: 'Support',
   },
   {
+    id: 'customer-portal',
+    label: 'Customer portal',
+    description: 'Control customer access and request intake through the portal.',
+    keywords: ['portal', 'requests', 'customer access', 'anonymous intake'],
+    icon: CustomerPortal,
+    group: 'Support',
+  },
+  {
+    id: 'support-sla',
+    label: 'SLA policies',
+    description: 'Set first response, next response and resolution targets for conversations.',
+    keywords: ['sla', 'service level', 'response time', 'targets', 'breach', 'priority'],
+    icon: SLAPolicies,
+    group: 'Support',
+  },
+  {
+    id: 'support-conversation-fields',
+    label: 'Request types & fields',
+    description: 'Choose what customers ask for on the portal and the fields conversations carry.',
+    keywords: ['custom fields', 'fields', 'attributes', 'ticket fields', 'form fields', 'request types', 'ticket forms', 'forms'],
+    icon: Fields,
+    group: 'Support',
+  },
+  {
+    id: 'support-webhooks',
+    label: 'Webhooks',
+    description: 'Send signed support events to your own systems as they happen.',
+    keywords: ['webhook', 'integration', 'events', 'callback', 'zapier', 'api'],
+    icon: Webhooks,
+    group: 'Support',
+    requiredPermission: 'support.admin',
+  },
+  {
     id: 'support-ai-assistant',
     label: 'AI assistant',
     description: 'Configure how support AI replies, drafts internal notes, and hands conversations to humans.',
@@ -421,6 +466,14 @@ const allSettingsSections: SettingsSectionMeta[] = [
     label: 'Deal pipelines',
     description: 'Configure deal pipelines and stages.',
     icon: Pipelines,
+    group: 'CRM',
+  },
+  {
+    id: 'crm-fields',
+    keywords: ['custom fields', 'custom properties', 'attributes', 'contact fields', 'company fields'],
+    label: 'Fields',
+    description: 'Give contact and company keys a label and type.',
+    icon: Fields,
     group: 'CRM',
   },
   {

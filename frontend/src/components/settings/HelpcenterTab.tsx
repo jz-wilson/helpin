@@ -30,8 +30,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { toast } from 'sonner';
 import { useDocsHelpcenterLocales, useUpdateDocsHelpcenterLocales } from '@/hooks/queries';
 import { HelpcenterLocalesCard } from '@/components/settings/helpcenter/HelpcenterLocalesCard';
+import { HelpcenterCustomDomainStatus, type HelpcenterDomainVerification } from '@/components/settings/helpcenter/HelpcenterCustomDomainStatus';
 import { HelpcenterTranslationsTable } from '@/components/settings/helpcenter/HelpcenterTranslationsTable';
 import { StickyFormFooter } from '@/components/settings/StickyFormFooter';
+import { HelpAssistantSetting } from '@/components/settings/HelpAssistantSetting';
 import { SortableFooterLinkRow, SortableHeaderLinkRow, SortableSocialLinkRow } from '@/components/settings/helpcenter/HelpcenterSortableRows';
 import {
   PlusSignIcon, InformationCircleIcon, ArrowDown01Icon, Cancel01Icon,
@@ -336,6 +338,9 @@ interface ConfigState {
   is_published: boolean;
   chat_widget_enabled: boolean;
   ai_answers_enabled: boolean;
+  demo_mode: boolean;
+  search_indexing_enabled: boolean;
+  official_docs_url: string;
   seo_title: string;
   seo_description: string;
   og_title: string;
@@ -372,6 +377,9 @@ const DEFAULT_CONFIG: ConfigState = {
   is_published: false,
   chat_widget_enabled: true,
   ai_answers_enabled: true,
+  demo_mode: false,
+  search_indexing_enabled: true,
+  official_docs_url: '',
   seo_title: '',
   seo_description: '',
   og_title: '',
@@ -593,6 +601,8 @@ export function HelpcenterTab({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [config, setConfig] = useState<ConfigState>(DEFAULT_CONFIG);
+  // The saved custom domain's verification, as the server last reported it.
+  const [domainVerification, setDomainVerification] = useState<HelpcenterDomainVerification | null>(null);
   // Snapshot of config at the time of last load or save. Used to
   // detect unsaved changes via JSON comparison.
   const [savedSnapshot, setSavedSnapshot] = useState('');
@@ -630,6 +640,7 @@ export function HelpcenterTab({
       const res = await docsService.getHelpcenterConfig(workspaceId);
       if (res.data) {
         const d = res.data;
+        setDomainVerification(d);
         const loaded: ConfigState = {
           subdomain: d.subdomain ?? '',
           custom_domain: d.custom_domain ?? '',
@@ -655,6 +666,9 @@ export function HelpcenterTab({
           is_published: d.is_published ?? false,
           chat_widget_enabled: d.chat_widget_enabled !== false,
           ai_answers_enabled: d.ai_answers_enabled !== false,
+          demo_mode: d.demo_mode ?? false,
+          search_indexing_enabled: d.search_indexing_enabled ?? true,
+          official_docs_url: d.official_docs_url ?? '',
           seo_title: d.seo_title ?? '',
           seo_description: d.seo_description ?? '',
           og_title: d.og_title ?? '',
@@ -749,6 +763,9 @@ export function HelpcenterTab({
       is_published: config.is_published,
       chat_widget_enabled: config.chat_widget_enabled,
       ai_answers_enabled: config.ai_answers_enabled,
+      demo_mode: config.demo_mode,
+      search_indexing_enabled: config.search_indexing_enabled,
+      official_docs_url: config.official_docs_url,
       seo_title: config.seo_title || undefined,
       seo_description: config.seo_description || undefined,
       og_title: config.og_title,
@@ -770,6 +787,7 @@ export function HelpcenterTab({
     if (res.error) {
       toast.error(res.error);
     } else {
+      if (res.data) setDomainVerification(res.data);
       toast.success('Help center settings saved');
       setSavedSnapshot(JSON.stringify(config));
     }
@@ -1448,17 +1466,21 @@ export function HelpcenterTab({
                 autoComplete="off"
                 spellCheck={false}
               />
-              <div className="rounded-md border border-border/60 bg-muted/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
-                <p className="mb-1.5 font-medium text-foreground">DNS setup</p>
-                <p>
-                  Create a <span className="font-mono text-foreground">CNAME</span> record on your domain pointing to{' '}
-                  <span className="font-mono text-foreground">helpin.center</span>. SSL certificates are issued automatically once DNS resolves.
-                </p>
-                <p className="mt-1.5">
-                  Example: <span className="font-mono text-foreground">help.yourcompany.com</span> →{' '}
-                  <span className="font-mono text-foreground">helpin.center</span>
-                </p>
-              </div>
+              <HelpcenterCustomDomainStatus
+                verification={domainVerification}
+                editedDomain={config.custom_domain}
+                editable
+                onCheck={async () => {
+                  const { docsService } = await import('@/lib/services/docsService');
+                  const checked = await docsService.verifyHelpcenterCustomDomain(workspaceId);
+                  if (checked.error || !checked.data) {
+                    toast.error(checked.error || 'Could not check DNS. Try again.');
+                    return null;
+                  }
+                  setDomainVerification(checked.data);
+                  return checked.data;
+                }}
+              />
             </div>
             <div className="space-y-2">
               <Label htmlFor="hc-support-email">Support Email</Label>
@@ -1473,6 +1495,17 @@ export function HelpcenterTab({
           </div>
           <div className="space-y-4">
             <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="hc-demo-mode">Demo mode</Label>
+                <Switch id="hc-demo-mode" checked={config.demo_mode} onCheckedChange={(checked) => setConfig({ ...config, demo_mode: checked })} />
+              </div>
+              <p className="text-xs text-muted-foreground">Shows a demo disclosure and excludes this Help Center from search engines. This does not restrict public access.</p>
+              <div className="flex items-center justify-between">
+                <Label htmlFor="hc-indexing">Allow search engine indexing</Label>
+                <Switch id="hc-indexing" disabled={config.demo_mode} checked={!config.demo_mode && config.search_indexing_enabled} onCheckedChange={(checked) => setConfig({ ...config, search_indexing_enabled: checked })} />
+              </div>
+              <Label htmlFor="hc-official-docs">Official documentation URL</Label>
+              <Input id="hc-official-docs" type="url" value={config.official_docs_url} onChange={(e) => setConfig({ ...config, official_docs_url: e.target.value })} placeholder="https://docs.example.com" />
               <Label htmlFor="hc-seo-title">Meta Title</Label>
               <Input
                 id="hc-seo-title"
@@ -1711,6 +1744,7 @@ export function HelpcenterTab({
                     aria-label="AI answers in help center search"
                   />
                 </div>
+                <HelpAssistantSetting workspaceId={workspaceId} editable />
                 <div className="flex gap-3 rounded-lg border border-border/60 bg-muted/30 p-4 text-xs leading-relaxed text-muted-foreground">
                   <InformationCircleIcon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
                   <p>

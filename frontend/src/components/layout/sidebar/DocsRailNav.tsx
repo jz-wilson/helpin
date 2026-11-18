@@ -8,6 +8,7 @@ import {
   File01Icon,
   FolderOpenIcon,
   InboxIcon,
+  LayoutGridIcon,
   MoreVerticalIcon,
   PencilEdit01Icon,
   PlusSignIcon,
@@ -75,19 +76,25 @@ type DocsRailNavProps = {
   onNavigate: (target: SidebarNavigateTarget) => void
 }
 
-function SpaceMark({ space, size = 'md' }: { space: DocsSpace; size?: 'sm' | 'md' }) {
+// Counts, the collection "⋯" menu and the "In this space" + share one
+// trailing slot: 24px wide, 8px from the row's right edge, content
+// centred. Every row in the rail uses px-2, so they line up on one axis.
+const TRAILING_SLOT = 'flex h-6 w-6 shrink-0 items-center justify-center'
+const COUNT_CLASS = 'ml-auto w-6 shrink-0 text-center text-[11px] tabular-nums text-muted-foreground'
+
+function SpaceMark({ space, size = 'md' }: { space: DocsSpace; size?: 'xs' | 'sm' | 'md' }) {
   return (
     <span
       data-slot="docs-space-avatar"
       className={cn(
         'flex shrink-0 items-center justify-center overflow-hidden rounded-full font-semibold leading-none',
         getAvatarColor(space.id),
-        size === 'md' ? 'h-7 w-7 text-xs' : 'h-6 w-6 text-[11px]',
+        size === 'md' ? 'h-7 w-7 text-xs' : size === 'sm' ? 'h-6 w-6 text-[11px]' : 'h-5 w-5 text-[9px]',
       )}
     >
       <StoredIcon
         name={space.icon}
-        className={size === 'md' ? 'h-4 w-4' : 'h-3.5 w-3.5'}
+        className={size === 'md' ? 'h-4 w-4' : size === 'sm' ? 'h-3.5 w-3.5' : 'h-3 w-3'}
         textClassName="leading-none"
         fallback={<span>{getInitials(space.name).slice(0, 2)}</span>}
       />
@@ -275,7 +282,15 @@ function CollectionBranch({
             fallback={<FolderOpenIcon className="h-3.5 w-3.5 shrink-0" />}
           />
           <span className="truncate text-sm font-medium">{node.collection.name}</span>
-          <span className="ml-auto w-6 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">{directCount}</span>
+          <span
+            data-slot="docs-sidebar-count"
+            className={cn(
+              COUNT_CLASS,
+              canEditDocs && 'transition-opacity group-hover/collection:opacity-0 group-has-[:focus-visible]/collection:opacity-0 group-has-[[data-state=open]]/collection:opacity-0',
+            )}
+          >
+            {directCount}
+          </span>
         </button>
         {canEditDocs && (
           <DropdownMenu>
@@ -283,7 +298,11 @@ function CollectionBranch({
               <button
                 type="button"
                 aria-label={`Manage ${node.collection.name}`}
-                className="absolute inset-y-0 right-0 flex w-8 items-center justify-center rounded-md bg-gradient-to-l from-sidebar from-65% to-transparent opacity-0 transition-opacity group-hover/collection:opacity-100 data-[state=open]:opacity-100"
+                data-slot="docs-tree-row-menu"
+                className={cn(
+                  TRAILING_SLOT,
+                  'absolute inset-y-0 right-2 my-auto rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover/collection:opacity-100 data-[state=open]:opacity-100',
+                )}
                 onClick={(event) => event.stopPropagation()}
               >
                 <MoreVerticalIcon className="h-3.5 w-3.5" />
@@ -348,6 +367,75 @@ function CollectionBranch({
   )
 }
 
+// One space in the All spaces sidebar list: opens the space; editors get
+// the same "⋯" menu as collection rows, in the count's slot.
+function SpaceListRow({
+  space,
+  count,
+  canEditDocs,
+  onOpen,
+  onEdit,
+  onDelete,
+}: {
+  space: DocsSpace
+  count: number | undefined
+  canEditDocs: boolean
+  onOpen: () => void
+  onEdit: () => void
+  onDelete: () => void
+}) {
+  return (
+    <div data-slot="docs-space-row" className="group/space relative flex min-h-8 items-center">
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+      >
+        <SpaceMark space={space} size="xs" />
+        <span className="truncate text-sm font-medium">{space.name}</span>
+        {count !== undefined && (
+          <span
+            data-slot="docs-sidebar-count"
+            className={cn(
+              COUNT_CLASS,
+              canEditDocs && 'transition-opacity group-hover/space:opacity-0 group-has-[:focus-visible]/space:opacity-0 group-has-[[data-state=open]]/space:opacity-0',
+            )}
+          >
+            {count}
+          </span>
+        )}
+      </button>
+      {canEditDocs && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label={`Manage ${space.name}`}
+              data-slot="docs-tree-row-menu"
+              className={cn(
+                TRAILING_SLOT,
+                'absolute inset-y-0 right-2 my-auto rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover/space:opacity-100 data-[state=open]:opacity-100',
+              )}
+            >
+              <MoreVerticalIcon className="h-3.5 w-3.5" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="right" align="start">
+            <DropdownMenuItem onClick={onEdit}>
+              <PencilEdit01Icon className="h-4 w-4" />
+              Edit space
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={onDelete} className="text-destructive focus:text-destructive">
+              <Delete01Icon className="h-4 w-4" />
+              Delete space
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
+    </div>
+  )
+}
+
 export function DocsRailNav({
   wsId,
   wsSlug,
@@ -372,6 +460,21 @@ export function DocsRailNav({
   const [deletingCollection, setDeletingCollection] = useState<DocsCollection | null>(null)
   const deleteSpace = useDeleteDocsSpace(wsId)
   const deleteCollection = useDeleteDocsCollection(wsId)
+  // Same query as the My documents page; the count leaves out archived
+  // documents because that page hides them by default.
+  const { data: myDocuments } = useDocsDocuments(wsId, { mine: 'true', include_archived: 'true' })
+  const onAllSpaces = location.pathname.replace(/\/$/, '') === `/w/${wsSlug}/docs`
+  // On All spaces the sidebar lists the spaces instead of the last one
+  // opened. Same query as that page, so the counts match its rows.
+  const { data: allDocuments } = useDocsDocuments(wsId, {}, { enabled: onAllSpaces })
+  const documentCountBySpace = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const document of allDocuments ?? []) {
+      counts.set(document.space_id, (counts.get(document.space_id) ?? 0) + 1)
+    }
+    return counts
+  }, [allDocuments])
+  const [creatingSpaceType, setCreatingSpaceType] = useState<DocsSpace['type'] | null>(null)
 
   const activeSpaceId = resolveDocsSidebarSpaceId({
     spaces,
@@ -537,13 +640,30 @@ export function DocsRailNav({
               aria-expanded={switcherOpen}
               className="flex min-h-13 w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition-colors hover:bg-sidebar-accent"
             >
-              <SpaceMark space={activeSpace} />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-semibold tracking-tight">{activeSpace.name}</span>
-                <span className="block truncate text-[11px] text-muted-foreground">
-                  {documents.length} {documents.length === 1 ? 'doc' : 'docs'} · {activeSpace.type === 'external_capable' ? 'external' : 'team'}
-                </span>
-              </span>
+              {onAllSpaces ? (
+                <>
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                    <LayoutGridIcon className="h-3.5 w-3.5" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-semibold tracking-tight">All spaces</span>
+                    <span className="block truncate text-[11px] text-muted-foreground">
+                      {spaces.length} {spaces.length === 1 ? 'space' : 'spaces'}
+                      {allDocuments && ` · ${allDocuments.length} ${allDocuments.length === 1 ? 'doc' : 'docs'}`}
+                    </span>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <SpaceMark space={activeSpace} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-semibold tracking-tight">{activeSpace.name}</span>
+                    <span className="block truncate text-[11px] text-muted-foreground">
+                      {documents.length} {documents.length === 1 ? 'doc' : 'docs'} · {activeSpace.type !== 'external_capable' ? 'team' : activeSpace.helpcenter_audience === 'customers' ? 'signed-in customers' : 'external'}
+                    </span>
+                  </span>
+                </>
+              )}
               <ArrowDown01Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             </button>
           </PopoverTrigger>
@@ -596,7 +716,7 @@ export function DocsRailNav({
                         key={space.id}
                         space={space}
                         wsId={wsId}
-                        active={space.id === activeSpaceId}
+                        active={!onAllSpaces && space.id === activeSpaceId}
                         highlighted={orderedFilteredSpaces[highlightedSpaceIndex]?.id === space.id}
                         canEditDocs={canEditDocs}
                         onSelect={() => navigateToSpace(space.id)}
@@ -611,18 +731,36 @@ export function DocsRailNav({
                 <p className="px-2 py-6 text-center text-sm text-muted-foreground">No spaces found.</p>
               )}
             </div>
+            <div className="mx-1 my-1 h-px bg-border/70" />
+            <button
+              type="button"
+              aria-current={onAllSpaces ? 'page' : undefined}
+              className={cn(
+                'flex min-h-9 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors hover:bg-muted',
+                onAllSpaces && 'bg-muted',
+              )}
+              onClick={() => {
+                setSwitcherOpen(false)
+                onNavigate({ to: '/w/$slug/docs', params: { slug: wsSlug } })
+              }}
+            >
+              <span className="flex h-6 w-6 items-center justify-center"><LayoutGridIcon className="h-3.5 w-3.5" /></span>
+              All spaces
+              {onAllSpaces && (
+                <span className="ml-auto flex h-7 w-7 shrink-0 items-center justify-center">
+                  <Tick01Icon className="h-3.5 w-3.5" />
+                </span>
+              )}
+            </button>
             {canEditDocs && (
-              <>
-                <div className="mx-1 my-1 h-px bg-border/70" />
-                <button
-                  type="button"
-                  className="flex min-h-9 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors hover:bg-muted"
-                  onClick={() => { setSwitcherOpen(false); openCreate('docs_space') }}
-                >
-                  <span className="flex h-6 w-6 items-center justify-center"><PlusSignIcon className="h-3.5 w-3.5" /></span>
-                  New space
-                </button>
-              </>
+              <button
+                type="button"
+                className="flex min-h-9 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors hover:bg-muted"
+                onClick={() => { setSwitcherOpen(false); openCreate('docs_space') }}
+              >
+                <span className="flex h-6 w-6 items-center justify-center"><PlusSignIcon className="h-3.5 w-3.5" /></span>
+                New space
+              </button>
             )}
           </PopoverContent>
         </Popover>
@@ -658,8 +796,8 @@ export function DocsRailNav({
 
       <nav data-slot="docs-quick-links" aria-label="Docs views" className="space-y-0.5 px-2 pb-2">
         {[
-          { label: 'Recent docs', icon: Clock01Icon, link: `/w/${wsSlug}/docs/recent` },
-          { label: 'My documents', icon: UserIcon, link: `/w/${wsSlug}/docs/my` },
+          { label: 'Recent docs', icon: Clock01Icon, link: `/w/${wsSlug}/docs/recent`, count: undefined },
+          { label: 'My documents', icon: UserIcon, link: `/w/${wsSlug}/docs/my`, count: myDocuments?.filter((document) => document.status !== 'archived').length },
         ].map((item) => (
           <button
             key={item.link}
@@ -672,155 +810,214 @@ export function DocsRailNav({
           >
             <item.icon className="h-3.5 w-3.5 text-muted-foreground" />
             <span className="truncate">{item.label}</span>
+            {item.count !== undefined && (
+              <span data-slot="docs-sidebar-count" className={COUNT_CLASS}>{item.count}</span>
+            )}
           </button>
         ))}
-        <button
-          type="button"
-          onClick={() => navigateToSpace(activeSpaceId)}
-          className={cn(
-            'flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
-            isActive(`/w/${wsSlug}/docs/spaces/${activeSpaceId}`) && 'bg-sidebar-accent font-medium text-sidebar-accent-foreground',
-          )}
-        >
-          <File01Icon className="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="truncate">All docs in space</span>
-          <span className="ml-auto w-6 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">{documents.length}</span>
-        </button>
+        {!onAllSpaces && (
+          <button
+            type="button"
+            onClick={() => navigateToSpace(activeSpaceId)}
+            className={cn(
+              'flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+              isActive(`/w/${wsSlug}/docs/spaces/${activeSpaceId}`) && 'bg-sidebar-accent font-medium text-sidebar-accent-foreground',
+            )}
+          >
+            <File01Icon className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="truncate">All docs in space</span>
+            <span data-slot="docs-sidebar-count" className={COUNT_CLASS}>{documents.length}</span>
+          </button>
+        )}
       </nav>
 
       <div className="mx-3 h-px bg-sidebar-border/80" />
 
-      <div data-slot="docs-tree-scroll" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-2">
-        <div className="flex min-h-7 items-center justify-between px-2 text-[11px] uppercase tracking-wide text-muted-foreground/90">
-          <span>In this space</span>
-          {canEditDocs && (
-            <button
-              type="button"
-              aria-label="New collection"
-              className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-              onClick={() => openCreate('docs_collection', { spaceId: activeSpaceId })}
-            >
-              <PlusSignIcon className="h-3.5 w-3.5" />
-            </button>
-          )}
-        </div>
-
-        {pinnedDocuments.length > 0 && (
-          <div className="mb-2 space-y-0.5">
-            {pinnedDocuments.map((document) => (
-              <DocumentRow
-                key={`pinned-${document.id}`}
-                document={document}
-                pinned
-                active={document.id === activeDocumentId}
-                onOpen={() => navigateToDocument(document)}
-              />
-            ))}
-          </div>
-        )}
-
-        {collectionsLoading || documentsLoading ? (
-          <div className="space-y-1">
-            {[1, 2, 3, 4].map((row) => <Skeleton key={row} className="h-8 rounded-md" />)}
-          </div>
-        ) : (
-          <div className="space-y-0.5">
-            {tree.map((node) => (
-              <CollectionBranch
-                key={node.collection.id}
-                node={node}
-                expanded={expanded}
-                activeDocumentId={activeDocumentId}
-                activeCollectionId={location.pathname.includes('/docs/spaces/') && search.collection !== '__uncollected__' ? (search.collection ?? '') : ''}
-                canEditDocs={canEditDocs}
-                onToggle={toggleCollection}
-                onOpenCollection={navigateToCollection}
-                onOpenDocument={navigateToDocument}
-                onCreateDocument={(collectionId) => openCreate('docs_document', { spaceId: activeSpaceId, collectionId })}
-                onEditCollection={setEditingCollection}
-                onDeleteCollection={setDeletingCollection}
-              />
-            ))}
-
-            {uncollectedDocuments.length > 0 && (
-              <div>
-                <div data-slot="docs-tree-row" className="relative flex min-h-8 items-center">
-                  <button
-                    type="button"
-                    data-slot="docs-tree-disclosure"
-                    aria-label={`${uncategorizedExpanded ? 'Collapse' : 'Expand'} Uncategorized`}
-                    aria-expanded={uncategorizedExpanded}
-                    onClick={() => toggleCollection('__uncategorized__')}
-                    className="absolute -left-2 z-10 flex h-8 w-2 items-center justify-start text-muted-foreground transition-colors before:absolute before:inset-y-0 before:left-0 before:w-4 hover:text-sidebar-accent-foreground"
-                  >
-                    <ArrowRight01Icon className={cn('h-2.5 w-2.5 max-w-none shrink-0 transition-transform', uncategorizedExpanded && 'rotate-90')} />
-                  </button>
-                  <button
-                    type="button"
-                    data-slot="docs-tree-item"
-                    aria-current={location.pathname.includes('/docs/spaces/') && search.collection === '__uncollected__' ? 'location' : undefined}
-                    onClick={() => onNavigate({
-                      to: '/w/$slug/docs/spaces/$spaceId',
-                      params: { slug: wsSlug, spaceId: activeSpaceId },
-                      search: { collection: '__uncollected__' },
-                    })}
-                    className={cn(
-                      'flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
-                      location.pathname.includes('/docs/spaces/') && search.collection === '__uncollected__' && 'bg-sidebar-accent text-sidebar-accent-foreground',
-                    )}
-                  >
-                    <InboxIcon className="h-3.5 w-3.5" />
-                    <span className="truncate text-sm font-medium">Uncategorized</span>
-                    <span className="ml-auto w-6 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">{uncollectedDocuments.length}</span>
-                  </button>
+      {onAllSpaces ? (
+        <div data-slot="docs-space-list" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-2">
+          {([
+            ['internal', 'Team spaces'],
+            ['external_capable', 'External spaces'],
+          ] as const).map(([type, label]) => {
+            const group = orderedSpaces.filter((space) => space.type === type)
+            return (
+              <div key={type} className="mb-2">
+                <div className="flex min-h-7 items-center justify-between px-2 text-[11px] uppercase tracking-wide text-muted-foreground/90">
+                  <span>{label}</span>
+                  {canEditDocs && (
+                    <button
+                      type="button"
+                      aria-label={type === 'internal' ? 'New team space' : 'New external space'}
+                      data-slot="docs-tree-header-add"
+                      className={cn(TRAILING_SLOT, 'rounded-md hover:bg-sidebar-accent hover:text-sidebar-accent-foreground')}
+                      onClick={() => setCreatingSpaceType(type)}
+                    >
+                      <PlusSignIcon className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                 </div>
-                {uncategorizedExpanded && (
-                  <div className="ml-4 border-l border-sidebar-border/80 pl-2">
-                    {uncollectedDocuments.map((document) => (
-                      <DocumentRow
-                        key={document.id}
-                        document={document}
-                        active={document.id === activeDocumentId}
-                        onOpen={() => navigateToDocument(document)}
-                      />
-                    ))}
-                    {canEditDocs && (
-                      <button
-                        type="button"
-                        onClick={() => openCreate('docs_document', { spaceId: activeSpaceId })}
-                        className="flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                      >
-                        <PlusSignIcon className="h-3 w-3" />
-                        New document
-                      </button>
-                    )}
-                  </div>
-                )}
+                <div className="space-y-0.5">
+                  {group.map((space) => (
+                    <SpaceListRow
+                      key={space.id}
+                      space={space}
+                      count={allDocuments ? (documentCountBySpace.get(space.id) ?? 0) : undefined}
+                      canEditDocs={canEditDocs}
+                      onOpen={() => navigateToSpace(space.id)}
+                      onEdit={() => setEditingSpace(space)}
+                      onDelete={() => setDeletingSpace(space)}
+                    />
+                  ))}
+                  {group.length === 0 && (
+                    <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                      {type === 'internal' ? 'No team spaces yet.' : 'No external spaces yet.'}
+                    </p>
+                  )}
+                </div>
               </div>
-            )}
-
-            {tree.length === 0 && uncollectedDocuments.length === 0 && (
-              <p className="px-2 py-3 text-xs text-muted-foreground">No collections or documents yet.</p>
-            )}
+            )
+          })}
+        </div>
+      ) : (
+        <div data-slot="docs-tree-scroll" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-2">
+          <div className="flex min-h-7 items-center justify-between px-2 text-[11px] uppercase tracking-wide text-muted-foreground/90">
+            <span>In this space</span>
             {canEditDocs && (
               <button
                 type="button"
+                aria-label="New collection"
+                data-slot="docs-tree-header-add"
+                className={cn(TRAILING_SLOT, 'rounded-md hover:bg-sidebar-accent hover:text-sidebar-accent-foreground')}
                 onClick={() => openCreate('docs_collection', { spaceId: activeSpaceId })}
-                className="mt-1 flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
               >
-                <PlusSignIcon className="h-3 w-3" />
-                New collection
+                <PlusSignIcon className="h-3.5 w-3.5" />
               </button>
             )}
           </div>
-        )}
-      </div>
+
+          {pinnedDocuments.length > 0 && (
+            <div className="mb-2 space-y-0.5">
+              {pinnedDocuments.map((document) => (
+                <DocumentRow
+                  key={`pinned-${document.id}`}
+                  document={document}
+                  pinned
+                  active={document.id === activeDocumentId}
+                  onOpen={() => navigateToDocument(document)}
+                />
+              ))}
+            </div>
+          )}
+
+          {collectionsLoading || documentsLoading ? (
+            <div className="space-y-1">
+              {[1, 2, 3, 4].map((row) => <Skeleton key={row} className="h-8 rounded-md" />)}
+            </div>
+          ) : (
+            <div className="space-y-0.5">
+              {tree.map((node) => (
+                <CollectionBranch
+                  key={node.collection.id}
+                  node={node}
+                  expanded={expanded}
+                  activeDocumentId={activeDocumentId}
+                  activeCollectionId={location.pathname.includes('/docs/spaces/') && search.collection !== '__uncollected__' ? (search.collection ?? '') : ''}
+                  canEditDocs={canEditDocs}
+                  onToggle={toggleCollection}
+                  onOpenCollection={navigateToCollection}
+                  onOpenDocument={navigateToDocument}
+                  onCreateDocument={(collectionId) => openCreate('docs_document', { spaceId: activeSpaceId, collectionId })}
+                  onEditCollection={setEditingCollection}
+                  onDeleteCollection={setDeletingCollection}
+                />
+              ))}
+
+              {uncollectedDocuments.length > 0 && (
+                <div>
+                  <div data-slot="docs-tree-row" className="relative flex min-h-8 items-center">
+                    <button
+                      type="button"
+                      data-slot="docs-tree-disclosure"
+                      aria-label={`${uncategorizedExpanded ? 'Collapse' : 'Expand'} Uncategorized`}
+                      aria-expanded={uncategorizedExpanded}
+                      onClick={() => toggleCollection('__uncategorized__')}
+                      className="absolute -left-2 z-10 flex h-8 w-2 items-center justify-start text-muted-foreground transition-colors before:absolute before:inset-y-0 before:left-0 before:w-4 hover:text-sidebar-accent-foreground"
+                    >
+                      <ArrowRight01Icon className={cn('h-2.5 w-2.5 max-w-none shrink-0 transition-transform', uncategorizedExpanded && 'rotate-90')} />
+                    </button>
+                    <button
+                      type="button"
+                      data-slot="docs-tree-item"
+                      aria-current={location.pathname.includes('/docs/spaces/') && search.collection === '__uncollected__' ? 'location' : undefined}
+                      onClick={() => onNavigate({
+                        to: '/w/$slug/docs/spaces/$spaceId',
+                        params: { slug: wsSlug, spaceId: activeSpaceId },
+                        search: { collection: '__uncollected__' },
+                      })}
+                      className={cn(
+                        'flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+                        location.pathname.includes('/docs/spaces/') && search.collection === '__uncollected__' && 'bg-sidebar-accent text-sidebar-accent-foreground',
+                      )}
+                    >
+                      <InboxIcon className="h-3.5 w-3.5" />
+                      <span className="truncate text-sm font-medium">Uncategorized</span>
+                      <span data-slot="docs-sidebar-count" className={COUNT_CLASS}>{uncollectedDocuments.length}</span>
+                    </button>
+                  </div>
+                  {uncategorizedExpanded && (
+                    <div className="ml-4 border-l border-sidebar-border/80 pl-2">
+                      {uncollectedDocuments.map((document) => (
+                        <DocumentRow
+                          key={document.id}
+                          document={document}
+                          active={document.id === activeDocumentId}
+                          onOpen={() => navigateToDocument(document)}
+                        />
+                      ))}
+                      {canEditDocs && (
+                        <button
+                          type="button"
+                          onClick={() => openCreate('docs_document', { spaceId: activeSpaceId })}
+                          className="flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+                        >
+                          <PlusSignIcon className="h-3 w-3" />
+                          New document
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {tree.length === 0 && uncollectedDocuments.length === 0 && (
+                <p className="px-2 py-3 text-xs text-muted-foreground">No collections or documents yet.</p>
+              )}
+              {canEditDocs && (
+                <button
+                  type="button"
+                  onClick={() => openCreate('docs_collection', { spaceId: activeSpaceId })}
+                  className="mt-1 flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+                >
+                  <PlusSignIcon className="h-3 w-3" />
+                  New collection
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <SpaceDialog
         wsId={wsId}
         open={editingSpace !== null}
         onOpenChange={(open) => { if (!open) setEditingSpace(null) }}
         space={editingSpace}
+      />
+      <SpaceDialog
+        wsId={wsId}
+        open={creatingSpaceType !== null}
+        onOpenChange={(open) => { if (!open) setCreatingSpaceType(null) }}
+        defaultType={creatingSpaceType ?? undefined}
       />
       <DeleteSpaceDialog
         wsId={wsId}

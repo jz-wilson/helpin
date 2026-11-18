@@ -18,6 +18,7 @@ import (
 
 // Handlers aggregates all HTTP handlers.
 type Handlers struct {
+	IconSuggestion         *handler.IconSuggestionHandler
 	Metrics                *observability.Metrics
 	AuthenticatedRateLimit func(http.Handler) http.Handler
 	// WidgetRateLimit guards the unauthenticated /widget write endpoints
@@ -27,6 +28,9 @@ type Handlers struct {
 	// HelpcenterAnswerRateLimit guards the public AI answer endpoints
 	// (nil disables limiting, e.g. when Redis is not configured).
 	HelpcenterAnswerRateLimit func(http.Handler) http.Handler
+	// HelpAssistantRateLimit guards questions to the help assistant (nil
+	// disables limiting).
+	HelpAssistantRateLimit func(http.Handler) http.Handler
 
 	// DemoReadOnly rejects every non-read request made by the shared public demo
 	// viewer account (nil when the demo login is not configured).
@@ -35,9 +39,12 @@ type Handlers struct {
 	Assets              *handler.AssetHandler
 	Health              *handler.HealthHandler
 	Auth                *handler.AuthHandler
+	CustomerPortal      *handler.CustomerPortalHandler
+	CustomerPortalAdmin *handler.CustomerPortalAdminHandler
 	Passkey             *handler.PasskeyHandler
 	Organization        *handler.OrganizationHandler
 	Workspace           *handler.WorkspaceHandler
+	LinkPreview         *handler.LinkPreviewHandler
 	Setup               *handler.SetupHandler
 	Capability          *handler.CapabilityHandler
 	SampleData          *handler.SampleDataHandler
@@ -98,6 +105,7 @@ type Handlers struct {
 	CRMImport           *handler.CRMImportHandler
 	CRMEmail            *handler.CRMEmailHandler
 	CRMOutreach         *handler.CRMOutreachHandler
+	SupportTeamReply    *handler.SupportTeamReplyHandler
 	CRMCalendar         *handler.CRMCalendarHandler
 	CRMEnrichment       *handler.CRMEnrichmentHandler
 	CRMSignal           *handler.CRMSignalHandler
@@ -114,6 +122,15 @@ type Handlers struct {
 	SupportAI           *handler.SupportAIHandler
 	SupportAttachment   *handler.SupportAttachmentHandler
 	SupportCoverage     *handler.SupportCoverageHandler
+	SupportReports      *handler.SupportReportsHandler
+	SupportSLA          *handler.SupportSLAHandler
+	ConversationFields  *handler.CustomFieldHandler
+	RequestTypes        *handler.SupportRequestTypeHandler
+	CRMFieldDefinitions *handler.CustomFieldHandler
+	SupportWebhooks     *handler.SupportWebhookHandler
+	SupportImports      *handler.SupportImportHandler
+	SupportActions      *handler.SupportConversationActionsHandler
+	SupportInboxClear   *handler.SupportInboxClearHandler
 	PostmarkInbound     *handler.PostmarkInboundHandler
 	EmailImageProxy     *handler.EmailImageProxyHandler
 	AdminWebhookEvent   *handler.AdminWebhookEventHandler
@@ -130,6 +147,10 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 	helpcenterAnswerLimiter := h.HelpcenterAnswerRateLimit
 	if helpcenterAnswerLimiter == nil {
 		helpcenterAnswerLimiter = func(next http.Handler) http.Handler { return next }
+	}
+	helpAssistantLimiter := h.HelpAssistantRateLimit
+	if helpAssistantLimiter == nil {
+		helpAssistantLimiter = func(next http.Handler) http.Handler { return next }
 	}
 
 	// Global middleware (applied to all routes)
@@ -238,6 +259,7 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 		r.With(h.SupportInboxWidget.RequireOrigin).Post("/session/revoke", h.SupportInboxWidget.RevokeSession)
 		r.With(h.SupportInboxWidget.RequireOrigin).Post("/messages", h.SupportInboxWidget.SendMessage)
 		r.With(h.SupportInboxWidget.RequireOrigin).Post("/messages/{messageId}/feedback", h.SupportInboxWidget.SubmitAnswerFeedback)
+		r.With(h.SupportInboxWidget.RequireOrigin).Post("/conversations/{conversationId}/csat", h.SupportInboxWidget.SubmitCSAT)
 		r.With(h.SupportInboxWidget.RequireOrigin).Post("/conversations/{conversationId}/transcript", h.SupportInboxWidget.SendTranscript)
 		r.With(h.SupportInboxWidget.RequireOrigin).Post("/support/conversations/{conversationId}/transcript", h.SupportInboxWidget.SendTranscript)
 		r.With(h.SupportInboxWidget.RequireOrigin).Post("/typing", h.SupportInboxWidget.TypingIndicator) // Deprecated: use WebSocket typing:start/typing:stop instead. Kept as HTTP fallback.
@@ -292,6 +314,12 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 			r.Get("/search", h.Docs.PublicSearchArticles)
 			r.With(helpcenterAnswerLimiter).Post("/answer", h.Docs.PublicAnswerQuestion)
 			r.With(helpcenterAnswerLimiter).Post("/answer/{answerID}/feedback", h.Docs.PublicAnswerFeedback)
+			if h.CustomerPortal != nil {
+				r.Get("/portal", h.CustomerPortal.HelpcenterPortal)
+			}
+			r.With(helpAssistantLimiter).Post("/assistant/messages", h.Docs.PublicAssistantAsk)
+			r.Get("/assistant/sessions/{sessionId}", h.Docs.PublicAssistantSession)
+			r.With(helpcenterAnswerLimiter).Post("/assistant/messages/{messageId}/feedback", h.Docs.PublicAssistantFeedback)
 
 			// Canonical collection + article routes
 			r.Get("/c/{collectionSlug}", h.Docs.PublicGetCollectionPage)
@@ -323,12 +351,64 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 		}
 
 		// ---- Public routes ----
+		if h.SupportTeamReply != nil {
+			// The "Ask our team to reply" page from AI emails; the token is the credential.
+			r.Route("/public/support/team-reply/{token}", func(r chi.Router) {
+				if h.WidgetRateLimit != nil {
+					r.Use(h.WidgetRateLimit)
+				}
+				r.Get("/", h.SupportTeamReply.Page)
+				r.Post("/", h.SupportTeamReply.Request)
+			})
+		}
+		if h.CustomerPortal != nil {
+			r.Route("/public/portal/{slug}", func(r chi.Router) {
+				if h.WidgetRateLimit != nil {
+					r.Use(h.WidgetRateLimit)
+				}
+				r.Get("/", h.CustomerPortal.Config)
+				r.Post("/auth/magic-link", h.CustomerPortal.RequestLink)
+				r.Post("/auth/exchange", h.CustomerPortal.Exchange)
+				r.Post("/intake/session", h.CustomerPortal.StartAnonymousIntake)
+				r.Post("/intake/attachments", h.CustomerPortal.UploadAnonymousAttachment)
+				r.Patch("/intake/attachments/{attachmentId}/confirm", h.CustomerPortal.ConfirmAnonymousAttachment)
+				r.Post("/intake/requests", h.CustomerPortal.CreateAnonymousRequest)
+				r.Get("/suggestions", h.CustomerPortal.Suggestions)
+				r.Post("/suggestions/events", h.CustomerPortal.SuggestionEvent)
+				r.With(helpAssistantLimiter).Post("/assistant/messages", h.CustomerPortal.AssistantAsk)
+				r.Get("/assistant/sessions/{sessionId}", h.CustomerPortal.AssistantSession)
+				r.Post("/assistant/messages/{messageId}/feedback", h.CustomerPortal.AssistantFeedback)
+				r.Get("/help", h.CustomerPortal.HelpArticles)
+				r.Get("/help/search", h.CustomerPortal.HelpSearch)
+				r.Get("/help/articles/{articleId}", h.CustomerPortal.HelpArticle)
+				r.Get("/session", h.CustomerPortal.Session)
+				r.Delete("/session", h.CustomerPortal.Logout)
+				r.Get("/requests", h.CustomerPortal.Requests)
+				r.Post("/attachments", h.CustomerPortal.UploadAttachment)
+				r.Post("/requests/{reference}/attachments", h.CustomerPortal.UploadAttachment)
+				r.Patch("/attachments/{attachmentId}/confirm", h.CustomerPortal.ConfirmAttachment)
+				r.Patch("/requests/{reference}/attachments/{attachmentId}/confirm", h.CustomerPortal.ConfirmAttachment)
+				r.Get("/requests/search", h.CustomerPortal.SearchRequests)
+				r.Get("/requests/{reference}", h.CustomerPortal.RequestDetail)
+				r.Post("/requests/{reference}/replies", h.CustomerPortal.Reply)
+				r.Post("/requests/{reference}/csat", h.CustomerPortal.Rate)
+				r.Put("/requests/{reference}/cc", h.CustomerPortal.SetRequestCC)
+				r.Get("/cc-options", h.CustomerPortal.CCOptions)
+				r.Get("/companies/{companyId}/team", h.CustomerPortal.Team)
+				r.Post("/companies/{companyId}/team/invites", h.CustomerPortal.InviteColleague)
+				r.Put("/companies/{companyId}/team/{contactId}/role", h.CustomerPortal.SetColleagueRole)
+				r.Delete("/companies/{companyId}/team/{contactId}", h.CustomerPortal.RemoveColleague)
+				r.Post("/requests", h.CustomerPortal.CreateRequest)
+			})
+		}
 		r.Get("/auth/config", h.Auth.GetConfig)
 		r.Post("/auth/signup", h.Auth.Signup)
 		r.Post("/auth/verify-email", h.Auth.VerifyEmail)
 		r.Get("/auth/google/start", h.Auth.GoogleStart)
 		r.Get("/auth/google/callback", h.Auth.GoogleCallback)
 		r.Post("/auth/google/mobile-exchange", h.Auth.GoogleMobileExchange)
+		r.Get("/auth/oidc/start", h.Auth.OIDCStart)
+		r.Get("/auth/oidc/callback", h.Auth.OIDCCallback)
 		r.Post("/auth/signin", h.Auth.Signin)
 		if h.WidgetRateLimit != nil {
 			r.With(h.WidgetRateLimit).Post("/auth/demo", h.Auth.DemoSignin)
@@ -414,6 +494,9 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 		r.Route("/hc/{subdomain}", func(r chi.Router) {
 			r.Get("/config", h.Docs.PublicGetConfig)
 			r.Get("/bootstrap", h.Docs.PublicGetBootstrap)
+			if h.CustomerPortal != nil {
+				r.Get("/portal", h.CustomerPortal.HelpcenterPortal)
+			}
 			r.Get("/{locale}/spaces", h.Docs.PublicGetSpaces)
 			r.Get("/{locale}/spaces/{spaceSlug}/navigation", h.Docs.PublicGetSpaceNavigation)
 			r.Get("/{locale}/spaces/{spaceSlug}/api-references", h.Docs.PublicListAPIReferences)
@@ -440,6 +523,9 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 			r.Get("/search", h.Docs.PublicSearchArticles)
 			r.With(helpcenterAnswerLimiter).Post("/answer", h.Docs.PublicAnswerQuestion)
 			r.With(helpcenterAnswerLimiter).Post("/answer/{answerID}/feedback", h.Docs.PublicAnswerFeedback)
+			r.With(helpAssistantLimiter).Post("/assistant/messages", h.Docs.PublicAssistantAsk)
+			r.Get("/assistant/sessions/{sessionId}", h.Docs.PublicAssistantSession)
+			r.With(helpcenterAnswerLimiter).Post("/assistant/messages/{messageId}/feedback", h.Docs.PublicAssistantFeedback)
 
 			// Canonical collection + article routes
 			r.Get("/c/{collectionSlug}", h.Docs.PublicGetCollectionPage)
@@ -456,6 +542,16 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 		r.Get("/docs/shared/{shareToken}", h.Docs.PublicGetSharedDoc)
 		if h.PublicShare != nil {
 			r.Get("/public/shares/{token}", h.PublicShare.GetPublic)
+		}
+		if h.LinkPreview != nil {
+			r.Route("/link-previews", func(r chi.Router) {
+				r.Use(h.LinkPreview.Limit)
+				r.Get("/metadata", h.LinkPreview.Metadata)
+				r.Get("/image", h.LinkPreview.Image)
+				r.Head("/image", h.LinkPreview.Image)
+				r.Get("/html", h.LinkPreview.HTML)
+				r.Head("/html", h.LinkPreview.HTML)
+			})
 		}
 
 		// ---- Public widget routes (no JWT, open CORS) ----
@@ -513,10 +609,15 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				AllowCredentials: false,
 				MaxAge:           3600,
 			}))
+			// Writes share the /widget limiter: a message can start an AI turn.
+			sdkWrite := chi.Chain(h.SupportInboxWidget.RequireOrigin)
+			if h.WidgetRateLimit != nil {
+				sdkWrite = chi.Chain(h.WidgetRateLimit, h.SupportInboxWidget.RequireOrigin)
+			}
 			r.With(h.SupportInboxWidget.RequireOrigin).Get("/config", h.SupportInboxWidget.GetConfig)
-			r.With(h.SupportInboxWidget.RequireOrigin).Post("/session", h.SupportInboxWidget.CreateSession)
+			r.With(sdkWrite...).Post("/session", h.SupportInboxWidget.CreateSession)
 			r.With(h.SupportInboxWidget.RequireOrigin).Post("/session/revoke", h.SupportInboxWidget.RevokeSession)
-			r.With(h.SupportInboxWidget.RequireOrigin).Post("/messages", h.SupportInboxWidget.SendMessage)
+			r.With(sdkWrite...).Post("/messages", h.SupportInboxWidget.SendMessage)
 			if h.WidgetRateLimit != nil {
 				r.With(h.WidgetRateLimit, h.SupportInboxWidget.RequireOrigin).Post("/messages/{messageId}/feedback", h.SupportInboxWidget.SubmitAnswerFeedback)
 			} else {
@@ -561,6 +662,11 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 			r.Get("/webhook-events", h.AdminWebhookEvent.List)
 			r.Get("/webhook-events/{id}", h.AdminWebhookEvent.GetByID)
 			r.Get("/email-queue", h.AdminEmailQueue.List)
+			r.Get("/inbound-emails", h.AdminEmailQueue.ListInbound)
+			r.Get("/inbound-emails/{id}", h.AdminEmailQueue.GetInbound)
+			r.Get("/inbound-emails/{id}/conversations", h.AdminEmailQueue.InboundConversations)
+			r.Post("/inbound-emails/{id}/recover", h.AdminEmailQueue.RecoverInbound)
+			r.Get("/inbound-emails/{id}/attachments/{attachmentID}", h.AdminEmailQueue.DownloadInboundAttachment)
 			r.Get("/email-diagnostics", h.AdminEmailQueue.Diagnostics)
 			r.Get("/email-diagnostics/conversations/{conversationID}", h.AdminEmailQueue.ConversationDiagnostics)
 		})
@@ -994,6 +1100,8 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 					r.With(requireCommandBarRead()).Get("/transcriptions", h.VoiceInput.Capabilities)
 					r.With(requireCommandBarRead()).Post("/transcriptions", h.VoiceInput.Transcribe)
 				}
+				r.With(requireCommandBarRead()).Get("/pins", h.DockChat.ListPins)
+				r.With(requireCommandBarRead()).Put("/pins/{kind}/{resourceID}", h.DockChat.SetPin)
 				r.With(requireCommandBarRead()).Get("/chats", h.DockChat.ListChats)
 				r.With(requireCommandBarRead()).Post("/chats", h.DockChat.CreateChat)
 				r.With(requireCommandBarRead()).Get("/chats/support-conversation", h.DockChat.FindSupportConversationChat)
@@ -1010,6 +1118,8 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requireCommandBarEdit()).Post("/chats/{chatID}/interactions/{interactionID}/resolve", h.DockChat.ResolveChatRunInteraction)
 				r.With(requireCommandBarEdit()).Post("/chats/{chatID}/run/cancel", h.DockChat.CancelChatRun)
 				r.With(requireCommandBarEdit()).Post("/chats/{chatID}/run/pause", h.DockChat.PauseChatRun)
+				r.With(requireCommandBarEdit()).Get("/chats/{chatID}/runs/{runID}/steering", h.DockChat.ChatRunSteering)
+				r.With(requireCommandBarEdit()).Post("/chats/{chatID}/runs/{runID}/steering", h.DockChat.ChatRunSteering)
 				r.With(requireCommandBarEdit()).Post("/chats/{chatID}/run/resume", h.DockChat.ResumeChatRun)
 				r.With(requireCommandBarRead()).Get("/runs", h.DockChat.ListRuns)
 				r.With(requireCommandBarRead()).Get("/runs/{runID}/snapshot", h.DockChat.GetRunSnapshot)
@@ -1025,6 +1135,8 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requireCommandBarEdit()).Post("/runs/{runID}/continue", h.DockChat.ContinueRun)
 				r.With(requireCommandBarEdit()).Post("/runs/{runID}/cancel", h.DockChat.CancelRun)
 				r.With(requireCommandBarEdit()).Post("/runs/{runID}/pause", h.DockChat.PauseRun)
+				r.With(requireCommandBarEdit()).Post("/runs/{runID}/steering", h.DockChat.RunSteering)
+				r.With(requireCommandBarEdit()).Get("/runs/{runID}/steering", h.DockChat.RunSteering)
 				r.With(requireCommandBarEdit()).Post("/runs/{runID}/resume", h.DockChat.ResumeRun)
 			})
 
@@ -1064,6 +1176,9 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermSupportEdit)).Delete("/inbox/tags/{tagId}", h.SupportTag.Delete)
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/mailboxes/scopes", h.SupportInbox.ListInboxScopes)
 				r.With(requirePerm(authorization.PermSupportAdmin)).Get("/inbox/mailboxes", h.SupportInbox.ListMailboxes)
+				if h.IconSuggestion != nil {
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/inbox/icon-suggestion", h.IconSuggestion.Inbox)
+				}
 				r.With(requirePerm(authorization.PermSupportAdmin)).Post("/inbox/mailboxes", h.SupportInbox.CreateMailbox)
 				r.With(requirePerm(authorization.PermSupportAdmin)).Put("/inbox/mailboxes/{mailboxId}", h.SupportInbox.UpdateMailbox)
 				r.With(requirePerm(authorization.PermSupportAdmin)).Post("/inbox/mailboxes/{mailboxId}/archive", h.SupportInbox.ArchiveMailbox)
@@ -1094,6 +1209,10 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations", h.SupportInbox.ListConversations)
 				r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/conversations", h.SupportInbox.CreateConversation)
 				r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/conversations/create-and-send", h.SupportInbox.CreateConversationWithMessage)
+				if h.SupportActions != nil {
+					r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/conversations/bulk", h.SupportActions.Bulk)
+					r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/conversations/{id}/macros/{macroId}/apply", h.SupportActions.ApplyMacro)
+				}
 				if h.SupportAI != nil {
 					r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/rewrite-draft", h.SupportAI.RewriteNewSupportDraft)
 				}
@@ -1103,6 +1222,7 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Put("/inbox/conversations/{id}/status", h.SupportInbox.UpdateConversationStatus)
 				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Post("/inbox/conversations/{id}/follow-up/cancel", h.SupportInbox.CancelConversationFollowUp)
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/messages", h.SupportInbox.ListConversationMessages)
+				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/shared-items", h.SupportInbox.ListConversationSharedItems)
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/translation", h.SupportInbox.TranslationOptions)
 				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Put("/inbox/conversations/{id}/translation", h.SupportInbox.SetLiveTranslate)
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/translation/messages", h.SupportInbox.CachedLiveTranslations)
@@ -1149,6 +1269,11 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermSupportRead)).Post("/inbox/conversations/{id}/read", h.SupportInbox.MarkConversationRead)
 				r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/conversations/{id}/unread", h.SupportInbox.MarkConversationUnread)
 				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Put("/inbox/conversations/{id}/subject", h.SupportInbox.UpdateConversationSubject)
+				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Put("/inbox/conversations/{id}/priority", h.SupportInbox.UpdateConversationPriority)
+				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Put("/inbox/conversations/{id}/request-type", h.SupportInbox.SetConversationRequestType)
+				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Patch("/inbox/conversations/{id}/fields", h.SupportInbox.SetConversationFields)
+				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Post("/inbox/conversations/{id}/snooze", h.SupportInbox.SnoozeConversation)
+				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Delete("/inbox/conversations/{id}/snooze", h.SupportInbox.UnsnoozeConversation)
 				r.With(requirePerm(authorization.PermSupportEdit), h.SupportInbox.RequireWritableConversation).Delete("/inbox/conversations/{id}", h.SupportInbox.DeleteConversation)
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/visitor-context", h.SupportInbox.GetVisitorContext)
 				r.With(requirePerm(authorization.PermSupportMerge)).Get("/inbox/conversations/{id}/merge-candidates", h.SupportInbox.ConversationMergeCandidates)
@@ -1168,6 +1293,22 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermSupportAdmin)).Post("/inbox/installations/reveal-secret", h.SupportInbox.RevealWidgetSecret)
 				r.With(requirePerm(authorization.PermSupportAdmin)).Post("/inbox/installations/rotate-secret", h.SupportInbox.RotateWidgetSecret)
 
+				// Customer portal access
+				if h.CustomerPortalAdmin != nil {
+					r.With(requirePerm(authorization.PermSupportAdmin)).Get("/inbox/portal/access", h.CustomerPortalAdmin.AccessSummary)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Get("/inbox/portal/contacts/{contactId}/access", h.CustomerPortalAdmin.ContactAccess)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/inbox/portal/contacts/{contactId}/access", h.CustomerPortalAdmin.UpdateContactAccess)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/inbox/portal/contacts/{contactId}/role", h.CustomerPortalAdmin.UpdateContactRole)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Get("/inbox/portal/companies/{companyId}", h.CustomerPortalAdmin.CompanyAccess)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/inbox/portal/companies/{companyId}", h.CustomerPortalAdmin.UpdateCompanyAccess)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/inbox/portal/companies/{companyId}/members/from-domain", h.CustomerPortalAdmin.AddCompanyDomainMembers)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/inbox/portal/companies/{companyId}/team-settings", h.CustomerPortalAdmin.UpdateCompanyTeamSettings)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/inbox/portal/companies/{companyId}/members/{contactId}", h.CustomerPortalAdmin.UpdateCompanyMember)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/inbox/portal/companies/{companyId}/members/{contactId}/role", h.CustomerPortalAdmin.UpdateCompanyMemberRole)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/inbox/conversations/{id}/portal-confirmation", h.CustomerPortalAdmin.ResendIntakeConfirmation)
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/portal-context", h.CustomerPortalAdmin.ConversationPortalContext)
+				}
+
 				// Canned responses
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/canned-responses", h.SupportInbox.ListCannedResponses)
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/canned-responses/search", h.SupportInbox.SearchCannedResponses)
@@ -1183,10 +1324,72 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 
 				// File attachments
 				if h.SupportAttachment != nil {
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/attachments/policy", h.SupportAttachment.Policy)
 					r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{convId}/attachments/{attachmentId}/content", h.SupportAttachment.Content)
 					r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/conversations/{convId}/attachments", h.SupportAttachment.Create)
 					r.With(requirePerm(authorization.PermSupportEdit)).Patch("/inbox/attachments/{attachmentId}/confirm", h.SupportAttachment.ConfirmUpload)
 					r.With(requirePerm(authorization.PermSupportEdit)).Delete("/inbox/attachments/{attachmentId}", h.SupportAttachment.Delete)
+				}
+
+				// Inbox-zero celebration
+				if h.SupportInboxClear != nil {
+					r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox-clears", h.SupportInboxClear.RecordClear)
+				}
+
+				if h.ConversationFields != nil {
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/conversation-fields", h.ConversationFields.List)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/conversation-fields", h.ConversationFields.Create)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/conversation-fields/reorder", h.ConversationFields.Reorder)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/conversation-fields/{fieldId}", h.ConversationFields.Update)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/conversation-fields/{fieldId}/archive", h.ConversationFields.Archive)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/conversation-fields/{fieldId}/restore", h.ConversationFields.Restore)
+				}
+				if h.RequestTypes != nil {
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/request-types", h.RequestTypes.List)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/request-types", h.RequestTypes.Create)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/request-types/reorder", h.RequestTypes.Reorder)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/request-types/{typeId}", h.RequestTypes.Update)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Delete("/request-types/{typeId}", h.RequestTypes.Delete)
+				}
+				if h.SupportSLA != nil {
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/sla-policies", h.SupportSLA.List)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/sla-policies", h.SupportSLA.Create)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/sla-policies/reorder", h.SupportSLA.Reorder)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/sla-policies/{policyId}", h.SupportSLA.Update)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Delete("/sla-policies/{policyId}", h.SupportSLA.Delete)
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/sla-tiers", h.SupportSLA.ListTiers)
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/sla-teammates", h.SupportSLA.SLATeammates)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/sla-tiers", h.SupportSLA.CreateTier)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/sla-tiers/reorder", h.SupportSLA.ReorderTiers)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/sla-tiers/{tierId}", h.SupportSLA.UpdateTier)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Delete("/sla-tiers/{tierId}", h.SupportSLA.DeleteTier)
+					// A company's tier and custom SLA change what it is promised.
+					r.With(requirePerm(authorization.PermSupportAdmin)).Put("/sla-companies/tier", h.SupportSLA.SetCompanyTier)
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/sla-companies/{companyId}", h.SupportSLA.CompanySLA)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Post("/sla-companies/{companyId}/custom-sla", h.SupportSLA.CustomizeCompanySLA)
+					r.With(requirePerm(authorization.PermSupportAdmin)).Delete("/sla-companies/{companyId}/custom-sla", h.SupportSLA.RemoveCompanySLA)
+					if h.SupportImports != nil {
+						r.With(requirePerm(authorization.PermSupportAdmin)).Get("/imports", h.SupportImports.List)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/imports/intercom/preview", h.SupportImports.PreviewIntercom)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/imports/intercom", h.SupportImports.StartIntercom)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/imports/{importId}/cancel", h.SupportImports.Cancel)
+					}
+					if h.SupportWebhooks != nil {
+						r.With(requirePerm(authorization.PermSupportAdmin)).Get("/webhooks", h.SupportWebhooks.List)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Get("/webhooks/event-types", h.SupportWebhooks.EventTypes)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/webhooks", h.SupportWebhooks.Create)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Put("/webhooks/{webhookId}", h.SupportWebhooks.Update)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Delete("/webhooks/{webhookId}", h.SupportWebhooks.Delete)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/webhooks/{webhookId}/rotate-secret", h.SupportWebhooks.RotateSecret)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/webhooks/{webhookId}/test", h.SupportWebhooks.Test)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Get("/webhooks/{webhookId}/deliveries", h.SupportWebhooks.Deliveries)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/webhooks/{webhookId}/deliveries/{deliveryId}/redeliver", h.SupportWebhooks.Redeliver)
+					}
+				}
+				if h.SupportReports != nil {
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/reports/overview", h.SupportReports.Overview)
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/reports/conversations.csv", h.SupportReports.ExportConversations)
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/reports/sla/conversations", h.SupportReports.SLAConversations)
 				}
 
 				// Docs coverage
@@ -1488,6 +1691,8 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs/{id}/messages", h.Agent.ListRunMessages)
 					r.With(requirePerm(authorization.PermPMEdit)).Post("/agent-runs/{id}/messages", h.Agent.SendRunMessage)
 					r.With(requirePerm(authorization.PermPMEdit)).Post("/agent-runs/{id}/resume", h.Agent.ResumeRun)
+					r.With(requirePerm(authorization.PermPMEdit)).Post("/agent-runs/{id}/steering", h.Agent.RunSteering)
+					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs/{id}/steering", h.Agent.RunSteering)
 					r.With(requirePerm(authorization.PermPMEdit)).Post("/agent-runs/{id}/continue", h.Agent.ContinueRun)
 					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs/{id}/artifacts", h.Agent.ListRunArtifacts)
 					r.With(requirePerm(authorization.PermPMEdit)).Post("/agent-runs/{id}/cancel", h.Agent.CancelRun)
@@ -1554,6 +1759,11 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				if h.Assets != nil {
 					r.With(requirePerm(authorization.PermDocsRead)).Get("/images/content", h.Assets.DocsImage)
 				}
+
+				if h.IconSuggestion != nil {
+					r.With(requirePerm(authorization.PermDocsEdit)).Post("/icon-suggestion", h.IconSuggestion.Collection)
+				}
+				r.With(requirePerm(authorization.PermDocsEdit)).Post("/rewrite-selection", h.Docs.RewriteSelection)
 
 				// Spaces — docs.read / docs.edit / docs.admin
 				r.With(requirePerm(authorization.PermDocsRead)).Get("/spaces", h.Docs.ListSpaces)
@@ -1666,9 +1876,11 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				// Help Center Config — docs.admin
 				r.With(requirePerm(authorization.PermDocsRead)).Get("/helpcenter/config", h.Docs.GetHelpcenterConfig)
 				r.With(requirePerm(authorization.PermDocsAdmin)).Put("/helpcenter/config", h.Docs.UpdateHelpcenterConfig)
+				r.With(requirePerm(authorization.PermDocsAdmin)).Post("/helpcenter/config/verify-domain", h.Docs.VerifyHelpcenterCustomDomain)
 				r.With(requirePerm(authorization.PermDocsRead)).Get("/helpcenter/locales", h.Docs.GetHelpcenterLocales)
 				r.With(requirePerm(authorization.PermDocsAdmin)).Put("/helpcenter/locales", h.Docs.UpdateHelpcenterLocales)
 				r.With(requirePerm(authorization.PermDocsAdmin)).Post("/helpcenter/upload", h.Docs.UploadHelpcenterAsset)
+				r.With(requirePerm(authorization.PermDocsAdmin)).Post("/helpcenter/brand-import", h.Docs.ImportHelpcenterBrand)
 				r.With(requirePerm(authorization.PermDocsEdit)).Post("/images/import", h.Docs.ImportExternalImage)
 				r.With(requirePerm(authorization.PermDocsRead)).Get("/spaces/{spaceId}/helpcenter/translations", h.Docs.ListSpaceTranslations)
 				r.With(requirePerm(authorization.PermDocsAdmin)).Put("/spaces/{spaceId}/helpcenter/translations", h.Docs.UpsertSpaceTranslation)
@@ -1704,6 +1916,10 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermDocsImport)).Get("/import/jobs", h.Docs.ImportListJobs)
 				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/helpscout/preview", h.Docs.ImportPreviewHelpscout)
 				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/helpscout/start", h.Docs.ImportStartHelpscout)
+				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/intercom/preview", h.Docs.ImportPreviewIntercom)
+				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/intercom/start", h.Docs.ImportStartIntercom)
+				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/public-help-center/preview", h.Docs.ImportPreviewPublicHelpCenter)
+				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/public-help-center/start", h.Docs.ImportStartPublicHelpCenter)
 				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/nextra/preview", h.Docs.ImportPreviewNextra)
 				r.With(requirePerm(authorization.PermDocsImport)).Post("/import/nextra/start", h.Docs.ImportStartNextra)
 				r.With(requirePerm(authorization.PermDocsImport)).Get("/import/{jobId}/status", h.Docs.ImportGetStatus)
@@ -1724,10 +1940,12 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 
 				// Contacts — crm.read / crm.edit
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/contacts", h.CRMContact.List)
+				r.With(requirePerm(authorization.PermCRMRead)).Get("/contacts/filter-options", h.CRMContact.FilterOptions)
 				r.With(requirePerm(authorization.PermCRMEdit)).Post("/contacts", h.CRMContact.Create)
 				r.With(requirePerm(authorization.PermCRMEdit)).Post("/contacts/seed", h.CRMContact.Seed)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/contacts/{id}", h.CRMContact.Get)
 				r.With(requirePerm(authorization.PermCRMEdit)).Put("/contacts/{id}", h.CRMContact.Update)
+				r.With(requirePerm(authorization.PermCRMEdit)).Patch("/contacts/{id}/custom-properties", h.CRMContact.SetCustomFields)
 				r.With(requirePerm(authorization.PermCRMEdit)).Delete("/contacts/{id}", h.CRMContact.Delete)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/contacts/{id}/activities", h.CRMActivity.ListByContact)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/contacts/{id}/timeline", h.CRMContact.ListTimeline)
@@ -1736,9 +1954,11 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 
 				// Companies — crm.read / crm.edit
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/companies", h.CRMCompany.List)
+				r.With(requirePerm(authorization.PermCRMRead)).Get("/companies/filter-options", h.CRMCompany.FilterOptions)
 				r.With(requirePerm(authorization.PermCRMEdit)).Post("/companies", h.CRMCompany.Create)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/companies/{id}", h.CRMCompany.Get)
 				r.With(requirePerm(authorization.PermCRMEdit)).Put("/companies/{id}", h.CRMCompany.Update)
+				r.With(requirePerm(authorization.PermCRMEdit)).Patch("/companies/{id}/custom-properties", h.CRMCompany.SetCustomFields)
 				r.With(requirePerm(authorization.PermCRMEdit)).Delete("/companies/{id}", h.CRMCompany.Delete)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/companies/{id}/activities", h.CRMActivity.ListByCompany)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/companies/{id}/timeline", h.CRMCompany.ListTimeline)
@@ -1757,6 +1977,16 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/deals/{id}/activities", h.CRMActivity.ListByDeal)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/deals/{id}/timeline", h.CRMDeal.ListTimeline)
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/deals/{id}/associations", h.CRMAssociation.ListDealAssociations)
+
+				// Field definitions — crm.read / crm.admin
+				if h.CRMFieldDefinitions != nil {
+					r.With(requirePerm(authorization.PermCRMRead)).Get("/field-definitions", h.CRMFieldDefinitions.List)
+					r.With(requirePerm(authorization.PermCRMAdmin)).Post("/field-definitions", h.CRMFieldDefinitions.Create)
+					r.With(requirePerm(authorization.PermCRMAdmin)).Post("/field-definitions/reorder", h.CRMFieldDefinitions.Reorder)
+					r.With(requirePerm(authorization.PermCRMAdmin)).Put("/field-definitions/{fieldId}", h.CRMFieldDefinitions.Update)
+					r.With(requirePerm(authorization.PermCRMAdmin)).Post("/field-definitions/{fieldId}/archive", h.CRMFieldDefinitions.Archive)
+					r.With(requirePerm(authorization.PermCRMAdmin)).Post("/field-definitions/{fieldId}/restore", h.CRMFieldDefinitions.Restore)
+				}
 
 				// Pipelines — crm.read / crm.admin
 				r.With(requirePerm(authorization.PermCRMRead)).Get("/pipelines", h.CRMDeal.ListPipelines)

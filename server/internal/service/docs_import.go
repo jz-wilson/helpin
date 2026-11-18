@@ -19,6 +19,7 @@ import (
 	appcrypto "github.com/helpin-ai/helpin/server/internal/crypto"
 	"github.com/helpin-ai/helpin/server/internal/docsimport"
 	"github.com/helpin-ai/helpin/server/internal/helpscout"
+	"github.com/helpin-ai/helpin/server/internal/intercom"
 	"github.com/helpin-ai/helpin/server/internal/llm"
 	"github.com/helpin-ai/helpin/server/internal/model"
 	"github.com/helpin-ai/helpin/server/internal/repository"
@@ -30,6 +31,14 @@ import (
 
 // DocsImportService orchestrates help center article imports.
 type DocsImportService struct {
+	// intercomBaseURLOverride replaces the Intercom API host for every
+	// region (INTERCOM_API_BASE_URL).
+	intercomBaseURLOverride string
+	// publicIntercom reads help centers by their public address.
+	publicIntercom *intercom.PublicClient
+	// imageUploader, when set, stores imported images instead of the S3
+	// client. Tests use it to run an import without object storage.
+	imageUploader  helpscout.ImageUploader
 	importRepo     *repository.DocsImportRepository
 	spaceSvc       *DocsSpaceService
 	collectionSvc  *DocsCollectionService
@@ -139,7 +148,7 @@ func (s *DocsImportService) importExternalImageWithUploader(ctx context.Context,
 		return "", fmt.Errorf("create image request: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := helpscout.ImageHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download image: %w", err)
 	}
@@ -149,18 +158,11 @@ func (s *DocsImportService) importExternalImageWithUploader(ctx context.Context,
 		return "", fmt.Errorf("download image: status %d", resp.StatusCode)
 	}
 
-	contentType := resp.Header.Get("Content-Type")
-	if idx := strings.Index(contentType, ";"); idx >= 0 {
-		contentType = strings.TrimSpace(contentType[:idx])
-	}
-	if contentType == "" {
-		contentType = mime.TypeByExtension(path.Ext(parsed.Path))
-	}
-	if !strings.HasPrefix(contentType, "image/") {
-		return "", fmt.Errorf("remote URL is not an image")
-	}
-
 	filename := path.Base(parsed.Path)
+	body, contentType, err := helpscout.ImageBody(resp, filename)
+	if err != nil {
+		return "", fmt.Errorf("download image: %w", err)
+	}
 	if filename == "" || filename == "." || filename == "/" {
 		filename = "image"
 		if exts, _ := mime.ExtensionsByType(contentType); len(exts) > 0 {
@@ -168,7 +170,7 @@ func (s *DocsImportService) importExternalImageWithUploader(ctx context.Context,
 		}
 	}
 
-	uploadedURL, err := uploader.UploadImage(ctx, workspaceID, filename, resp.Body, contentType)
+	uploadedURL, err := uploader.UploadImage(ctx, workspaceID, filename, body, contentType)
 	if err != nil {
 		return "", err
 	}
@@ -312,6 +314,12 @@ type articleStats struct {
 type docsImportJobConfig struct {
 	HelpScoutCollectionID string `json:"helpscout_collection_id,omitempty"`
 	ImportStatus          string `json:"import_status,omitempty"`
+	// SourceURL is the help center home of an import that read a public site.
+	// It holds no secret, so it stays readable for retries and the history.
+	SourceURL string `json:"source_url,omitempty"`
+	// IntercomRegion is the data center of a token-based Intercom import. A
+	// retry needs it: a token only works in its own region.
+	IntercomRegion string `json:"intercom_region,omitempty"`
 }
 
 type helpscoutCategoryTarget struct {
@@ -730,10 +738,10 @@ type ReconvertResult struct {
 
 // Reconvert re-runs the HTML-to-Tiptap converter on all documents from a previous import job,
 // using the stored import_source_html. This overwrites existing content.
-func (s *DocsImportService) Reconvert(ctx context.Context, jobID string) (*ReconvertResult, error) {
-	job, err := s.importRepo.GetByID(ctx, jobID)
+func (s *DocsImportService) Reconvert(ctx context.Context, jobID, workspaceID string) (*ReconvertResult, error) {
+	job, err := s.jobInWorkspace(ctx, jobID, workspaceID)
 	if err != nil {
-		return nil, fmt.Errorf("get import job: %w", err)
+		return nil, err
 	}
 	if job == nil {
 		return nil, fmt.Errorf("import job not found")
@@ -835,20 +843,44 @@ func (s *DocsImportService) ListJobs(ctx context.Context, workspaceID string) ([
 	return s.importRepo.ListByWorkspace(ctx, workspaceID)
 }
 
-func (s *DocsImportService) GetStatus(ctx context.Context, jobID string) (*model.DocsImportJob, error) {
-	return s.importRepo.GetByID(ctx, jobID)
+// jobInWorkspace loads an import job and hides it (nil, nil) unless it
+// belongs to the workspace the caller is authorized for. Job IDs are not
+// secrets, so every job endpoint goes through this check.
+func (s *DocsImportService) jobInWorkspace(ctx context.Context, jobID, workspaceID string) (*model.DocsImportJob, error) {
+	if strings.TrimSpace(workspaceID) == "" {
+		return nil, nil
+	}
+	job, err := s.importRepo.GetByID(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("get import job: %w", err)
+	}
+	if job == nil || job.WorkspaceID != workspaceID {
+		return nil, nil
+	}
+	return job, nil
+}
+
+// GetStatus returns a workspace's import job, or nil when it has none with
+// that ID.
+func (s *DocsImportService) GetStatus(ctx context.Context, jobID, workspaceID string) (*model.DocsImportJob, error) {
+	return s.jobInWorkspace(ctx, jobID, workspaceID)
 }
 
 // Retry re-imports only the articles that failed in a previous job run.
-func (s *DocsImportService) Retry(ctx context.Context, jobID, apiKey string) error {
-	job, err := s.importRepo.GetByID(ctx, jobID)
+func (s *DocsImportService) Retry(ctx context.Context, jobID, workspaceID, apiKey string) error {
+	job, err := s.jobInWorkspace(ctx, jobID, workspaceID)
 	if err != nil {
-		return fmt.Errorf("get import job: %w", err)
+		return err
 	}
 	if job == nil {
 		return fmt.Errorf("import job not found")
 	}
-	if job.Status != model.DocsImportStatusDone && job.Status != model.DocsImportStatusFailed {
+	// A public import keeps everything it needs and resumes from its
+	// checkpoints, so it can also continue after it was stopped or failed
+	// before reaching any article.
+	resumable := job.Source == docsImportSourceIntercomPublic
+	if job.Status != model.DocsImportStatusDone && job.Status != model.DocsImportStatusFailed &&
+		(!resumable || job.Status != model.DocsImportStatusInterrupted) {
 		return fmt.Errorf("can only retry completed or failed jobs")
 	}
 
@@ -856,7 +888,7 @@ func (s *DocsImportService) Retry(ctx context.Context, jobID, apiKey string) err
 	if err := json.Unmarshal(job.Failures, &failures); err != nil {
 		return fmt.Errorf("parse failures: %w", err)
 	}
-	if len(failures) == 0 {
+	if len(failures) == 0 && (!resumable || job.Status == model.DocsImportStatusDone) {
 		return fmt.Errorf("no failures to retry")
 	}
 
@@ -876,6 +908,11 @@ func (s *DocsImportService) Retry(ctx context.Context, jobID, apiKey string) err
 		HelpscoutCollectionID: importCfg.HelpScoutCollectionID,
 		TargetSpaceID:         &spaceID,
 		ImportStatus:          importCfg.ImportStatus,
+		IntercomRegion:        importCfg.IntercomRegion,
+		SourceURL:             importCfg.SourceURL,
+	}
+	if resumable && req.SourceURL == "" {
+		return fmt.Errorf("import job has no source address")
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -935,10 +972,10 @@ func readDocsImportJobConfig(job *model.DocsImportJob) docsImportJobConfig {
 }
 
 // GetRedirectMap returns the redirect map for an import job.
-func (s *DocsImportService) GetRedirectMap(ctx context.Context, jobID string) (json.RawMessage, error) {
-	job, err := s.importRepo.GetByID(ctx, jobID)
+func (s *DocsImportService) GetRedirectMap(ctx context.Context, jobID, workspaceID string) (json.RawMessage, error) {
+	job, err := s.jobInWorkspace(ctx, jobID, workspaceID)
 	if err != nil {
-		return nil, fmt.Errorf("get import job: %w", err)
+		return nil, err
 	}
 	if job == nil {
 		return nil, fmt.Errorf("import job not found")

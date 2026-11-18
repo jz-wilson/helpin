@@ -1246,16 +1246,24 @@ describe('WidgetManager', () => {
   });
 
   describe('conversation CSAT', () => {
-    it('tracks and persists a valid conversation rating', () => {
+    it('saves a rating on the server, then tracks and remembers it', async () => {
       const track = vi.fn();
       (globalThis as any).helpin = { track };
+      (widget as any).host = 'api.example.test';
       (widget as any).widgetKey = 'test-key';
+      (widget as any).sessionToken = 'session-token';
       (widget as any).activeConversationId = 'conv-1';
+      (widget as any).conversations = [{ id: 'conv-1', subject: 'Help', status: 'resolved' }];
       (widget as any).messages = [{ role: 'agent' }];
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ csat: { rating: 4 } }), { status: 200 }));
 
-      (widget as any).handleCsatSubmit(4, ' Helpful and quick ');
+      await (widget as any).handleCsatSubmit(4, ' Helpful and quick ');
 
+      expect(fetchMock).toHaveBeenCalledWith('https://api.example.test/widget/conversations/conv-1/csat', expect.objectContaining({
+        method: 'POST', body: JSON.stringify({ session_token: 'session-token', rating: 4, comment: 'Helpful and quick' }),
+      }));
       expect(localStorage.setItem).toHaveBeenCalledWith('helpin_csat_test-key_conv-1', '1');
+      expect((widget as any).conversations[0].csatRating).toBe(4);
       expect(track).toHaveBeenCalledWith('support_conversation_csat', {
         conversation_id: 'conv-1',
         rating: 4,
@@ -1263,6 +1271,37 @@ describe('WidgetManager', () => {
         handled_by: 'human',
       });
       delete (globalThis as any).helpin;
+    });
+
+    it('rejects a failed rating without marking it submitted', async () => {
+      (widget as any).widgetKey = 'test-key';
+      (widget as any).sessionToken = 'session-token';
+      (widget as any).activeConversationId = 'conv-1';
+      fetchMock.mockResolvedValueOnce(new Response('{}', { status: 409 }));
+
+      await expect((widget as any).handleCsatSubmit(2)).rejects.toThrow('can no longer be rated');
+      expect(localStorage.setItem).not.toHaveBeenCalledWith('helpin_csat_test-key_conv-1', '1');
+    });
+
+    it('keeps a known rating when a later conversation list omits it', () => {
+      (widget as any).render = vi.fn();
+      (widget as any).conversations = [(widget as any).mapConversation({ id: 'conv-2', status: 'resolved', csat_rating: 4 })];
+      (widget as any).handleWSMessage({ type: 'conversations:listed', data: { conversations: [{ id: 'conv-2', status: 'resolved' }] } });
+      expect((widget as any).conversations[0].csatRating).toBe(4);
+    });
+
+    it('reports a network failure in plain words', async () => {
+      (widget as any).sessionToken = 'session-token';
+      (widget as any).activeConversationId = 'conv-1';
+      fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+      await expect((widget as any).handleCsatSubmit(3)).rejects.toThrow('Check your connection');
+    });
+
+    it('treats a rating saved on another device as submitted', () => {
+      (widget as any).widgetKey = 'test-key';
+      (widget as any).conversations = [(widget as any).mapConversation({ id: 'conv-2', status: 'resolved', csat_rating: 5 })];
+      expect((widget as any).hasSubmittedCsat('conv-2')).toBe(true);
+      expect((widget as any).hasSubmittedCsat('conv-3')).toBe(false);
     });
 
     it('exposes persisted CSAT state to the mounted widget', () => {
@@ -1808,6 +1847,49 @@ describe('WidgetManager', () => {
       expect(emailSpy).toHaveBeenCalledWith('visitor@example.com');
       expect((widget as any).preChatDone).toBe(true);
     });
+    it.each(['after_ai_reply', 'before_handoff'])('holds queued messages for %s and sends after confirmed capture', async timing => {
+      const manager = widget as any;
+      manager.widgetKey = 'test-key';
+      manager.anonymousId = 'visitor-id';
+      manager.widgetConfig = { features: { emailCaptureTiming: timing, forceIdentify: true } };
+      manager.messages = [{ id: 'answer', role: 'ai', content: 'Answer' }];
+      manager.activeConversationId = 'conv-1';
+      manager.conversations = [{ id: 'conv-1', status: 'open', aiState: 'escalated', flowState: 'after_hours_queue' }];
+      manager.connectionStatus = 'connected';
+      const sent: string[] = [];
+      manager.wsConnection = { readyState: WebSocket.OPEN, send: (payload: string) => sent.push(payload), close: vi.fn() };
+      manager.pendingOutgoingMessages = [{ id: 'queued', content: 'Next question', conversationId: 'conv-1', queuedAt: Date.now(), lastSentConnection: -1 }];
+      manager.flushPendingOutgoingMessages();
+      expect(sent).toEqual([]);
+      manager.handleWSMessage({type:'connection:error', data:{code:'email_required'}});
+      expect(manager.isAIThinking).toBe(false);
+      expect(manager.waitingForEmail).toBe(true);
+      fetchMock.mockResolvedValueOnce({ok:true,json:async()=>({success:true})});
+      await manager.handleCaptureEmail('visitor@example.com');
+      expect(sent.map(frame=>JSON.parse(frame))).toContainEqual({type:'message:send',data:{content:'Next question'}});
+    });
+    it.each(['return to AI', 'optional email', 'never ask'])('releases queued handoff messages after %s', change => {
+      const manager = widget as any;
+      manager.widgetConfig = { features: { emailCaptureTiming: 'before_handoff', forceIdentify: true } };
+      manager.activeConversationId = 'conv-1';
+      manager.conversations = [{ id: 'conv-1', status: 'open', flowState: 'ai_handling' }];
+      manager.connectionStatus = 'connected';
+      const sent: string[] = [];
+      manager.wsConnection = { readyState: WebSocket.OPEN, send: (payload: string) => sent.push(payload), close: vi.fn() };
+      manager.pendingOutgoingMessages = [{ id: 'queued', content: 'Next question', conversationId: 'conv-1', queuedAt: Date.now(), lastSentConnection: -1 }];
+      manager.handleWSMessage({ type: 'conversation:escalated', data: { conversation_id: 'conv-1', flow_state: 'waiting_for_human', handoff_state: 'live' } });
+      manager.flushPendingOutgoingMessages();
+      expect(sent).toEqual([]);
+      manager.handleWSMessage({ type: 'connection:error', data: { code: 'email_required' } });
+      expect(sent.map(frame => JSON.parse(frame).type)).toEqual(['conversations:list']);
+      if (change === 'return to AI') {
+        manager.handleWSMessage({ type: 'conversations:listed', data: { conversations: [{ id: 'conv-1', status: 'open', flow_state: 'ai_handling', ai_state: 'escalated' }] } });
+      } else {
+        manager.handleWSMessage({ type: 'config:updated', data: { features: { emailCaptureTiming: change === 'never ask' ? 'never' : 'before_handoff', forceIdentify: change === 'never ask' } } });
+      }
+      manager.flushPendingOutgoingMessages();
+      expect(sent.map(frame => JSON.parse(frame))).toContainEqual({ type: 'message:send', data: { content: 'Next question' } });
+    });
     it('does not save a rejected identity locally', async () => {
       (widget as any).widgetKey = 'test-key';
       (widget as any).anonymousId = 'visitor-id';
@@ -1822,7 +1904,7 @@ describe('WidgetManager', () => {
   });
 
   describe('pre-chat and websocket event handling', () => {
-    it('persists pre-chat completion, upgrades the session, and tracks leads', () => {
+    it('persists pre-chat completion only after confirmed identity save and tracks leads', async () => {
       const sent: string[] = [];
       const track = vi.fn();
       (globalThis as any).helpin = { track };
@@ -1837,19 +1919,16 @@ describe('WidgetManager', () => {
         onclose: null,
       };
 
-      (widget as any).handlePreChatSubmit({ email: 'lead@example.com', phone: '+1234567890' });
+      (widget as any).anonymousId = 'visitor-id';
+      fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ success: true }) });
+      await (widget as any).handlePreChatSubmit({ email: 'lead@example.com', phone: '+1234567890' });
 
       expect(emailSpy).toHaveBeenCalledWith('lead@example.com');
       expect(localStorage.setItem).toHaveBeenCalledWith('helpin_prechat_test-key', '1');
       expect(track).toHaveBeenCalledWith('lead', { email: 'lead@example.com' });
-      expect(sent.map((frame) => JSON.parse(frame))).toContainEqual({
-        type: 'session:upgrade',
-        data: {
-          email: 'lead@example.com',
-          phone: '+1234567890',
-          source: 'widget_prechat',
-        },
-      });
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/widget/identify'), expect.objectContaining({
+        body: JSON.stringify({ api_key: 'test-key', anonymous_id: 'visitor-id', email: 'lead@example.com', phone: '+1234567890', source: 'widget_prechat' }),
+      }));
       expect((widget as any).currentEmail).toBe('lead@example.com');
       expect((widget as any).preChatDone).toBe(true);
       expect((widget as any).messages).not.toEqual(

@@ -366,3 +366,98 @@ describe('delayed team reply contact capture', () => {
     expect(getByRole('textbox', { name: 'Email for reply notifications' })).toBeTruthy();
   });
 });
+
+describe('email collection after AI reply', () => {
+  const reply: Message = { id: 'answer', conversationId: 'conv', role: 'ai', content: 'Here is your answer.', isInternal: false, createdAt: new Date().toISOString() };
+  function emailConfig(required = false): WidgetConfig {
+    return { ...baseConfig, features: { ...baseConfig.features, emailCaptureTiming: 'after_ai_reply', preChatForm: true, forceIdentify: required } };
+  }
+  it('replaces the composer after a reply and restores it when optional capture is dismissed', () => {
+    const view = renderConversationView({ config: emailConfig(), messages: [reply] });
+    expect(view.queryByPlaceholderText('Ask a question...')).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: 'Dismiss email request' }));
+    expect(view.getByPlaceholderText('Ask a question...')).toBeTruthy();
+  });
+  it('does not allow required capture to be dismissed', () => {
+    const view = renderConversationView({ config: emailConfig(true), messages: [reply] });
+    expect(view.getByPlaceholderText('you@example.com')).toBeTruthy();
+    expect(view.queryByRole('button', { name: 'Dismiss email request' })).toBeNull();
+    expect(view.queryByPlaceholderText('Ask a question...')).toBeNull();
+  });
+  it('does not prompt before a real AI reply or when email is known', () => {
+    const view = renderConversationView({ config: emailConfig(true), messages: [] });
+    expect(view.queryByPlaceholderText('you@example.com')).toBeNull();
+    view.unmount();
+    const known = renderConversationView({ config: emailConfig(true), messages: [reply], transcriptEmail: 'visitor@example.com' });
+    expect(known.queryByPlaceholderText('you@example.com')).toBeNull();
+  });
+});
+
+
+describe('required email after automatic handoff', () => {
+  const config: WidgetConfig = { ...baseConfig, features: { ...baseConfig.features, emailCaptureTiming: 'before_handoff', preChatForm: true, forceIdentify: true } };
+  const conversation: Conversation = { id: 'handoff', subject: 'Question', status: 'open', flowState: 'after_hours_queue', aiState: 'escalated', handoffState: 'after_hours' };
+
+  it.each(['live', 'busy', 'after_hours'] as const)('replaces the composer with one required email form during %s handoff', handoffState => {
+    const view = renderConversationView({ config, conversation: { ...conversation, handoffState } });
+    expect(view.queryByPlaceholderText('Ask a question...')).toBeNull();
+    expect(view.getByRole('region', { name: 'Enter your email' })).toBeTruthy();
+    expect(view.container.querySelectorAll('input[type="email"]')).toHaveLength(1);
+    expect(view.queryByRole('button', { name: 'Dismiss email request' })).toBeNull();
+    expect(view.queryByRole('button', { name: 'Continue without email' })).toBeNull();
+  });
+
+  it('keeps the form after a failed save and restores chat only after saving, without another handoff', async () => {
+    const save = vi.fn().mockRejectedValueOnce(new Error('Save failed'));
+    const escalate = vi.fn();
+    const view = render(<ConversationView config={config} conversation={conversation} messages={[]} onSendMessage={() => {}} onBack={() => {}} onPreChatSubmit={save} onEscalateToHuman={escalate} contactCaptureCompleted />);
+    fireEvent.input(view.getByRole('textbox', { name: 'Email address' }), { target: { value: 'visitor@example.com' } });
+    fireEvent.submit(view.getByRole('textbox', { name: 'Email address' }).closest('form')!);
+    await waitFor(() => expect(view.getByRole('alert').textContent).toContain('Could not save'));
+    expect(view.queryByPlaceholderText('Ask a question...')).toBeNull();
+    let complete!: () => void;
+    save.mockImplementationOnce(() => new Promise<void>(resolve => { complete = resolve; }));
+    fireEvent.submit(view.getByRole('textbox', { name: 'Email address' }).closest('form')!);
+    expect(view.queryByPlaceholderText('Ask a question...')).toBeNull();
+    complete();
+    await waitFor(() => expect(view.getByPlaceholderText('Ask a question...')).toBeTruthy());
+    expect(save).toHaveBeenLastCalledWith({ email: 'visitor@example.com', phone: '' });
+    expect(escalate).not.toHaveBeenCalled();
+  });
+
+  it('keeps optional capture optional and skips capture for a known email', () => {
+    const optional = { ...config, features: { ...config.features, forceIdentify: false } };
+    const view = renderConversationView({ config: optional, conversation });
+    expect(view.getByPlaceholderText('Ask a question...')).toBeTruthy();
+    expect(view.queryByRole('region', { name: 'Enter your email' })).toBeNull();
+    view.unmount();
+    const known = renderConversationView({ config, conversation, transcriptEmail: 'visitor@example.com' });
+    expect(known.getByPlaceholderText('Ask a question...')).toBeTruthy();
+    expect(known.queryByRole('region', { name: 'Enter your email' })).toBeNull();
+  });
+
+  it.each([
+    { flowState: 'ai_handling' },
+    { status: 'resolved' },
+    { status: 'closed' },
+    { status: 'spam' },
+    { flowState: 'resolved_by_human' },
+  ])('does not enforce an old handoff after %j', state => {
+    const view = renderConversationView({ config, conversation: { ...conversation, ...state } });
+    expect(view.queryByRole('region', { name: 'Enter your email' })).toBeNull();
+  });
+});
+
+it('allows optional handoff without email while dismissal keeps AI chat open', async () => {
+  const handoff = vi.fn();
+  const save = vi.fn();
+  const config = {...baseConfig, features:{...baseConfig.features, preChatForm:true, emailCaptureTiming:'before_handoff' as const, showTalkToHuman:true}};
+  const view = render(<ConversationView config={config} messages={[{id:'ai',conversationId:'handoff',role:'ai',content:'Answer',isInternal:false,createdAt:new Date().toISOString()}]} onSendMessage={()=>{}} onBack={()=>{}} showPreChatForm onPreChatSubmit={save} onEscalateToHuman={handoff} />);
+  fireEvent.click(view.getByRole('button',{name:'Talk to a person'}));
+  fireEvent.click(view.getByRole('button',{name:'Dismiss email request'}));
+  expect(handoff).not.toHaveBeenCalled();
+  fireEvent.click(view.getByRole('button',{name:'Talk to a person'}));
+  fireEvent.click(view.getByRole('button',{name:'Continue without email'}));
+  await waitFor(()=>expect(handoff).toHaveBeenCalledOnce());
+  expect(save).toHaveBeenCalledWith({email:'',phone:''});
+});

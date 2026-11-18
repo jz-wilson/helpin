@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -16,12 +17,19 @@ import (
 // CRMCompanyService contains CRM company business logic.
 type CRMCompanyService struct {
 	companyRepo    *repository.CRMCompanyRepository
+	behavior       *repository.CRMBehaviorProfileRepository
 	timelineRepo   *repository.CRMCompanyTimelineRepository
 	summaryRefresh CompanySummaryRefreshRequester
 	motionSignals  interface {
 		RefreshEntityMotionSignals(ctx context.Context, workspaceID, entityType, entityID string) error
 	}
 	productAnalyticsEmitter
+	customFields *CustomFieldService
+}
+
+// SetCustomFieldService lets filters and edits use field definitions.
+func (s *CRMCompanyService) SetCustomFieldService(fields *CustomFieldService) {
+	s.customFields = fields
 }
 
 // SetMotionSignalRefresher keeps company motion state current outside detection runs.
@@ -155,7 +163,19 @@ func (s *CRMCompanyService) List(ctx context.Context, workspaceID string, filter
 	if workspaceID == "" {
 		return nil, 0, fmt.Errorf("workspace_id is required")
 	}
-	return s.companyRepo.List(ctx, workspaceID, filters, pagination)
+	dateKeys, err := s.customFields.DateKeys(ctx, workspaceID, model.CustomFieldObjectCRMCompany, filters.Query)
+	if err != nil {
+		return nil, 0, err
+	}
+	filters.DateKeys = dateKeys
+	companies, total, err := s.companyRepo.List(ctx, workspaceID, filters, pagination)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.attachCompanyBehavior(ctx, workspaceID, companies); err != nil {
+		return nil, 0, err
+	}
+	return companies, total, nil
 }
 
 func (s *CRMCompanyService) ListContacts(ctx context.Context, workspaceID, companyID, search string, pagination model.PMPagination) ([]model.CRMContact, int64, error) {
@@ -170,6 +190,13 @@ func (s *CRMCompanyService) ListDeals(ctx context.Context, workspaceID, companyI
 		return nil, 0, err
 	}
 	return s.companyRepo.ListDeals(ctx, workspaceID, companyID, search, pagination)
+}
+
+// RequireWorkspace reports "company not found" unless the company belongs to
+// the workspace the caller is authorized for. Handlers call it before any
+// lookup, update, or delete by company ID.
+func (s *CRMCompanyService) RequireWorkspace(ctx context.Context, workspaceID, companyID string) error {
+	return s.requireCompanyWorkspace(ctx, workspaceID, companyID)
 }
 
 func (s *CRMCompanyService) requireCompanyWorkspace(ctx context.Context, workspaceID, companyID string) error {
@@ -195,6 +222,11 @@ func (s *CRMCompanyService) GetByID(ctx context.Context, id string) (*model.CRMC
 	if company == nil {
 		return nil, fmt.Errorf("company not found")
 	}
+	single := []model.CRMCompany{*company}
+	if err := s.attachCompanyBehavior(ctx, company.WorkspaceID, single); err != nil {
+		return nil, err
+	}
+	company.Behavior = single[0].Behavior
 	return company, nil
 }
 
@@ -326,6 +358,18 @@ func (s *CRMCompanyService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("company not found")
 	}
 	return s.companyRepo.Delete(ctx, id)
+}
+
+// SetCustomFieldValues writes defined field values on a company key by key.
+func (s *CRMCompanyService) SetCustomFieldValues(ctx context.Context, workspaceID, companyID string, values map[string]any) error {
+	if s.customFields == nil {
+		return errors.New("custom fields are not configured")
+	}
+	if err := s.customFields.SetValues(ctx, workspaceID, model.CustomFieldObjectCRMCompany, companyID, values); err != nil {
+		return err
+	}
+	s.requestCompanySummaryRefresh(ctx, workspaceID, companyID)
+	return nil
 }
 
 func (s *CRMCompanyService) requestCompanySummaryRefresh(ctx context.Context, workspaceID, companyID string) {

@@ -123,6 +123,9 @@ func (r *SupportFollowUpRepository) WithEpisode(ctx context.Context, workspaceID
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("workspace_id = ? AND id = ?", workspaceID, ref.ConversationID).First(&conv).Error; err != nil {
 			return err
 		}
+		if err := LoadSupportMailboxAIPolicy(tx, &conv); err != nil {
+			return err
+		}
 		var episode model.SupportAIFollowUp
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("workspace_id = ? AND id = ?", workspaceID, id).First(&episode).Error; err != nil {
 			return err
@@ -196,18 +199,23 @@ func (r *SupportFollowUpRepository) CancelEpisode(ctx context.Context, workspace
 	})
 }
 
+// SupportFollowUpChannels lists the conversation channels AI follow-ups may run on.
+func SupportFollowUpChannels(settings model.SupportInboxSettings) []string {
+	channels := []string{}
+	for _, mode := range []model.SupportAIMode{model.SupportAIModeChat, model.SupportAIModeEmail} {
+		if model.SupportAIChannelEnabled(settings, string(mode)) {
+			channels = append(channels, model.SupportAIModeChannels(mode)...)
+		}
+	}
+	return channels
+}
+
 func supportFollowUpCandidates(tx *gorm.DB, workspaceID string, settings model.SupportInboxSettings, now time.Time, includeFuture bool) *gorm.DB {
 	cutoff := now.Add(-time.Duration(settings.AIFollowUpDelayHours) * time.Hour)
 	if includeFuture {
 		cutoff = now
 	}
-	channels := []string{}
-	if model.SupportAIChannelEnabled(settings, "chat") {
-		channels = append(channels, "widget")
-	}
-	if model.SupportAIChannelEnabled(settings, "email") {
-		channels = append(channels, "email")
-	}
+	channels := SupportFollowUpChannels(settings)
 	return tx.Model(&model.SupportConversation{}).Where(`(CASE WHEN source = 'email' OR channel = 'email' OR EXISTS
  (SELECT 1 FROM support_messages m WHERE m.id = support_conversations.last_public_message_id AND m.workspace_id = support_conversations.workspace_id AND m.via_channel = 'email')
  THEN 'email' ELSE channel END) IN ?`, channels).Where(`workspace_id = ? AND flow_state = 'ai_handling' AND ai_state = 'pending'
@@ -218,6 +226,7 @@ func supportFollowUpCandidates(tx *gorm.DB, workspaceID string, settings model.S
    AND (ai_resumed_at IS NULL OR last_public_message_at > ai_resumed_at)
    AND assigned_agent_id = ? AND last_public_sender_type = 'ai' AND last_public_message_at <= ? AND last_public_message_at >= ?
    AND NOT customer_awaiting_response
+   AND NOT EXISTS (SELECT 1 FROM support_mailboxes mb WHERE mb.id = support_conversations.mailbox_id AND mb.workspace_id = support_conversations.workspace_id AND mb.ai_replies_disabled = true)
    AND NOT EXISTS (SELECT 1 FROM support_ai_follow_ups f WHERE f.workspace_id = support_conversations.workspace_id AND f.conversation_id = support_conversations.id AND (f.source_message_id = support_conversations.last_public_message_id OR f.sent_message_id = support_conversations.last_public_message_id OR f.second_message_id = support_conversations.last_public_message_id OR f.status IN ('scheduled','assessing','waiting')))`, workspaceID, settings.AIAgentID, cutoff, now.Add(-30*24*time.Hour))
 }
 

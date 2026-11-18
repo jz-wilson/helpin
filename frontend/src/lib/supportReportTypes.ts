@@ -1,0 +1,173 @@
+export interface SupportReportDuration {
+  count: number
+  median_seconds: number | null
+  p90_seconds: number | null
+}
+
+export interface SupportReportSummary {
+  conversations_created: number
+  conversations_resolved: number
+  resolved_by_ai: number
+  resolved_by_human: number
+  first_response: SupportReportDuration
+  first_human_response: SupportReportDuration
+  resolution: SupportReportDuration
+  ai_involved: number
+  ai_resolved: number
+  ai_resolved_confirmed: number
+  ai_resolved_assumed: number
+  ai_handoffs: number
+  ai_involvement_rate: number | null
+  ai_resolution_rate: number | null
+  ai_handoff_rate: number | null
+  csat_responses: number
+  csat_average: number | null
+  csat_positive_rate: number | null
+}
+
+export interface SupportReportDay {
+  date: string
+  conversations_created: number
+  conversations_resolved: number
+  resolved_by_ai: number
+  median_first_human_response_seconds: number | null
+}
+
+export interface SupportReportChannel {
+  channel: string
+  conversations_created: number
+  conversations_resolved: number
+  first_human_response: SupportReportDuration
+}
+
+/**
+ * One tag's conversations, summarized like the headline numbers. A
+ * conversation with several tags counts under each; an empty tag_id is the
+ * row of conversations without a tag.
+ */
+export interface SupportReportTopic {
+  tag_id: string
+  name: string
+  color: string | null
+  conversations_created: number
+  previous_conversations_created: number
+  ai_involved: number
+  ai_resolution_rate: number | null
+  ai_handoff_rate: number | null
+  first_human_response: SupportReportDuration
+  resolution: SupportReportDuration
+  csat_responses: number
+  csat_average: number | null
+}
+
+export interface SupportReportTeammate {
+  user_id: string
+  name: string
+  avatar_url?: string
+  resolved: number
+  replies_sent: number
+  first_human_response: SupportReportDuration
+  csat_responses: number
+  csat_average: number | null
+}
+
+export interface SupportReportCSATComment {
+  conversation_id: string
+  display_id: number
+  subject: string
+  rating: number
+  comment: string
+  channel: string
+  resolved_by: 'ai' | 'human'
+  submitted_at: string
+}
+
+export interface SupportReportSLATarget {
+  met: number
+  missed: number
+  hit_rate: number | null
+}
+
+export type SupportReportSLAMetric = 'first_response' | 'next_response' | 'resolution'
+export type SupportReportSLAOutcome = 'achieved' | 'breached'
+
+/** One conversation behind an SLA report count. */
+export interface SupportReportSLAConversation {
+  id: string
+  display_id: number
+  subject: string
+  status: string
+  priority: string
+  customer_name: string | null
+  customer_email: string | null
+  company_name: string | null
+  policy_name: string
+  assignee_name: string | null
+  created_at: string
+  /** When the target was met or missed; empty for met next-response targets. */
+  outcome_at: string | null
+  next_response_breaches: number
+}
+
+export interface SupportReportSLAConversationsPage {
+  data: SupportReportSLAConversation[]
+  total: number
+  page: number
+  per_page: number
+}
+
+export interface SupportReportOverview {
+  range: { from: string; to: string; previous_from: string; previous_to: string; timezone: string }
+  summary: SupportReportSummary
+  previous: SupportReportSummary
+  daily: SupportReportDay[]
+  topics: SupportReportTopic[]
+  channels: SupportReportChannel[]
+  teammates: SupportReportTeammate[]
+  csat: {
+    distribution: [number, number, number, number, number]
+    ai_average: number | null
+    ai_responses: number
+    human_average: number | null
+    human_responses: number
+    recent_comments: SupportReportCSATComment[]
+  }
+  sla: {
+    conversations: number
+    first_response: SupportReportSLATarget
+    next_response: SupportReportSLATarget
+    resolution: SupportReportSLATarget
+  }
+  /** Workspace-wide reports only, when customers wrote portal requests in the period. */
+  portal_intake?: SupportReportPortalIntake
+  help_assistant?: SupportReportHelpAssistant
+}
+
+/** What customers did with help center articles suggested while writing portal requests. */
+export interface SupportReportPortalIntake {
+  with_suggestions: number
+  opened: number
+  submitted_after_opening: number
+  likely_deflected: number
+  submitted_without_suggestions: number
+}
+
+export interface SupportReportParams {
+  from: string
+  to: string
+  tz: string
+  mailboxIds: string[]
+}
+
+/** Help assistant conversations in the report period. */
+export interface SupportReportHelpAssistant {
+  conversations: number
+  questions: number
+  answered: number
+  /** Questions the articles did not answer; the assistant offered support. */
+  handed_off: number
+  failed: number
+  helpful: number
+  not_helpful: number
+  unanswered: { question: string; asked_at: string }[]
+}

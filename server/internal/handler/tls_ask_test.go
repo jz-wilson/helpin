@@ -61,10 +61,14 @@ func newTLSAskTestHandler(t *testing.T, customDomain string) *TLSAskHandler {
 		t.Fatalf("open sqlite db: %v", err)
 	}
 	if err := db.Exec(`CREATE TABLE docs_helpcenter_configs (
+ demo_mode BOOLEAN NOT NULL DEFAULT 0,
+ search_indexing_enabled BOOLEAN NOT NULL DEFAULT 1,
+ official_docs_url TEXT NOT NULL DEFAULT '',
 		id TEXT PRIMARY KEY,
 		workspace_id TEXT NOT NULL,
 		subdomain TEXT NOT NULL,
-		custom_domain TEXT
+		custom_domain TEXT,
+		custom_domain_status TEXT DEFAULT 'verified'
 	)`).Error; err != nil {
 		t.Fatalf("create table: %v", err)
 	}
