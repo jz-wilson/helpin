@@ -52,8 +52,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bearer := bearerToken(r.Header.Get("Authorization"))
 	principal, err := h.service.AuthenticateBearer(r.Context(), bearer)
 	if err != nil {
+		// Advertise scopes so clients that take them from the challenge (such as
+		// Claude Code) send a scope parameter; the authorize step requires one.
 		w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-			`Bearer resource_metadata=%q`, h.service.Config().IssuerURL+"/.well-known/oauth-protected-resource"))
+			`Bearer resource_metadata=%q, scope=%q`,
+			h.service.Config().IssuerURL+"/.well-known/oauth-protected-resource",
+			strings.Join(service.AllMCPScopes(), " ")))
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
