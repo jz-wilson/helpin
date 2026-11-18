@@ -27,6 +27,13 @@ var legacyPortalVersions = map[string]string{
 	"20260927000101": "202609270001",
 }
 
+// The OIDC branch first shipped user_oidc_identities as 202610170001, a version
+// later assigned on develop to support_inbound_recovery. Installations that ran
+// the branch carry the OIDC checksum at the old version; move it, unchanged.
+var legacyOIDCVersions = map[string]string{
+	"202611140001": "202610170001",
+}
+
 type migrationVersionMove struct {
 	from string
 	to   Migration
@@ -38,6 +45,9 @@ func legacyVersionMoves(migrations []Migration, applied map[string]appliedMigrat
 		oldVersion, known := legacyNativeVersions[migration.Version]
 		if portalVersion, portalKnown := legacyPortalVersions[migration.Version]; portalKnown {
 			oldVersion, known = portalVersion, true
+		}
+		if oidcVersion, oidcKnown := legacyOIDCVersions[migration.Version]; oidcKnown {
+			oldVersion, known = oidcVersion, true
 		}
 		// The local pre-release fix briefly occupied the original CRM version.
 		// Its unchanged SQL now has its own version; preserve that applied row
