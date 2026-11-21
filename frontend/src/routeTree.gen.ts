@@ -48,6 +48,7 @@ import { Route as AuthenticatedWSlugDocsRouteImport } from './routes/_authentica
 import { Route as AuthenticatedWSlugDashboardRouteImport } from './routes/_authenticated/w/$slug/dashboard'
 import { Route as AuthenticatedWSlugCrmRouteImport } from './routes/_authenticated/w/$slug/crm'
 import { Route as AuthenticatedWSlugAutomationRouteImport } from './routes/_authenticated/w/$slug/automation'
+import { Route as AuthenticatedOauthSlackCallbackRouteImport } from './routes/_authenticated/oauth/slack/callback'
 import { Route as AuthenticatedOauthExternalMcpCallbackRouteImport } from './routes/_authenticated/oauth/external-mcp/callback'
 import { Route as AuthenticatedOauthCliAuthorizeRouteImport } from './routes/_authenticated/oauth/cli/authorize'
 import { Route as AuthenticatedWSlugSprintsIndexRouteImport } from './routes/_authenticated/w/$slug/sprints/index'
@@ -69,6 +70,7 @@ import { Route as AuthenticatedWSlugSettingsSupportWebhooksRouteImport } from '.
 import { Route as AuthenticatedWSlugSettingsSupportTranslationRouteImport } from './routes/_authenticated/w/$slug/settings/support-translation'
 import { Route as AuthenticatedWSlugSettingsSupportSlaRouteImport } from './routes/_authenticated/w/$slug/settings/support-sla'
 import { Route as AuthenticatedWSlugSettingsSupportConversationFieldsRouteImport } from './routes/_authenticated/w/$slug/settings/support-conversation-fields'
+import { Route as AuthenticatedWSlugSettingsSupportChannelsRouteImport } from './routes/_authenticated/w/$slug/settings/support-channels'
 import { Route as AuthenticatedWSlugSettingsSupportAiAssistantRouteImport } from './routes/_authenticated/w/$slug/settings/support-ai-assistant'
 import { Route as AuthenticatedWSlugSettingsServerRouteImport } from './routes/_authenticated/w/$slug/settings/server'
 import { Route as AuthenticatedWSlugSettingsRepositoriesRouteImport } from './routes/_authenticated/w/$slug/settings/repositories'
@@ -82,6 +84,7 @@ import { Route as AuthenticatedWSlugSettingsInboxesRoutingRouteImport } from './
 import { Route as AuthenticatedWSlugSettingsImportRouteImport } from './routes/_authenticated/w/$slug/settings/import'
 import { Route as AuthenticatedWSlugSettingsHelpcenterRouteImport } from './routes/_authenticated/w/$slug/settings/helpcenter'
 import { Route as AuthenticatedWSlugSettingsGeneralRouteImport } from './routes/_authenticated/w/$slug/settings/general'
+import { Route as AuthenticatedWSlugSettingsExternalToolsRouteImport } from './routes/_authenticated/w/$slug/settings/external-tools'
 import { Route as AuthenticatedWSlugSettingsExternalMcpRouteImport } from './routes/_authenticated/w/$slug/settings/external-mcp'
 import { Route as AuthenticatedWSlugSettingsExternalAgentsRouteImport } from './routes/_authenticated/w/$slug/settings/external-agents'
 import { Route as AuthenticatedWSlugSettingsDeliveryRouteImport } from './routes/_authenticated/w/$slug/settings/delivery'
@@ -353,6 +356,12 @@ const AuthenticatedWSlugAutomationRoute =
     path: '/automation',
     getParentRoute: () => AuthenticatedWSlugRoute,
   } as any)
+const AuthenticatedOauthSlackCallbackRoute =
+  AuthenticatedOauthSlackCallbackRouteImport.update({
+    id: '/oauth/slack/callback',
+    path: '/oauth/slack/callback',
+    getParentRoute: () => AuthenticatedRoute,
+  } as any)
 const AuthenticatedOauthExternalMcpCallbackRoute =
   AuthenticatedOauthExternalMcpCallbackRouteImport.update({
     id: '/oauth/external-mcp/callback',
@@ -478,6 +487,12 @@ const AuthenticatedWSlugSettingsSupportConversationFieldsRoute =
     path: '/settings/support-conversation-fields',
     getParentRoute: () => AuthenticatedWSlugRoute,
   } as any)
+const AuthenticatedWSlugSettingsSupportChannelsRoute =
+  AuthenticatedWSlugSettingsSupportChannelsRouteImport.update({
+    id: '/settings/support-channels',
+    path: '/settings/support-channels',
+    getParentRoute: () => AuthenticatedWSlugRoute,
+  } as any)
 const AuthenticatedWSlugSettingsSupportAiAssistantRoute =
   AuthenticatedWSlugSettingsSupportAiAssistantRouteImport.update({
     id: '/settings/support-ai-assistant',
@@ -554,6 +569,12 @@ const AuthenticatedWSlugSettingsGeneralRoute =
   AuthenticatedWSlugSettingsGeneralRouteImport.update({
     id: '/settings/general',
     path: '/settings/general',
+    getParentRoute: () => AuthenticatedWSlugRoute,
+  } as any)
+const AuthenticatedWSlugSettingsExternalToolsRoute =
+  AuthenticatedWSlugSettingsExternalToolsRouteImport.update({
+    id: '/settings/external-tools',
+    path: '/settings/external-tools',
     getParentRoute: () => AuthenticatedWSlugRoute,
   } as any)
 const AuthenticatedWSlugSettingsExternalMcpRoute =
@@ -992,6 +1013,7 @@ export interface FileRoutesByFullPath {
   '/portal/$slug/': typeof PortalSlugIndexRoute
   '/oauth/cli/authorize': typeof AuthenticatedOauthCliAuthorizeRoute
   '/oauth/external-mcp/callback': typeof AuthenticatedOauthExternalMcpCallbackRoute
+  '/oauth/slack/callback': typeof AuthenticatedOauthSlackCallbackRoute
   '/w/$slug/automation': typeof AuthenticatedWSlugAutomationRouteWithChildren
   '/w/$slug/crm': typeof AuthenticatedWSlugCrmRouteWithChildren
   '/w/$slug/dashboard': typeof AuthenticatedWSlugDashboardRoute
@@ -1048,6 +1070,7 @@ export interface FileRoutesByFullPath {
   '/w/$slug/settings/delivery': typeof AuthenticatedWSlugSettingsDeliveryRoute
   '/w/$slug/settings/external-agents': typeof AuthenticatedWSlugSettingsExternalAgentsRoute
   '/w/$slug/settings/external-mcp': typeof AuthenticatedWSlugSettingsExternalMcpRoute
+  '/w/$slug/settings/external-tools': typeof AuthenticatedWSlugSettingsExternalToolsRoute
   '/w/$slug/settings/general': typeof AuthenticatedWSlugSettingsGeneralRoute
   '/w/$slug/settings/helpcenter': typeof AuthenticatedWSlugSettingsHelpcenterRoute
   '/w/$slug/settings/import': typeof AuthenticatedWSlugSettingsImportRoute
@@ -1061,6 +1084,7 @@ export interface FileRoutesByFullPath {
   '/w/$slug/settings/repositories': typeof AuthenticatedWSlugSettingsRepositoriesRoute
   '/w/$slug/settings/server': typeof AuthenticatedWSlugSettingsServerRoute
   '/w/$slug/settings/support-ai-assistant': typeof AuthenticatedWSlugSettingsSupportAiAssistantRoute
+  '/w/$slug/settings/support-channels': typeof AuthenticatedWSlugSettingsSupportChannelsRoute
   '/w/$slug/settings/support-conversation-fields': typeof AuthenticatedWSlugSettingsSupportConversationFieldsRoute
   '/w/$slug/settings/support-sla': typeof AuthenticatedWSlugSettingsSupportSlaRoute
   '/w/$slug/settings/support-translation': typeof AuthenticatedWSlugSettingsSupportTranslationRoute
@@ -1131,6 +1155,7 @@ export interface FileRoutesByTo {
   '/portal/$slug': typeof PortalSlugIndexRoute
   '/oauth/cli/authorize': typeof AuthenticatedOauthCliAuthorizeRoute
   '/oauth/external-mcp/callback': typeof AuthenticatedOauthExternalMcpCallbackRoute
+  '/oauth/slack/callback': typeof AuthenticatedOauthSlackCallbackRoute
   '/w/$slug/dashboard': typeof AuthenticatedWSlugDashboardRoute
   '/w/$slug/notifications': typeof AuthenticatedWSlugNotificationsRoute
   '/w/$slug/setup': typeof AuthenticatedWSlugSetupRoute
@@ -1183,6 +1208,7 @@ export interface FileRoutesByTo {
   '/w/$slug/settings/delivery': typeof AuthenticatedWSlugSettingsDeliveryRoute
   '/w/$slug/settings/external-agents': typeof AuthenticatedWSlugSettingsExternalAgentsRoute
   '/w/$slug/settings/external-mcp': typeof AuthenticatedWSlugSettingsExternalMcpRoute
+  '/w/$slug/settings/external-tools': typeof AuthenticatedWSlugSettingsExternalToolsRoute
   '/w/$slug/settings/general': typeof AuthenticatedWSlugSettingsGeneralRoute
   '/w/$slug/settings/helpcenter': typeof AuthenticatedWSlugSettingsHelpcenterRoute
   '/w/$slug/settings/import': typeof AuthenticatedWSlugSettingsImportRoute
@@ -1196,6 +1222,7 @@ export interface FileRoutesByTo {
   '/w/$slug/settings/repositories': typeof AuthenticatedWSlugSettingsRepositoriesRoute
   '/w/$slug/settings/server': typeof AuthenticatedWSlugSettingsServerRoute
   '/w/$slug/settings/support-ai-assistant': typeof AuthenticatedWSlugSettingsSupportAiAssistantRoute
+  '/w/$slug/settings/support-channels': typeof AuthenticatedWSlugSettingsSupportChannelsRoute
   '/w/$slug/settings/support-conversation-fields': typeof AuthenticatedWSlugSettingsSupportConversationFieldsRoute
   '/w/$slug/settings/support-sla': typeof AuthenticatedWSlugSettingsSupportSlaRoute
   '/w/$slug/settings/support-translation': typeof AuthenticatedWSlugSettingsSupportTranslationRoute
@@ -1269,6 +1296,7 @@ export interface FileRoutesById {
   '/portal/$slug/': typeof PortalSlugIndexRoute
   '/_authenticated/oauth/cli/authorize': typeof AuthenticatedOauthCliAuthorizeRoute
   '/_authenticated/oauth/external-mcp/callback': typeof AuthenticatedOauthExternalMcpCallbackRoute
+  '/_authenticated/oauth/slack/callback': typeof AuthenticatedOauthSlackCallbackRoute
   '/_authenticated/w/$slug/automation': typeof AuthenticatedWSlugAutomationRouteWithChildren
   '/_authenticated/w/$slug/crm': typeof AuthenticatedWSlugCrmRouteWithChildren
   '/_authenticated/w/$slug/dashboard': typeof AuthenticatedWSlugDashboardRoute
@@ -1325,6 +1353,7 @@ export interface FileRoutesById {
   '/_authenticated/w/$slug/settings/delivery': typeof AuthenticatedWSlugSettingsDeliveryRoute
   '/_authenticated/w/$slug/settings/external-agents': typeof AuthenticatedWSlugSettingsExternalAgentsRoute
   '/_authenticated/w/$slug/settings/external-mcp': typeof AuthenticatedWSlugSettingsExternalMcpRoute
+  '/_authenticated/w/$slug/settings/external-tools': typeof AuthenticatedWSlugSettingsExternalToolsRoute
   '/_authenticated/w/$slug/settings/general': typeof AuthenticatedWSlugSettingsGeneralRoute
   '/_authenticated/w/$slug/settings/helpcenter': typeof AuthenticatedWSlugSettingsHelpcenterRoute
   '/_authenticated/w/$slug/settings/import': typeof AuthenticatedWSlugSettingsImportRoute
@@ -1338,6 +1367,7 @@ export interface FileRoutesById {
   '/_authenticated/w/$slug/settings/repositories': typeof AuthenticatedWSlugSettingsRepositoriesRoute
   '/_authenticated/w/$slug/settings/server': typeof AuthenticatedWSlugSettingsServerRoute
   '/_authenticated/w/$slug/settings/support-ai-assistant': typeof AuthenticatedWSlugSettingsSupportAiAssistantRoute
+  '/_authenticated/w/$slug/settings/support-channels': typeof AuthenticatedWSlugSettingsSupportChannelsRoute
   '/_authenticated/w/$slug/settings/support-conversation-fields': typeof AuthenticatedWSlugSettingsSupportConversationFieldsRoute
   '/_authenticated/w/$slug/settings/support-sla': typeof AuthenticatedWSlugSettingsSupportSlaRoute
   '/_authenticated/w/$slug/settings/support-translation': typeof AuthenticatedWSlugSettingsSupportTranslationRoute
@@ -1413,6 +1443,7 @@ export interface FileRouteTypes {
     | '/portal/$slug/'
     | '/oauth/cli/authorize'
     | '/oauth/external-mcp/callback'
+    | '/oauth/slack/callback'
     | '/w/$slug/automation'
     | '/w/$slug/crm'
     | '/w/$slug/dashboard'
@@ -1469,6 +1500,7 @@ export interface FileRouteTypes {
     | '/w/$slug/settings/delivery'
     | '/w/$slug/settings/external-agents'
     | '/w/$slug/settings/external-mcp'
+    | '/w/$slug/settings/external-tools'
     | '/w/$slug/settings/general'
     | '/w/$slug/settings/helpcenter'
     | '/w/$slug/settings/import'
@@ -1482,6 +1514,7 @@ export interface FileRouteTypes {
     | '/w/$slug/settings/repositories'
     | '/w/$slug/settings/server'
     | '/w/$slug/settings/support-ai-assistant'
+    | '/w/$slug/settings/support-channels'
     | '/w/$slug/settings/support-conversation-fields'
     | '/w/$slug/settings/support-sla'
     | '/w/$slug/settings/support-translation'
@@ -1552,6 +1585,7 @@ export interface FileRouteTypes {
     | '/portal/$slug'
     | '/oauth/cli/authorize'
     | '/oauth/external-mcp/callback'
+    | '/oauth/slack/callback'
     | '/w/$slug/dashboard'
     | '/w/$slug/notifications'
     | '/w/$slug/setup'
@@ -1604,6 +1638,7 @@ export interface FileRouteTypes {
     | '/w/$slug/settings/delivery'
     | '/w/$slug/settings/external-agents'
     | '/w/$slug/settings/external-mcp'
+    | '/w/$slug/settings/external-tools'
     | '/w/$slug/settings/general'
     | '/w/$slug/settings/helpcenter'
     | '/w/$slug/settings/import'
@@ -1617,6 +1652,7 @@ export interface FileRouteTypes {
     | '/w/$slug/settings/repositories'
     | '/w/$slug/settings/server'
     | '/w/$slug/settings/support-ai-assistant'
+    | '/w/$slug/settings/support-channels'
     | '/w/$slug/settings/support-conversation-fields'
     | '/w/$slug/settings/support-sla'
     | '/w/$slug/settings/support-translation'
@@ -1689,6 +1725,7 @@ export interface FileRouteTypes {
     | '/portal/$slug/'
     | '/_authenticated/oauth/cli/authorize'
     | '/_authenticated/oauth/external-mcp/callback'
+    | '/_authenticated/oauth/slack/callback'
     | '/_authenticated/w/$slug/automation'
     | '/_authenticated/w/$slug/crm'
     | '/_authenticated/w/$slug/dashboard'
@@ -1745,6 +1782,7 @@ export interface FileRouteTypes {
     | '/_authenticated/w/$slug/settings/delivery'
     | '/_authenticated/w/$slug/settings/external-agents'
     | '/_authenticated/w/$slug/settings/external-mcp'
+    | '/_authenticated/w/$slug/settings/external-tools'
     | '/_authenticated/w/$slug/settings/general'
     | '/_authenticated/w/$slug/settings/helpcenter'
     | '/_authenticated/w/$slug/settings/import'
@@ -1758,6 +1796,7 @@ export interface FileRouteTypes {
     | '/_authenticated/w/$slug/settings/repositories'
     | '/_authenticated/w/$slug/settings/server'
     | '/_authenticated/w/$slug/settings/support-ai-assistant'
+    | '/_authenticated/w/$slug/settings/support-channels'
     | '/_authenticated/w/$slug/settings/support-conversation-fields'
     | '/_authenticated/w/$slug/settings/support-sla'
     | '/_authenticated/w/$slug/settings/support-translation'
@@ -2098,6 +2137,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedWSlugAutomationRouteImport
       parentRoute: typeof AuthenticatedWSlugRoute
     }
+    '/_authenticated/oauth/slack/callback': {
+      id: '/_authenticated/oauth/slack/callback'
+      path: '/oauth/slack/callback'
+      fullPath: '/oauth/slack/callback'
+      preLoaderRoute: typeof AuthenticatedOauthSlackCallbackRouteImport
+      parentRoute: typeof AuthenticatedRoute
+    }
     '/_authenticated/oauth/external-mcp/callback': {
       id: '/_authenticated/oauth/external-mcp/callback'
       path: '/oauth/external-mcp/callback'
@@ -2245,6 +2291,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedWSlugSettingsSupportConversationFieldsRouteImport
       parentRoute: typeof AuthenticatedWSlugRoute
     }
+    '/_authenticated/w/$slug/settings/support-channels': {
+      id: '/_authenticated/w/$slug/settings/support-channels'
+      path: '/settings/support-channels'
+      fullPath: '/w/$slug/settings/support-channels'
+      preLoaderRoute: typeof AuthenticatedWSlugSettingsSupportChannelsRouteImport
+      parentRoute: typeof AuthenticatedWSlugRoute
+    }
     '/_authenticated/w/$slug/settings/support-ai-assistant': {
       id: '/_authenticated/w/$slug/settings/support-ai-assistant'
       path: '/settings/support-ai-assistant'
@@ -2334,6 +2387,13 @@ declare module '@tanstack/react-router' {
       path: '/settings/general'
       fullPath: '/w/$slug/settings/general'
       preLoaderRoute: typeof AuthenticatedWSlugSettingsGeneralRouteImport
+      parentRoute: typeof AuthenticatedWSlugRoute
+    }
+    '/_authenticated/w/$slug/settings/external-tools': {
+      id: '/_authenticated/w/$slug/settings/external-tools'
+      path: '/settings/external-tools'
+      fullPath: '/w/$slug/settings/external-tools'
+      preLoaderRoute: typeof AuthenticatedWSlugSettingsExternalToolsRouteImport
       parentRoute: typeof AuthenticatedWSlugRoute
     }
     '/_authenticated/w/$slug/settings/external-mcp': {
@@ -3027,6 +3087,7 @@ interface AuthenticatedWSlugRouteChildren {
   AuthenticatedWSlugSettingsDeliveryRoute: typeof AuthenticatedWSlugSettingsDeliveryRoute
   AuthenticatedWSlugSettingsExternalAgentsRoute: typeof AuthenticatedWSlugSettingsExternalAgentsRoute
   AuthenticatedWSlugSettingsExternalMcpRoute: typeof AuthenticatedWSlugSettingsExternalMcpRoute
+  AuthenticatedWSlugSettingsExternalToolsRoute: typeof AuthenticatedWSlugSettingsExternalToolsRoute
   AuthenticatedWSlugSettingsGeneralRoute: typeof AuthenticatedWSlugSettingsGeneralRoute
   AuthenticatedWSlugSettingsHelpcenterRoute: typeof AuthenticatedWSlugSettingsHelpcenterRoute
   AuthenticatedWSlugSettingsImportRoute: typeof AuthenticatedWSlugSettingsImportRoute
@@ -3040,6 +3101,7 @@ interface AuthenticatedWSlugRouteChildren {
   AuthenticatedWSlugSettingsRepositoriesRoute: typeof AuthenticatedWSlugSettingsRepositoriesRoute
   AuthenticatedWSlugSettingsServerRoute: typeof AuthenticatedWSlugSettingsServerRoute
   AuthenticatedWSlugSettingsSupportAiAssistantRoute: typeof AuthenticatedWSlugSettingsSupportAiAssistantRoute
+  AuthenticatedWSlugSettingsSupportChannelsRoute: typeof AuthenticatedWSlugSettingsSupportChannelsRoute
   AuthenticatedWSlugSettingsSupportConversationFieldsRoute: typeof AuthenticatedWSlugSettingsSupportConversationFieldsRoute
   AuthenticatedWSlugSettingsSupportSlaRoute: typeof AuthenticatedWSlugSettingsSupportSlaRoute
   AuthenticatedWSlugSettingsSupportTranslationRoute: typeof AuthenticatedWSlugSettingsSupportTranslationRoute
@@ -3118,6 +3180,8 @@ const AuthenticatedWSlugRouteChildren: AuthenticatedWSlugRouteChildren = {
     AuthenticatedWSlugSettingsExternalAgentsRoute,
   AuthenticatedWSlugSettingsExternalMcpRoute:
     AuthenticatedWSlugSettingsExternalMcpRoute,
+  AuthenticatedWSlugSettingsExternalToolsRoute:
+    AuthenticatedWSlugSettingsExternalToolsRoute,
   AuthenticatedWSlugSettingsGeneralRoute:
     AuthenticatedWSlugSettingsGeneralRoute,
   AuthenticatedWSlugSettingsHelpcenterRoute:
@@ -3140,6 +3204,8 @@ const AuthenticatedWSlugRouteChildren: AuthenticatedWSlugRouteChildren = {
   AuthenticatedWSlugSettingsServerRoute: AuthenticatedWSlugSettingsServerRoute,
   AuthenticatedWSlugSettingsSupportAiAssistantRoute:
     AuthenticatedWSlugSettingsSupportAiAssistantRoute,
+  AuthenticatedWSlugSettingsSupportChannelsRoute:
+    AuthenticatedWSlugSettingsSupportChannelsRoute,
   AuthenticatedWSlugSettingsSupportConversationFieldsRoute:
     AuthenticatedWSlugSettingsSupportConversationFieldsRoute,
   AuthenticatedWSlugSettingsSupportSlaRoute:
@@ -3187,6 +3253,7 @@ interface AuthenticatedRouteChildren {
   AuthenticatedWSlugRoute: typeof AuthenticatedWSlugRouteWithChildren
   AuthenticatedOauthCliAuthorizeRoute: typeof AuthenticatedOauthCliAuthorizeRoute
   AuthenticatedOauthExternalMcpCallbackRoute: typeof AuthenticatedOauthExternalMcpCallbackRoute
+  AuthenticatedOauthSlackCallbackRoute: typeof AuthenticatedOauthSlackCallbackRoute
 }
 
 const AuthenticatedRouteChildren: AuthenticatedRouteChildren = {
@@ -3199,6 +3266,7 @@ const AuthenticatedRouteChildren: AuthenticatedRouteChildren = {
   AuthenticatedOauthCliAuthorizeRoute: AuthenticatedOauthCliAuthorizeRoute,
   AuthenticatedOauthExternalMcpCallbackRoute:
     AuthenticatedOauthExternalMcpCallbackRoute,
+  AuthenticatedOauthSlackCallbackRoute: AuthenticatedOauthSlackCallbackRoute,
 }
 
 const AuthenticatedRouteWithChildren = AuthenticatedRoute._addFileChildren(

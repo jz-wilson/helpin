@@ -52,7 +52,7 @@ func TestAIConnectionTestSucceedsWithSmallestCatalogModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.OK || result.Model != "gpt-5.6-luna" || result.Error != "" || result.LatencyMS < 0 {
+	if !result.OK || result.Model != "gpt-6-luna" || result.Error != "" || result.LatencyMS < 0 {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 	if len(fake.requests) != 1 || fake.requests[0].MaxTokens != aiConnectionTestMaxTokens || fake.requests[0].Provider != "openai" {
@@ -104,6 +104,28 @@ func TestAIConnectionTestSanitizesAndRecordsFailure(t *testing.T) {
 	stored, err := s.repo.Get(ctx, id)
 	if err != nil || stored.LastVerifiedAt == nil || derefString(stored.LastVerificationError) != result.Error {
 		t.Fatalf("failure was not recorded: %v", err)
+	}
+}
+
+func TestReconnectClearsOldVerification(t *testing.T) {
+	s, id, _ := setupAIConnectionVerifyTest(t, &fakeTestProvider{err: errors.New("old test failed")})
+	ctx := context.Background()
+	if _, err := s.TestConnection(ctx, "workspace", "owner", id, ""); err != nil {
+		t.Fatal(err)
+	}
+	tested, err := s.repo.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reconnect(ctx, "workspace", "owner", id, "replacement-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordTestResult(ctx, tested, &model.AIConnectionTestResult{Error: "late failure"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.repo.Get(ctx, id)
+	if err != nil || current.LastVerifiedAt != nil || current.LastVerificationError != nil {
+		t.Fatalf("replacement credential inherited verification: %v", err)
 	}
 }
 
@@ -177,7 +199,7 @@ func TestAIConnectionTestAgainstOpenAICompatibleServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sawKey != "Bearer sk-private-key" || sawModel != "openai/gpt-5.6-luna" {
+	if sawKey != "Bearer sk-private-key" || sawModel != "openai/gpt-6-luna" {
 		t.Fatalf("provider request: key sent=%t model=%q", sawKey != "", sawModel)
 	}
 	if result.OK || strings.Contains(result.Error, "sk-private-key") || !strings.Contains(result.Error, "HTTP 401") {

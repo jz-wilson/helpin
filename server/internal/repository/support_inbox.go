@@ -2406,12 +2406,12 @@ func (r *SupportConversationRepository) ListByAnonymousID(ctx context.Context, w
 	var conversations []model.SupportConversation
 	if err := r.db.WithContext(ctx).
 		Select(fmt.Sprintf(`support_conversations.*,
-		(SELECT COALESCE(`+supportMetadataValueSQL(r.db, "support_messages", "merge_public_text")+`, content) FROM support_messages WHERE (support_messages.conversation_id = support_conversations.id OR EXISTS (SELECT 1 FROM support_merge_messages g WHERE g.workspace_id = support_messages.workspace_id AND g.conversation_id = support_conversations.id AND g.message_id = support_messages.id)) AND support_messages.deleted_at IS NULL AND support_messages.is_internal = false AND support_messages.message_type = 'reply' AND support_messages.system_event_type IS NULL AND `+supportDeliveryModeSQL(r.db, "support_messages")+` <> 'email_only' ORDER BY created_at DESC LIMIT 1) AS last_message,
+		(SELECT COALESCE(`+supportMetadataValueSQL(r.db, "support_messages", "merge_public_text")+`, content) FROM support_messages WHERE (support_messages.conversation_id = support_conversations.id OR EXISTS (SELECT 1 FROM support_merge_messages g WHERE g.workspace_id = support_messages.workspace_id AND g.conversation_id = support_conversations.id AND g.message_id = support_messages.id)) AND support_messages.deleted_at IS NULL AND support_messages.is_internal = false AND support_messages.message_type = 'reply' AND support_messages.system_event_type IS NULL AND `+supportChatDeliveryVisibleSQL(r.db, "support_messages")+` ORDER BY created_at DESC LIMIT 1) AS last_message,
 		(SELECT COUNT(*)
 			FROM support_messages sm
 			WHERE (sm.conversation_id = support_conversations.id OR EXISTS (SELECT 1 FROM support_merge_messages g WHERE g.workspace_id = sm.workspace_id AND g.conversation_id = support_conversations.id AND g.message_id = sm.id))
 			  AND sm.deleted_at IS NULL
-			  AND sm.is_internal = false AND `+supportDeliveryModeSQL(r.db, "sm")+` <> 'email_only'
+			  AND sm.is_internal = false AND `+supportChatDeliveryVisibleSQL(r.db, "sm")+`
 			  AND sm.sender_type IN ('user', 'agent', 'ai')
 			  AND sm.message_type = 'reply'
 			  AND sm.system_event_type IS NULL
@@ -2513,6 +2513,22 @@ func (r *SupportConversationRepository) Delete(ctx context.Context, workspaceID,
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("workspace_id = ? AND id = ?", workspaceID, conversationID).Find(&conversation).Error; err != nil {
 			return err
 		}
+		// A provider customer known only from this conversation is forgotten
+		// with it; one linked to a contact or with other conversations stays.
+		var identityIDs []string
+		if conversation.ChannelIdentityID != nil {
+			if err := tx.Model(&model.SupportChannelIdentity{}).
+				Where("workspace_id = ? AND id = ? AND crm_contact_id IS NULL", workspaceID, *conversation.ChannelIdentityID).
+				Where("NOT EXISTS (SELECT 1 FROM support_conversations c WHERE c.channel_identity_id = support_channel_identities.id AND c.id <> ?)", conversationID).
+				Pluck("id", &identityIDs).Error; err != nil {
+				return err
+			}
+		}
+		if conversation.ChannelAccountID != nil {
+			if err := eraseChannelPersonTx(tx, workspaceID, []string{conversationID}, identityIDs); err != nil {
+				return err
+			}
+		}
 		if conversation.AnonymizedAt != nil {
 			if err := tx.Where("workspace_id = ? AND id = ?", workspaceID, conversationID).Delete(&model.SupportConversation{}).Error; err != nil {
 				return fmt.Errorf("delete anonymized conversation: %w", err)
@@ -2540,7 +2556,7 @@ func (r *SupportConversationRepository) MarkContactRead(ctx context.Context, con
 			SELECT 1 FROM support_messages sm
 			WHERE (sm.conversation_id = support_conversations.id OR EXISTS (SELECT 1 FROM support_merge_messages g WHERE g.workspace_id = sm.workspace_id AND g.conversation_id = support_conversations.id AND g.message_id = sm.id))
 			  AND sm.deleted_at IS NULL
-			  AND sm.is_internal = false AND `+supportDeliveryModeSQL(r.db, "sm")+` <> 'email_only'
+			  AND sm.is_internal = false AND `+supportChatDeliveryVisibleSQL(r.db, "sm")+`
 			  AND sm.sender_type IN ('user', 'agent', 'ai')
 			  AND sm.message_type = 'reply'
 			  AND sm.created_at > COALESCE(support_conversations.contact_last_seen_at, %s)

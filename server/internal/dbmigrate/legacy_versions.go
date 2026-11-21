@@ -27,11 +27,11 @@ var legacyPortalVersions = map[string]string{
 	"20260927000101": "202609270001",
 }
 
-// The OIDC branch first shipped user_oidc_identities as 202610170001, a version
-// later assigned on develop to support_inbound_recovery. Installations that ran
+// The OIDC branch shipped user_oidc_identities as 202611140001, a version
+// later assigned on develop to support_channels. Installations that ran
 // the branch carry the OIDC checksum at the old version; move it, unchanged.
 var legacyOIDCVersions = map[string]string{
-	"202611140001": "202610170001",
+	"202611140003": "202611140001",
 }
 
 type migrationVersionMove struct {

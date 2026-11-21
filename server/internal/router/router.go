@@ -128,6 +128,8 @@ type Handlers struct {
 	RequestTypes        *handler.SupportRequestTypeHandler
 	CRMFieldDefinitions *handler.CustomFieldHandler
 	SupportWebhooks     *handler.SupportWebhookHandler
+	Slack               *handler.SlackHandler
+	SupportChannels     *handler.SupportChannelHandler
 	SupportImports      *handler.SupportImportHandler
 	SupportActions      *handler.SupportConversationActionsHandler
 	SupportInboxClear   *handler.SupportInboxClearHandler
@@ -469,6 +471,13 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 		if h.CRMMeeting != nil {
 			r.Post("/webhooks/meeting-capture/{provider}", h.CRMMeeting.Webhook)
 		}
+		if h.Slack != nil {
+			r.Post("/slack/events", h.Slack.Event)
+			r.Post("/slack/actions", h.Slack.Action)
+		}
+		if h.SupportChannels != nil {
+			r.Post("/webhooks/channels/{provider}/{accountId}", h.SupportChannels.Webhook)
+		}
 		// ---- External agent file uploads (per-run bearer upload token, no JWT) ----
 		if h.ExternalA2A != nil {
 			r.Post("/a2a/uploads", h.ExternalA2A.Upload)
@@ -705,6 +714,7 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 					r.Post("/", h.AIProfile.Save)
 					r.Post("/models", h.AIProfile.EnableModel)
 					r.Put("/{profileID}", h.AIProfile.Save)
+					r.Put("/{profileID}/agent-sharing", h.AIProfile.SetAgentSharing)
 					r.Put("/{profileID}/visibility", h.AIProfile.SetVisibility)
 					r.Delete("/{profileID}", h.AIProfile.Delete)
 				})
@@ -743,6 +753,7 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.Route("/external-mcp", func(r chi.Router) {
 					r.Use(middleware.RequireWorkspaceID)
 					r.Use(wsActive)
+					r.Use(requireModule(model.ModuleAgents))
 					r.With(requirePerm(authorization.PermSettingsRead)).Get("/providers", h.ExternalMCP.Providers)
 					r.With(requirePerm(authorization.PermSettingsRead)).Get("/servers", h.ExternalMCP.ListServers)
 					r.With(requirePerm(authorization.PermSettingsManage)).Post("/servers", h.ExternalMCP.CreateServer)
@@ -1048,6 +1059,24 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(middleware.RequireWorkspaceID, wsActive, requirePerm(authorization.PermWorkspaceInvitesManage)).Delete("/{id}", h.Invite.Revoke)
 			})
 
+			if h.Slack != nil {
+				r.Route("/slack", func(r chi.Router) {
+					r.Use(middleware.RequireWorkspaceID)
+					r.Use(wsActive)
+					r.With(requirePerm(authorization.PermWorkspaceRead)).Post("/link", h.Slack.Link)
+					r.Group(func(r chi.Router) {
+						r.Use(requirePerm(authorization.PermSettingsManage))
+						r.Get("/", h.Slack.Settings)
+						r.Patch("/", h.Slack.SetAI)
+						r.Post("/install", h.Slack.Start)
+						r.Post("/complete", h.Slack.Finish)
+						r.Get("/channels", h.Slack.Channels)
+						r.Put("/routes", h.Slack.Configure)
+						r.Delete("/routes/{channel}", h.Slack.Remove)
+						r.Delete("/", h.Slack.Disconnect)
+					})
+				})
+			}
 			// Git integrations
 			r.Route("/git", func(r chi.Router) {
 				r.Use(middleware.RequireWorkspaceID)
@@ -1233,7 +1262,11 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/message-pages", h.SupportInbox.ListConversationMessagePage)
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/messages/{id}/email", h.SupportInbox.GetMessageEmailDetail)
+				if h.Slack != nil {
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/messages/{id}/slack-source", h.Slack.MessageSource)
+				}
 				r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/messages/{id}/attachments/{attachmentID}/retry", h.SupportInbox.RetryInboundAttachment)
+				r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/messages/{id}/channel-retry", h.SupportInbox.RetryChannelDelivery)
 				if h.EmailImageProxy != nil {
 					r.With(requirePerm(authorization.PermSupportRead)).Get("/email/image-proxy", h.EmailImageProxy.Proxy)
 				}
@@ -1384,6 +1417,13 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/webhooks/{webhookId}/test", h.SupportWebhooks.Test)
 						r.With(requirePerm(authorization.PermSupportAdmin)).Get("/webhooks/{webhookId}/deliveries", h.SupportWebhooks.Deliveries)
 						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/webhooks/{webhookId}/deliveries/{deliveryId}/redeliver", h.SupportWebhooks.Redeliver)
+					}
+					if h.SupportChannels != nil {
+						r.With(requirePerm(authorization.PermSupportAdmin)).Get("/channels", h.SupportChannels.List)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/channels", h.SupportChannels.Create)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Patch("/channels/{channelId}", h.SupportChannels.Update)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Post("/channels/{channelId}/reconnect", h.SupportChannels.Reconnect)
+						r.With(requirePerm(authorization.PermSupportAdmin)).Delete("/channels/{channelId}", h.SupportChannels.Disconnect)
 					}
 				}
 				if h.SupportReports != nil {
@@ -1686,6 +1726,7 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 					r.With(requirePerm(authorization.PermPMEdit)).Post("/agent-runs", h.Agent.StartTargetRun)
 					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs/workspace", h.Agent.ListWorkspaceRuns)
 					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs/recent", h.Agent.ListRecentRuns)
+					r.With(requirePerm(authorization.PermPMRead)).Get("/subtask-jobs/{jobID}", h.Agent.GetSubtaskJob)
 					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs", h.Agent.ListTargetRuns)
 					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs/{id}", h.Agent.GetAgentRun)
 					r.With(requirePerm(authorization.PermPMRead)).Get("/agent-runs/{id}/messages", h.Agent.ListRunMessages)

@@ -12,14 +12,27 @@ import (
 
 // SupportConversation represents a support conversation (renamed from SupportTicket).
 type SupportConversation struct {
-	MailboxAIRepliesDisabled bool       `json:"-" gorm:"-"`
-	MergeEmailRecipients     []string   `json:"merge_email_recipients,omitempty" gorm:"-"`
-	MergeHasWidget           bool       `json:"merge_has_widget,omitempty" gorm:"-"`
-	MergeContinuationID      *string    `json:"merge_continuation_id,omitempty" gorm:"-"`
-	MergeParticipants        []string   `json:"merge_participants,omitempty" gorm:"-"`
-	MergedIntoID             *string    `json:"merged_into_id,omitempty" gorm:"type:uuid;index"`
-	MergeRevision            int64      `json:"merge_revision" gorm:"not null;default:0"`
-	AnonymizedAt             *time.Time `json:"anonymized_at,omitempty" gorm:"type:timestamptz"`
+	MailboxAIRepliesDisabled bool     `json:"-" gorm:"-"`
+	MergeEmailRecipients     []string `json:"merge_email_recipients,omitempty" gorm:"-"`
+	MergeHasWidget           bool     `json:"merge_has_widget,omitempty" gorm:"-"`
+	// The inbox returns only destinations available to this conversation.
+	ProviderDestinations []SupportProviderDestination `json:"provider_destinations,omitempty" gorm:"-"`
+	// A merge may contain provider history even after its account is disconnected.
+	MergeHasChannel bool `json:"merge_has_channel,omitempty" gorm:"-"`
+	// ChannelHandle is the connected bot's handle (Telegram), for the sidebar.
+	ChannelHandle       string   `json:"channel_handle,omitempty" gorm:"-"`
+	MergeContinuationID *string  `json:"merge_continuation_id,omitempty" gorm:"-"`
+	MergeParticipants   []string `json:"merge_participants,omitempty" gorm:"-"`
+	MergedIntoID        *string  `json:"merged_into_id,omitempty" gorm:"type:uuid;index"`
+	// ChannelAccountID and ChannelIdentityID link a provider-channel
+	// conversation (Telegram) to its bot and customer. The default tag keeps
+	// them out of inserts when unset.
+	ChannelAccountID    *string    `json:"channel_account_id,omitempty" gorm:"type:uuid;default:null"`
+	ProviderThreadKey   *string    `json:"-" gorm:"->"`
+	ProviderChannelName *string    `json:"provider_channel_name,omitempty" gorm:"->"`
+	ChannelIdentityID   *string    `json:"channel_identity_id,omitempty" gorm:"type:uuid;default:null"`
+	MergeRevision       int64      `json:"merge_revision" gorm:"not null;default:0"`
+	AnonymizedAt        *time.Time `json:"anonymized_at,omitempty" gorm:"type:timestamptz"`
 	// RequestTypeID and CustomFields are read-only here: their own endpoints
 	// validate and write them, and inserts leave the column defaults.
 	RequestTypeID                  *string         `json:"request_type_id,omitempty" gorm:"type:uuid;->"`
@@ -388,11 +401,15 @@ type SupportMessage struct {
 	IsInternal        bool                  `json:"is_internal" gorm:"not null;default:false"`
 	Metadata          string                `json:"metadata" gorm:"type:jsonb;default:'{}'"` // JSONB for CSAT ratings, AI sources, etc.
 	ViaChannel        *string               `json:"via_channel,omitempty" gorm:"size:20"`
-	EmailNotifiedAt   *time.Time            `json:"email_notified_at,omitempty"`
-	WidgetReadAt      *time.Time            `json:"widget_read_at,omitempty" gorm:"-"`
-	EmailReadAt       *time.Time            `json:"email_read_at,omitempty"`
-	CreatedAt         time.Time             `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt         time.Time             `json:"updated_at" gorm:"autoUpdateTime"`
+	// ChannelAccountID and ExternalMessageKey dedupe provider messages; the
+	// default tags keep them out of inserts when unset.
+	ChannelAccountID   *string    `json:"-" gorm:"type:uuid;default:null"`
+	ExternalMessageKey *string    `json:"-" gorm:"default:null"`
+	EmailNotifiedAt    *time.Time `json:"email_notified_at,omitempty"`
+	WidgetReadAt       *time.Time `json:"widget_read_at,omitempty" gorm:"-"`
+	EmailReadAt        *time.Time `json:"email_read_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt          time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
 	// CancellableUntil is the moment the email-fallback timer fires for an
 	// outbound agent reply. Until this passes, the agent can soft-delete the
 	// message and the queued email is removed from the per-conversation Redis
@@ -421,6 +438,9 @@ type SupportMessage struct {
 	// ("sent", "delivered", "opened", "bounced", "spam_complaint"). Only set
 	// when an email log exists for the message.
 	EmailDeliveryStatus string `json:"email_delivery_status,omitempty" gorm:"-"`
+	// ChannelDelivery is the reply's delivery through a provider channel
+	// (Telegram), from support_channel_outbox.
+	ChannelDelivery *SupportChannelDelivery `json:"channel_delivery,omitempty" gorm:"-"`
 	// EmailDeliveryError surfaces the bounce/complaint description when the
 	// email's delivery failed. Empty otherwise.
 	EmailDeliveryError string          `json:"email_delivery_error,omitempty" gorm:"-"`
@@ -1030,6 +1050,14 @@ type CreateConversationWithMessageResponse struct {
 	Message      *SupportMessage      `json:"message"`
 }
 
+// SupportProviderDestination identifies an original provider conversation for a reply.
+type SupportProviderDestination struct {
+	ID        string `json:"id"`
+	Provider  string `json:"provider"`
+	Name      string `json:"name"`
+	DisplayID int    `json:"display_id"`
+}
+
 // CreateMessageRequest is the payload for creating a support message.
 type CreateMessageRequest struct {
 	ExpectedMergeRevision     *int64   `json:"expected_merge_revision,omitempty"`
@@ -1043,6 +1071,8 @@ type CreateMessageRequest struct {
 	MessageType               string   `json:"message_type"` // reply, csat_survey, system, email_notice
 	AttachmentIDs             []string `json:"attachment_ids,omitempty"`
 	Channels                  []string `json:"channels,omitempty"`
+	ProviderOriginID          string   `json:"provider_origin_id,omitempty"`
+	ReplyTransport            string   `json:"reply_transport,omitempty"`
 	DeliveryMode              string   `json:"delivery_mode,omitempty"`
 	EmailSubject              *string  `json:"email_subject,omitempty"`
 	CCEmails                  []string `json:"cc_emails,omitempty"`
@@ -1056,6 +1086,7 @@ type LinkTaskRequest struct {
 
 // CreateTaskFromConversationRequest creates a PM task from the current support conversation.
 type CreateTaskFromConversationRequest struct {
+	SlackThread       *SlackThread                 `json:"-"`
 	OwnerMemberIDs    []string                     `json:"owner_member_ids,omitempty"`
 	AssignedAgentID   *string                      `json:"assigned_agent_id,omitempty"`
 	RunOnCreate       bool                         `json:"run_on_create,omitempty"`
@@ -1176,8 +1207,7 @@ type WidgetTranscriptResponse struct {
 }
 
 type SendSupportConversationTranscriptRequest struct {
-	Email               string `json:"email"`
-	UpdateCustomerEmail bool   `json:"update_customer_email"`
+	Email string `json:"email"`
 }
 
 type SendSupportConversationTranscriptResponse struct {

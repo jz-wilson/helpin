@@ -55,7 +55,7 @@ import { getAgentTokenUsageTotal } from '@/lib/agentTokenUsage';
 import { CRM_AGENT_TARGET_OPTIONS } from '@/lib/agentCRMTargets';
 import { AIProfileLabel } from '@/components/agents/AIProfileLabel';
 import { AIProfilePicker } from '@/components/agents/AIProfilePicker';
-import { buildSettingsRoutePath } from '@/lib/settingsSections';
+import { buildExternalMCPSettingsPath, buildSettingsRoutePath } from '@/lib/settingsSections';
 import { getUpgradeRequiredReason, type UpgradeRequiredReason } from '@edition/errors';
 import { ACTIVE_RUN_STATUSES, getAgentRunDisplayStatus } from '@/components/pm/agentRunConstants';
 import type {
@@ -2446,7 +2446,7 @@ export function AgentsPage({ requestedAgentId }: { requestedAgentId?: string } =
   const workspace = useWorkspaceStore((state) => state.currentWorkspace);
   const workspaceId = workspace?.id;
   const repositoriesSettingsHref = workspace?.slug ? buildSettingsRoutePath(workspace.slug, 'repositories') : undefined;
-  const toolConnectionsHref = workspace?.slug ? buildSettingsRoutePath(workspace.slug, 'external-mcp') : undefined;
+  const toolConnectionsHref = workspace?.slug ? buildExternalMCPSettingsPath(workspace.slug) : undefined;
   const { data: access } = useWorkspaceAccess(workspaceId ?? '');
   const { canEdit } = usePermissions(access);
   const { teams: accessibleTeams, isAdmin } = useAccessibleTeams(workspaceId ?? '');
@@ -2567,6 +2567,7 @@ export function AgentsPage({ requestedAgentId }: { requestedAgentId?: string } =
   const [versionDescriptionDraft, setVersionDescriptionDraft] = useState('');
   const [creatingVersion, setCreatingVersion] = useState(false);
   const [workspaceVersionPendingDelete, setWorkspaceVersionPendingDelete] = useState<AgentPresetDefinition | null>(null);
+  const [customVersionPendingDelete, setCustomVersionPendingDelete] = useState<AgentVersion | null>(null);
   const [deletingVersion, setDeletingVersion] = useState(false);
   const [workspaceVersionBeingRenamed, setWorkspaceVersionBeingRenamed] = useState<AgentPresetDefinition | null>(null);
   const [customAgentVersions, setCustomAgentVersions] = useState<AgentVersion[]>([]);
@@ -3540,7 +3541,23 @@ export function AgentsPage({ requestedAgentId }: { requestedAgentId?: string } =
     toast.success('Active version updated');
   };
 
+  const handleDeleteCustomVersion = async () => {
+    if (!workspaceId || !editingAgent || !customVersionPendingDelete) return;
+    setDeletingVersion(true);
+    const res = await automationService.deleteAgentVersion(workspaceId, editingAgent.id, customVersionPendingDelete.id);
+    setDeletingVersion(false);
+    if (res.error) {
+      toast.error('Failed to delete version', { description: res.error });
+      return;
+    }
+    setCustomVersionPendingDelete(null);
+    // Reload re-selects the active version, so a deleted selection never lingers.
+    await loadCustomAgentVersions(editingAgent);
+    toast.success('Custom version deleted');
+  };
+
   const handleDeleteWorkspaceVersion = async () => {
+    if (customVersionPendingDelete) return handleDeleteCustomVersion();
     if (!workspaceId || !workspaceVersionPendingDelete?.id) return;
     setDeletingVersion(true);
     const res = await agentService.deletePresetVersion(workspaceId, workspaceVersionPendingDelete.id);
@@ -3679,6 +3696,7 @@ export function AgentsPage({ requestedAgentId }: { requestedAgentId?: string } =
     isEditingWorkspaceVersion && selectedPreset && hasWorkspacePresetVersionChanges(form, selectedPreset),
   );
   const hasCustomVersionChanges = Boolean(isEditingCustomVersion && selectedCustomVersion && (
+    (form.ai_profile_id || '') !== (selectedCustomVersion.ai_profile_id ?? '') ||
     form.model_tier !== (selectedCustomVersion.model_tier ?? editingAgent?.model_tier ?? 'large') ||
     form.system_prompt.trim() !== (selectedCustomVersion.system_prompt ?? '') ||
     stableJSON(form.skills) !== stableJSON(selectedCustomVersion.skills ?? []) ||
@@ -4288,15 +4306,13 @@ export function AgentsPage({ requestedAgentId }: { requestedAgentId?: string } =
                             >
                               Duplicate
                             </DropdownMenuItem>
-                            {isWorkspace && presetVersion.id && (
-                              <DropdownMenuItem
-                                disabled={isCurrent}
-                                className="text-destructive focus:text-destructive"
-                                onSelect={() => setWorkspaceVersionPendingDelete(presetVersion)}
-                              >
-                                Delete version
-                              </DropdownMenuItem>
-                            )}
+                            <DropdownMenuItem
+                              disabled={isCurrent || !isWorkspace || !presetVersion.id}
+                              className="text-destructive focus:text-destructive"
+                              onSelect={() => setWorkspaceVersionPendingDelete(presetVersion)}
+                            >
+                              Delete version
+                            </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
                       </div>
@@ -4357,6 +4373,13 @@ export function AgentsPage({ requestedAgentId }: { requestedAgentId?: string } =
                               }}
                             >
                               Duplicate
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              disabled={isCurrent || version.version_key === 'default'}
+                              className="text-destructive focus:text-destructive"
+                              onSelect={() => setCustomVersionPendingDelete(version)}
+                            >
+                              Delete version
                             </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
@@ -6756,12 +6779,16 @@ export function AgentsPage({ requestedAgentId }: { requestedAgentId?: string } =
       />
 
       <ConfirmDialog
-        open={workspaceVersionPendingDelete !== null}
-        onOpenChange={(open) => !open && setWorkspaceVersionPendingDelete(null)}
+        open={workspaceVersionPendingDelete !== null || customVersionPendingDelete !== null}
+        onOpenChange={(open) => {
+          if (open) return;
+          setWorkspaceVersionPendingDelete(null);
+          setCustomVersionPendingDelete(null);
+        }}
         title="Delete custom version"
         description={
-          workspaceVersionPendingDelete
-            ? `This will permanently delete "${workspaceVersionPendingDelete.version_label}". Agents using this version will need a new active version. This action cannot be undone.`
+          workspaceVersionPendingDelete || customVersionPendingDelete
+            ? `This will permanently delete "${workspaceVersionPendingDelete?.version_label ?? customVersionPendingDelete?.label}". Agents using this version will need a new active version. This action cannot be undone.`
             : ''
         }
         confirmLabel={deletingVersion ? 'Deleting…' : 'Delete custom version'}

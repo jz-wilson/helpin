@@ -17,7 +17,15 @@ Personal connections and profiles belong to a user within a workspace. They are
 available for explicit manual use and trusted descendants. Shared connections
 belong to the workspace and support unattended execution. Shared management uses
 workspace settings permissions; selecting a shared connection requires current
-workspace access. ChatGPT connections remain personal. Existing personal IDs and
+workspace access. A ChatGPT subscription owner can open **Settings → AI Models**,
+change a saved model’s **Access** from **Personal** to **Workspace-wide**, and confirm. Each
+shared model appears in agent creation, editing and manual runs. Scheduled runs
+use the agent’s saved choice. The grant authorizes that model on that specific
+subscription, including when several people have connected the same provider.
+The connection settings and other models remain personal. Choose **Personal**
+to revoke access, then choose another model for affected agents. Runtime
+credential revocation is retried if the runtime is temporarily unavailable.
+Existing personal IDs and
 encryption AAD are preserved; there is no account-wide credential migration.
 
 Fallback happens before admission when the authorized primary connection is
@@ -63,6 +71,16 @@ Migration `202609140012` updates unchanged standard Small profiles to
 to Small; agents and saved versions using its former standard Medium default
 move to Small. Custom profile routes and other explicit profile selections are
 preserved, as are accepted run inputs. New installations use these same defaults.
+
+Migration `202611200001` moves unchanged standard profiles to the 2026-11
+lineup: Medium to `openai/gpt-6.1-terra` on OpenRouter, Large to `gpt-6.2-sol`
+on OpenAI, and Flagship to `claude-opus-5-5` on Anthropic. Small stays on
+DeepSeek V4.1 Flash. Profiles that the startup re-mapper moved to another
+provider follow the same lineup on that provider. Because OpenAI retires
+`gpt-5-mini` on 2026-12-11, every remaining `gpt-5-mini` route, including custom
+profiles, agents, and preset versions, moves to `gpt-6.1-terra`. Superseded
+models are marked `legacy` in the model catalog: saved routes keep resolving and
+billing, but pickers and tier fallback no longer offer them.
 
 API and worker startup provision standard profiles for existing workspaces; new
 workspaces are provisioned automatically. Enterprise fills untouched standard connection

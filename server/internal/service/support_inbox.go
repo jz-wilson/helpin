@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"log/slog"
 	"net/mail"
 	"net/netip"
@@ -75,6 +74,7 @@ type SupportInboxService struct {
 	workspaceRepo                *repository.WorkspaceRepository
 	authzService                 *authorization.AuthzService
 	attachmentService            *SupportAttachmentService
+	channelOutbox                *repository.SupportChannelOutboxRepository
 	linkPreviewService           SupportMessageLinkPreviewer
 	presence                     websocket.PresenceProvider
 	statusOverrideRepo           *repository.SupportTeammateStatusOverrideRepository
@@ -690,97 +690,6 @@ func (s *SupportInboxService) isConversationAssignableUser(ctx context.Context, 
 	return s.userHasSupportModuleAccess(ctx, workspaceID, userID) && s.userCanAccessMailbox(ctx, workspaceID, mailboxID, userID)
 }
 
-func supportTranscriptSenderName(workspaceName string, msg model.SupportMessage) string {
-	switch msg.SenderType {
-	case "customer":
-		if strings.TrimSpace(derefString(msg.SenderDisplayName)) != "" {
-			return strings.TrimSpace(derefString(msg.SenderDisplayName))
-		}
-		return "You"
-	case "ai":
-		return "Helpin AI"
-	default:
-		if strings.TrimSpace(derefString(msg.SenderDisplayName)) != "" {
-			return strings.TrimSpace(derefString(msg.SenderDisplayName))
-		}
-		if strings.TrimSpace(workspaceName) != "" {
-			return workspaceName
-		}
-		return "Support"
-	}
-}
-
-func renderSupportTranscriptBodies(workspaceName string, conversation *model.SupportConversation, messages []model.SupportMessage) (string, string) {
-	subject := strings.TrimSpace(conversation.Subject)
-	if subject == "" {
-		subject = "Conversation transcript"
-	}
-
-	var text strings.Builder
-	text.WriteString(workspaceName)
-	text.WriteString(" conversation transcript\n")
-	text.WriteString("Conversation #")
-	text.WriteString(fmt.Sprintf("%d", conversation.DisplayID))
-	text.WriteString("\n")
-	text.WriteString("Subject: ")
-	text.WriteString(subject)
-	text.WriteString("\n\n")
-
-	var htmlBody strings.Builder
-	htmlBody.WriteString("<p>")
-	htmlBody.WriteString(html.EscapeString(workspaceName))
-	htmlBody.WriteString(" conversation transcript</p>")
-	htmlBody.WriteString("<p><strong>Conversation #")
-	htmlBody.WriteString(fmt.Sprintf("%d", conversation.DisplayID))
-	htmlBody.WriteString("</strong><br />Subject: ")
-	htmlBody.WriteString(html.EscapeString(subject))
-	htmlBody.WriteString("</p>")
-
-	for _, msg := range messages {
-		sender := supportTranscriptSenderName(workspaceName, msg)
-		timestamp := formatSupportTranscriptTimestamp(msg.CreatedAt)
-		content := strings.TrimSpace(msg.Content)
-
-		text.WriteString(sender)
-		text.WriteString(" — ")
-		text.WriteString(timestamp)
-		text.WriteString("\n")
-		if content != "" {
-			text.WriteString(content)
-			text.WriteString("\n")
-		}
-		for _, attachment := range msg.Attachments {
-			text.WriteString("[Attachment: ")
-			text.WriteString(strings.TrimSpace(attachment.FileName))
-			text.WriteString("]\n")
-		}
-		text.WriteString("\n")
-
-		htmlBody.WriteString("<p><strong>")
-		htmlBody.WriteString(html.EscapeString(sender))
-		htmlBody.WriteString("</strong> <span style=\"color:#6b7280\">")
-		htmlBody.WriteString(html.EscapeString(timestamp))
-		htmlBody.WriteString("</span><br />")
-		if content != "" {
-			htmlBody.WriteString(strings.ReplaceAll(html.EscapeString(content), "\n", "<br />"))
-			if len(msg.Attachments) > 0 {
-				htmlBody.WriteString("<br />")
-			}
-		}
-		for i, attachment := range msg.Attachments {
-			if i > 0 {
-				htmlBody.WriteString("<br />")
-			}
-			htmlBody.WriteString("[Attachment: ")
-			htmlBody.WriteString(html.EscapeString(strings.TrimSpace(attachment.FileName)))
-			htmlBody.WriteString("]")
-		}
-		htmlBody.WriteString("</p>")
-	}
-
-	return htmlBody.String(), text.String()
-}
-
 // SetSupportAIService injects the AI-first auto-reply service.
 func (s *SupportInboxService) SetSupportAIService(aiService *SupportAIService) *SupportInboxService {
 	if s == nil {
@@ -861,6 +770,12 @@ func (s *SupportInboxService) SetPushSenderService(ps *PushSenderService) *Suppo
 }
 
 // SetAttachmentService injects the support attachment service for file upload support.
+// SetChannelOutbox shows provider delivery state (Telegram) on replies.
+func (s *SupportInboxService) SetChannelOutbox(outbox *repository.SupportChannelOutboxRepository) *SupportInboxService {
+	s.channelOutbox = outbox
+	return s
+}
+
 func (s *SupportInboxService) SetAttachmentService(attachmentService *SupportAttachmentService) *SupportInboxService {
 	if s == nil {
 		return nil
@@ -1654,16 +1569,28 @@ func (s *SupportInboxService) GetConversation(ctx context.Context, workspaceID, 
 			slog.ErrorContext(ctx, "hydrate support conversation triage", "error", err, "workspace_id", workspaceID, "conversation_id", id)
 		}
 	}
+	if ticket.ChannelAccountID != nil {
+		var account model.SupportChannelAccount
+		if err := s.conversationRepo.DB().WithContext(ctx).Select("handle").
+			Where("workspace_id = ? AND id = ?", workspaceID, *ticket.ChannelAccountID).Limit(1).Find(&account).Error; err != nil {
+			slog.ErrorContext(ctx, "load conversation channel account", "error", err, "conversation_id", id)
+		}
+		ticket.ChannelHandle = account.Handle
+	}
 	if ticket.MergeRevision > 0 && ticket.MergedIntoID == nil {
 		group, err := s.mergeRepository().Group(ctx, workspaceID, id)
 		if err != nil {
 			return nil, err
 		}
 		if len(group) > 1 {
+			ticket.ProviderDestinations = mergedProviderDestinations(group)
 			ticket.MergeEmailRecipients = model.SupportMergeEmailAudience(group)
 			for _, c := range group {
 				if c.AnonymousID != nil || model.SupportChannelHasChatSession(c.Source) {
 					ticket.MergeHasWidget = true
+				}
+				if c.ChannelIdentityID != nil {
+					ticket.MergeHasChannel = true
 				}
 				label := strings.TrimSpace(derefString(c.CustomerEmail))
 				if label == "" {
@@ -1677,6 +1604,10 @@ func (s *SupportInboxService) GetConversation(ctx context.Context, workspaceID, 
 				}
 			}
 		}
+	}
+	ticket.ProviderDestinations, err = s.conversationRepo.ReplyDestinations(ctx, ticket)
+	if err != nil {
+		return nil, err
 	}
 	if ticket.MergedIntoID != nil {
 		root, err := s.mergeRepository().Root(ctx, workspaceID, id)
@@ -2065,6 +1996,7 @@ func (s *SupportInboxService) listConversationMessagesWith(ctx context.Context, 
 			hydrateEmailBodies(ctx, s.emailLogRepo, workspaceID, ticketID, messages)
 		}
 	}
+	s.hydrateChannelDelivery(ctx, workspaceID, conv, messages)
 
 	return messages, nil
 }
@@ -2255,14 +2187,6 @@ func (s *SupportInboxService) CreateConversationMessage(ctx context.Context, wor
 	if err != nil {
 		return nil, err
 	}
-	// Any request the customer sees in the portal (portal intake, or an email
-	// thread claimed after sign-in) can receive replies there.
-	portalReplySurface := supportConversationPortalReplySurface(conv)
-	if (req.DeliveryMode == model.SupportDeliveryChatOnly || req.DeliveryMode == model.SupportDeliveryChatAndEmail) &&
-		strings.TrimSpace(derefString(conv.AnonymousID)) == "" && !model.SupportChannelHasChatSession(conv.Source) && !deliveryConversation.MergeHasWidget && !portalReplySurface {
-		return nil, fmt.Errorf("this conversation has no chat session; choose email only")
-	}
-
 	replyID := ""
 	if senderType == "user" && senderUserID != nil && !req.IsInternal && messageType == "reply" && clientMessageID != "" {
 		previous, lookupErr := s.messageRepo.FindTeammateReplyByClientID(ctx, workspaceID, ticketID, *senderUserID, clientMessageID)
@@ -2273,6 +2197,53 @@ func (s *SupportInboxService) CreateConversationMessage(ctx context.Context, wor
 			return previous, nil
 		}
 		replyID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("support-reply:"+workspaceID+":"+ticketID+":"+*senderUserID+":"+clientMessageID)).String()
+	}
+
+	// Recheck the live route in case a bot or channel was removed while drafting.
+	providerChannel := conv.ChannelIdentityID != nil || deliveryConversation.MergeHasChannel
+	explicitChat := req.DeliveryMode == model.SupportDeliveryChatOnly || req.DeliveryMode == model.SupportDeliveryChatAndEmail
+	hasWidget := strings.TrimSpace(derefString(conv.AnonymousID)) != "" || model.SupportChannelHasChatSession(conv.Source) || deliveryConversation.MergeHasWidget
+	portalReplySurface := supportConversationPortalReplySurface(conv)
+	customerChatTarget := req.ReplyTransport == "widget" || req.ReplyTransport == "portal"
+	if req.ReplyTransport == "portal" && !portalReplySurface {
+		return nil, fmt.Errorf("this request is unavailable in the customer portal")
+	}
+	if req.ReplyTransport == "widget" && !hasWidget {
+		return nil, fmt.Errorf("this conversation has no chat session")
+	}
+	// Preserve automatic Telegram routing for clients that predate the picker.
+	if req.ReplyTransport == "" && !slices.ContainsFunc(deliveryConversation.ProviderDestinations, func(d model.SupportProviderDestination) bool { return d.Provider == "slack" }) {
+		deliveryConversation.ProviderDestinations = nil
+	}
+	if explicitChat && providerChannel && !customerChatTarget {
+		destinations, err := s.conversationRepo.ReplyDestinations(ctx, deliveryConversation)
+		if err != nil {
+			return nil, err
+		}
+		deliveryConversation.ProviderDestinations = destinations
+		providerChannel = len(destinations) > 0
+	}
+	if explicitChat && !providerChannel && req.ProviderOriginID != "" {
+		return nil, fmt.Errorf("the selected messaging channel is no longer connected")
+	}
+	if !customerChatTarget && !req.IsInternal && messageType == "reply" && req.DeliveryMode != model.SupportDeliveryEmailOnly && len(deliveryConversation.ProviderDestinations) > 0 {
+		destinations := deliveryConversation.ProviderDestinations
+		if len(destinations) == 1 && req.ProviderOriginID == "" {
+			req.ProviderOriginID = destinations[0].ID
+		}
+		if !slices.ContainsFunc(destinations, func(d model.SupportProviderDestination) bool {
+			return d.ID == req.ProviderOriginID && (req.ReplyTransport == "" || req.ReplyTransport == d.Provider)
+		}) {
+			return nil, fmt.Errorf("choose the original channel thread for this reply")
+		}
+	} else {
+		req.ProviderOriginID = ""
+	}
+	// A provider-channel conversation (Telegram), or a merged group holding
+	// one, delivers "chat" replies through the channel outbox.
+	if explicitChat &&
+		!hasWidget && !portalReplySurface && !providerChannel {
+		return nil, fmt.Errorf("this conversation has no chat session; choose email only")
 	}
 
 	explicitEmail := req.DeliveryMode == model.SupportDeliveryEmailOnly || req.DeliveryMode == model.SupportDeliveryChatAndEmail
@@ -2401,10 +2372,16 @@ func (s *SupportInboxService) CreateConversationMessage(ctx context.Context, wor
 		metaJSON, _ := json.Marshal(map[string]any{"mentioned_user_ids": mentionedUserIDs})
 		msg.Metadata = string(metaJSON)
 	}
-	if req.AIAssisted || clientMessageID != "" || translation != nil {
+	if req.AIAssisted || clientMessageID != "" || translation != nil || req.ProviderOriginID != "" || req.ReplyTransport != "" {
 		metadata := map[string]any{}
 		if strings.TrimSpace(msg.Metadata) != "" {
 			_ = json.Unmarshal([]byte(msg.Metadata), &metadata)
+		}
+		if req.ReplyTransport != "" {
+			metadata["reply_transport"] = req.ReplyTransport
+		}
+		if req.ProviderOriginID != "" {
+			metadata["provider_origin_id"] = req.ProviderOriginID
 		}
 		if translation != nil {
 			metadata["translated"] = true
@@ -2617,8 +2594,12 @@ func (s *SupportInboxService) CreateConversationMessage(ctx context.Context, wor
 
 	// Push visitor-scoped list refresh for widget unread when an agent/user/AI reply is sent.
 	if !msg.IsInternal && msg.SenderType != "customer" && msg.MessageType == "reply" && conv != nil {
-		if msg.WidgetVisible() && conv.AnonymousID != nil && *conv.AnonymousID != "" {
-			s.pushVisitorConversationsRefresh(ctx, workspaceID, *conv.AnonymousID)
+		if msg.WidgetVisible() {
+			if conv.MergeRevision > 0 {
+				s.refreshMergedVisitors(ctx, conv)
+			} else if conv.AnonymousID != nil && *conv.AnonymousID != "" {
+				s.pushVisitorConversationsRefresh(ctx, workspaceID, *conv.AnonymousID)
+			}
 		}
 		if !explicitEmail && req.DeliveryMode != model.SupportDeliveryChatOnly && s.emailFallbackService != nil && supportChannelsIncludeEmail(req.Channels) {
 			go func(convSnapshot *model.SupportConversation) {
@@ -2744,6 +2725,7 @@ func (s *SupportInboxService) CreateTaskFromConversation(
 	}
 	requesterMemberID := trimOptionalPtr(req.RequesterMemberID)
 	createReq := model.CreateTaskRequest{
+		SlackThread:       req.SlackThread,
 		WorkspaceID:       workspaceID,
 		Name:              firstNonEmptyString(trimPtrValue(req.Name), draft.Title),
 		Description:       description,
@@ -4623,6 +4605,14 @@ func (s *SupportInboxService) updateConversationCRMContact(ctx context.Context, 
 	}
 	if err := s.conversationRepo.UpdateFields(ctx, workspaceID, conversationID, fields); err != nil {
 		return nil, err
+	}
+	// The provider customer's later conversations start linked to the contact.
+	if ticket.ChannelIdentityID != nil {
+		if err := s.conversationRepo.DB().WithContext(ctx).Model(&model.SupportChannelIdentity{}).
+			Where("workspace_id = ? AND id = ?", workspaceID, *ticket.ChannelIdentityID).
+			Updates(map[string]any{"crm_contact_id": normalizedContactID, "updated_at": time.Now().UTC()}).Error; err != nil {
+			return nil, err
+		}
 	}
 	ticket.CRMContactID = normalizedContactID
 	ticket.UpdatedAt = time.Now().UTC()
