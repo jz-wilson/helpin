@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/helpin-ai/helpin/server/internal/aimodel"
+	"github.com/helpin-ai/helpin/server/internal/aipolicy"
 )
 
 const defaultAICompletionServiceTier = "standard"
@@ -88,6 +89,7 @@ func NewAICompletionRouteRegistry(crmConfig CRMCompletionRouteConfig) AICompleti
 		}
 	}
 	policies := []AICompletionRoutePolicy{
+		{FeatureKey: BillingFeatureAskChat, OperationKey: "slack_question", Primary: openRouterDeepSeekFlashRoute, Fallbacks: []AICompletionRoute{openRouterLunaRoute}, MaximumOutputTokens: 320},
 		{FeatureKey: BillingFeatureSupportTranslation, OperationKey: "quality_review", Primary: openRouterDeepSeekTranslationRoute, PreferRequestRoute: true, MaximumOutputTokens: 128},
 		{FeatureKey: BillingFeatureSupportTranslation, Primary: AICompletionRoute{Provider: "openrouter", Model: "openai/gpt-oss-120b", OpenRouterProvider: "cerebras/fp16", ServiceTier: defaultAICompletionServiceTier}, Fallbacks: []AICompletionRoute{openRouterDeepSeekTranslationRoute}, MaximumOutputTokens: 4000},
 		common(BillingFeatureAIRouting, 400),
@@ -131,6 +133,7 @@ func NewAICompletionRouteRegistry(crmConfig CRMCompletionRouteConfig) AICompleti
 		common(BillingFeatureHelpcenterAnswer, 4096),
 		common(BillingFeatureCustomAgentDraft, 1600),
 		common(BillingFeatureCompanyProductContext, 2400),
+		common(BillingFeatureOnboardingPreviewAnswer, 3200),
 		common(BillingFeatureDockChatTitle, 80),
 		{
 			FeatureKey: BillingFeatureAskChat, OperationKey: AIUsageOperationMediaEnrichment,
@@ -144,7 +147,7 @@ func NewAICompletionRouteRegistry(crmConfig CRMCompletionRouteConfig) AICompleti
 				Provider: "openrouter", Model: "qwen/qwen3.8-omni-flash", OpenRouterProvider: "alibaba",
 				ProviderOptions:  `{"only":["alibaba"],"max_price":{"prompt":0.15,"completion":0.47}}`,
 				DisableReasoning: true, AttemptTimeout: 2 * time.Minute, ServiceTier: defaultAICompletionServiceTier,
-			}}, MaximumOutputTokens: 700,
+			}}, MaximumOutputTokens: aipolicy.TaskAttachmentMaxOutputTokens,
 		},
 	}
 	registry := AICompletionRouteRegistry{policies: make(map[string]AICompletionRoutePolicy, len(policies))}
@@ -153,6 +156,7 @@ func NewAICompletionRouteRegistry(crmConfig CRMCompletionRouteConfig) AICompleti
 	}
 	media := registry.policies[aiCompletionPolicyKey(BillingFeatureAskChat, AIUsageOperationMediaEnrichment)]
 	media.FeatureKey = BillingFeatureSupportAIReply
+	media.MaximumOutputTokens = aipolicy.MediaEnrichmentMaxOutputTokens
 	registry.policies[aiCompletionPolicyKey(media.FeatureKey, media.OperationKey)] = media
 	return registry
 }

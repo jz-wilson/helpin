@@ -58,8 +58,14 @@ func (s *SupportChannelService) processNextJob(ctx context.Context, kind string)
 	switch kind {
 	case "slack_shortcut":
 		workErr = s.slack.shortcutJob(workCtx, job)
+	case SlackFeedActionJob:
+		workErr = s.slack.processFeedAction(workCtx, job)
+	case SlackInboxFeedJob:
+		workErr = s.slack.deliverInboxFeed(workCtx, job)
 	case SlackPMDeliveryJob:
 		workErr = s.slack.deliverDiscussion(workCtx, job)
+	case SlackAgentReplyJob:
+		workErr = s.slack.deliverAgentAnswer(workCtx, job)
 	case SlackEventJob:
 		workErr = s.slack.process(workCtx, job)
 	case SupportInboundKindChannelEvent:
@@ -74,8 +80,18 @@ func (s *SupportChannelService) processNextJob(ctx context.Context, kind string)
 	if ctx.Err() != nil {
 		return true, ctx.Err()
 	}
+	var slackError *slack.APIError
+	if (kind == SlackFeedActionJob || kind == SlackInboxFeedJob || kind == SlackEventJob) && errors.As(workErr, &slackError) && slackError.Code == "ratelimited" {
+		return true, s.jobs.WaitForResult(ctx, job, s.now().Add(max(time.Second, slackError.RetryAfter)))
+	}
+	if errors.Is(workErr, errSlackAgentPending) {
+		return true, s.jobs.WaitForResult(ctx, job, s.now().Add(3*time.Second))
+	}
 	if workErr != nil {
 		s.logger.ErrorContext(ctx, "channel job failed", "job_id", job.ID, "kind", kind, "attempt", job.Attempts, "error", workErr)
+		if (kind == SlackEventJob || kind == SlackAgentReplyJob) && s.slack.reportRequestFailure(ctx, job, workErr) {
+			workErr = &repository.InboundUndeliverableError{Reason: "Slack request failed after retry; requester notified"}
+		}
 		if kind == SupportInboundKindChannelAttachment {
 			s.markAttachmentRetrying(ctx, job)
 		}

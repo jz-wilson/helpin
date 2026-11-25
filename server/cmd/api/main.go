@@ -1236,6 +1236,7 @@ func main() {
 		cfg.OpenAIEmbeddingModel,
 		runEngine,
 	)
+	docsImportService.SetSpaceIndexer(docsEmbeddingService)
 	agentKnowledgeSourceService := service.NewAgentKnowledgeSourceServiceWithScopes(agentKnowledgeSourceRepo, docsSpaceRepo, docsCollectionRepo, docsDocumentRepo, docsEmbeddingService)
 	supportContentSyncService := service.NewSupportContentSyncService(
 		supportContentSourceRepo,
@@ -1394,6 +1395,7 @@ func main() {
 	)
 	commandService.SetPMAutomationService(pmAutomationService)
 	commandService.SetPMLabelService(pmLabelService)
+	commandService.SetTaskFileStore(s3Client)
 	commandService.SetPMCommentService(pmCommentService)
 	commandService.SetPMOperationalServices(workspaceRepo, pmEpicService, pmSprintService, pmObjectiveService, pmWorkflowService, pmChecklistItemService)
 	commandService.SetGitService(gitService)
@@ -1404,7 +1406,7 @@ func main() {
 	commandService.SetDocsBlockService(docsBlockService)
 	commandService.SetSupportDependencies(supportMessageRepo, supportConversationRepo, wsPublisher)
 	commandService.SetSupportAttachmentRepository(supportAttachmentRepo)
-	commandService.SetSupportMediaAnalyzer(supportLLMProvider)
+	commandService.SetAttachmentMediaAnalyzer(supportLLMProvider)
 	commandService.SetSupportOperationalServices(supportInboxService, supportTagService)
 	commandService.SetCRMReadServices(crmContactService, crmSignalService)
 	commandService.SetCRMOperationalServices(crmCompanyService, crmAssociationService)
@@ -1787,6 +1789,7 @@ func main() {
 		SetMediaSourceService(supportInboxService).
 		SetMediaAnalyzer(pmAttachmentService, supportLLMProvider)
 	publicShareRepo := repository.NewPublicShareRepository(db)
+	slackService.SetAskAgent(dockChatService)
 	dockChatService.SetFlowBuilder(ruleEngine, flowTemplateRegistry, flowTemplateInstaller)
 	commandService.SetFlowBuilderChat(dockChatService)
 	publicShareSource := service.NewPublicShareSource(dockChatService, agentService, dockChatRepo, agentRunMessageRepo, workspaceRepo)
@@ -2007,6 +2010,8 @@ func main() {
 		WidgetRateLimit:           middleware.WidgetRateLimit(redisClient),
 		HelpcenterAnswerRateLimit: middleware.HelpcenterAnswerRateLimit(redisClient),
 		HelpAssistantRateLimit:    middleware.HelpAssistantRateLimit(redisClient),
+		OnboardingReadRateLimit:   middleware.OnboardingReadRateLimit(redisClient),
+		OnboardingAnswerRateLimit: middleware.OnboardingAnswerRateLimit(redisClient),
 		DemoReadOnly:              demoReadOnly,
 		Assets:                    handler.NewAssetHandler(s3Client),
 		Health:                    handler.NewHealthHandler(s3Client, geoIPResolver),
@@ -2017,11 +2022,16 @@ func main() {
 			AppBaseURL:       cfg.AppBaseURL,
 			MobileAppBaseURL: cfg.MobileAppBaseURL,
 		}),
-		Passkey:             handler.NewPasskeyHandler(passkeyService),
-		Organization:        handler.NewOrganizationHandler(orgService),
-		Workspace:           handler.NewWorkspaceHandler(workspaceService, authzService),
-		LinkPreview:         linkPreviewHandler,
-		Setup:               setupHandler,
+		Passkey:      handler.NewPasskeyHandler(passkeyService),
+		Organization: handler.NewOrganizationHandler(orgService),
+		Workspace:    handler.NewWorkspaceHandler(workspaceService, authzService),
+		LinkPreview:  linkPreviewHandler,
+		Setup:        setupHandler,
+		SupportQuickstart: handler.NewSupportQuickstartHandler(service.NewSupportQuickstartService(service.SupportQuickstartDeps{
+			Brand: docsHelpcenterService, Imports: docsImportService, Workspaces: workspaceService, Support: supportInboxService,
+			ContentSources: supportContentSourceService, AgentContentSources: agentContentSourceService, Chunks: docsChunkRepo, Documents: docsDocumentRepo,
+			AI: supportLLMProvider, Redis: redisClient,
+		})),
 		SampleData:          handler.NewSampleDataHandler(service.NewSampleDataService(db, cfg.DocsOrderingUseSortKey), authzService),
 		Edition:             editionServices.Routes,
 		Settings:            handler.NewSettingsHandler(settingsService, automationInventoryService),
@@ -2467,6 +2477,9 @@ func main() {
 	go supportChannelService.StartWorker(inboundCtx, service.SupportInboundKindChannelAttachment)
 	go supportChannelService.StartWorker(inboundCtx, "slack_shortcut")
 	go supportChannelService.StartWorker(inboundCtx, service.SlackPMDeliveryJob)
+	go supportChannelService.StartWorker(inboundCtx, service.SlackInboxFeedJob)
+	go supportChannelService.StartWorker(inboundCtx, service.SlackFeedActionJob)
+	go supportChannelService.StartWorker(inboundCtx, service.SlackAgentReplyJob)
 	go supportChannelService.StartWorker(inboundCtx, service.SlackEventJob)
 	go supportChannelService.RunOutbox(inboundCtx, 2*time.Second)
 	go emailFallbackService.StartInboundBacklogMonitor(inboundCtx, metrics, appEmailClient, cfg.OpsAlertEmails)

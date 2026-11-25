@@ -793,22 +793,24 @@ func mapFromJSON(value interface{}) map[string]interface{} {
 }
 
 func validateRunAllowedTools(requested []string, agent *model.Agent) error {
-	requested = normalizeStringSlice(requested)
 	if len(requested) == 0 {
 		return nil
-	}
-	allowedSet := map[string]bool{}
-	for _, tool := range parseJSONStringSlice(agent.AllowedTools) {
-		allowedSet[tool] = true
 	}
 	// Output-bound review tools are safe to grant per run. They validate the
 	// run output context before doing anything, so older document agents can use
 	// new review-candidate flows without requiring an agent row migration first.
-	allowedSet["publish_document_change_proposal"] = true
-	allowedSet["publish_ai_section_candidate"] = true
-	for _, tool := range requested {
+	allowed := append(parseJSONStringSlice(agent.AllowedTools), "publish_document_change_proposal", "publish_ai_section_candidate")
+	return validateAgentToolSubset(requested, allowed, agent.Name)
+}
+
+func validateAgentToolSubset(requested, allowed []string, agentName string) error {
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, tool := range allowed {
+		allowedSet[tool] = true
+	}
+	for _, tool := range normalizeStringSlice(requested) {
 		if !allowedSet[tool] {
-			return fmt.Errorf("tool %q is not allowed for agent %s", tool, strings.TrimSpace(agent.Name))
+			return fmt.Errorf("tool %q is not allowed for agent %s", tool, strings.TrimSpace(agentName))
 		}
 	}
 	return nil
@@ -5300,11 +5302,15 @@ func (s *AgentService) startTargetRunWithOptions(ctx context.Context, workspaceI
 		if err != nil {
 			return nil, err
 		}
-		validationAgent := agent
-		if opts.executionEnabled && opts.dockChatID != nil && agent.EffectivePresetKey() == model.AgentPresetAskAgent {
-			validationAgent = withAskAgentDirectTools(agent)
+		switch {
+		case agent.IsSystem && agent.EffectivePresetKey() == model.AgentPresetAskAgent && !opts.executionEnabled && isSlackDockTrigger(trigger, opts.dockChatID):
+			err = validateAgentToolSubset(req.AllowedTools, slackRuntimeTools(), agent.Name)
+		case opts.executionEnabled && opts.dockChatID != nil && agent.EffectivePresetKey() == model.AgentPresetAskAgent:
+			err = validateRunAllowedTools(req.AllowedTools, withAskAgentDirectTools(agent))
+		default:
+			err = validateRunAllowedTools(req.AllowedTools, agent)
 		}
-		if err := validateRunAllowedTools(req.AllowedTools, validationAgent); err != nil {
+		if err != nil {
 			return nil, err
 		}
 		input, err := buildAgentRunInputPayload("workspace", workspaceID, trigger, event, req.Output, req.AdditionalContext, req.AllowedTools, workspaceContext)
@@ -6756,7 +6762,7 @@ func (s *AgentService) createRun(ctx context.Context, params createRunParams) (*
 	}
 
 	runtimeAgent = runtimeAgentForDockExecution(run, runtimeAgent)
-	if params.targetType != supportPreviewTarget && !isSupportInvestigationRun(run) {
+	if params.targetType != supportPreviewTarget && !isSupportInvestigationRun(run) && !isSlackDockRun(run) {
 		runtimeAgent, err = s.projectEnabledExternalMCPTools(ctx, params.workspaceID, runtimeAgent)
 		if err != nil {
 			s.failRunStart(ctx, run, params.agent, params.workspaceID, err)
@@ -6931,6 +6937,15 @@ func (s *AgentService) auditActorIDForRun(ctx context.Context, run *model.AgentR
 	// An event or schedule fires a flow with no user, and a template-installed
 	// agent has no authored version. Attribute the run's writes to the person
 	// who set up the flow so tools that record an author do not fail.
+	if actorID := s.ruleCreatorForRun(ctx, run); actorID != "" {
+		return actorID
+	}
+	// Built-in triggers start system agents with no user, version author, or
+	// rule; fall back to the workspace owner so author columns stay valid.
+	return s.workspaceOwnerID(ctx, run.WorkspaceID)
+}
+
+func (s *AgentService) ruleCreatorForRun(ctx context.Context, run *model.AgentRun) string {
 	ruleID := runInputRuleID(run.Input)
 	if s == nil || s.ruleEngine == nil || ruleID == "" {
 		return ""
@@ -6940,6 +6955,22 @@ func (s *AgentService) auditActorIDForRun(ctx context.Context, run *model.AgentR
 		return ""
 	}
 	return strings.TrimSpace(derefString(rule.CreatedBy))
+}
+
+// workspaceOwnerID returns the workspace owner's user ID, or "" when unknown.
+func (s *AgentService) workspaceOwnerID(ctx context.Context, workspaceID string) string {
+	if s == nil || s.workspaceRepo == nil || strings.TrimSpace(workspaceID) == "" {
+		return ""
+	}
+	workspace, err := s.workspaceRepo.GetByID(ctx, strings.TrimSpace(workspaceID))
+	if err != nil {
+		slog.WarnContext(ctx, "resolve workspace owner", "error", err, "workspace_id", workspaceID)
+		return ""
+	}
+	if workspace == nil {
+		return ""
+	}
+	return strings.TrimSpace(workspace.OwnerID)
 }
 
 // runInputRuleID returns the automation rule that started a run, if any.

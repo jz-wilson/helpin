@@ -31,6 +31,10 @@ type Handlers struct {
 	// HelpAssistantRateLimit guards questions to the help assistant (nil
 	// disables limiting).
 	HelpAssistantRateLimit func(http.Handler) http.Handler
+	// OnboardingReadRateLimit and OnboardingAnswerRateLimit guard the public
+	// onboarding preview (nil disables limiting).
+	OnboardingReadRateLimit   func(http.Handler) http.Handler
+	OnboardingAnswerRateLimit func(http.Handler) http.Handler
 
 	// DemoReadOnly rejects every non-read request made by the shared public demo
 	// viewer account (nil when the demo login is not configured).
@@ -46,6 +50,7 @@ type Handlers struct {
 	Workspace           *handler.WorkspaceHandler
 	LinkPreview         *handler.LinkPreviewHandler
 	Setup               *handler.SetupHandler
+	SupportQuickstart   *handler.SupportQuickstartHandler
 	Capability          *handler.CapabilityHandler
 	SampleData          *handler.SampleDataHandler
 	Edition             EditionRoutes
@@ -153,6 +158,14 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 	helpAssistantLimiter := h.HelpAssistantRateLimit
 	if helpAssistantLimiter == nil {
 		helpAssistantLimiter = func(next http.Handler) http.Handler { return next }
+	}
+	onboardingReadLimiter := h.OnboardingReadRateLimit
+	if onboardingReadLimiter == nil {
+		onboardingReadLimiter = func(next http.Handler) http.Handler { return next }
+	}
+	onboardingAnswerLimiter := h.OnboardingAnswerRateLimit
+	if onboardingAnswerLimiter == nil {
+		onboardingAnswerLimiter = func(next http.Handler) http.Handler { return next }
 	}
 
 	// Global middleware (applied to all routes)
@@ -424,6 +437,12 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 		r.Post("/auth/reset-password", h.Auth.ResetPassword)
 		r.Post("/auth/refresh", h.Auth.RefreshToken)
 		r.Post("/auth/signout", h.Auth.Signout)
+		// Onboarding preview: a visitor sees what Helpin finds on their site,
+		// and their agent answering, before creating an account.
+		if h.SupportQuickstart != nil {
+			r.With(onboardingReadLimiter).Post("/onboarding/support/preview", h.SupportQuickstart.Preview)
+			r.With(onboardingAnswerLimiter).Post("/onboarding/support/preview-answer", h.SupportQuickstart.PreviewAnswer)
+		}
 		if h.CLI != nil {
 			r.Get("/cli/oauth/authorize", h.CLI.AuthorizeRedirect)
 			r.Post("/cli/oauth/token", h.CLI.Token)
@@ -878,6 +897,11 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 					r.Patch("/setup/me", h.Setup.UpdatePreference)
 					r.Post("/setup/recommendations/{taskKey}/start", h.Setup.StartRecommendation)
 				}
+				if h.SupportQuickstart != nil {
+					supportAdmin := r.With(requireModule(model.ModuleSupport), requirePerm(authorization.PermSupportAdmin))
+					supportAdmin.Get("/support/quickstart", h.SupportQuickstart.Status)
+					supportAdmin.Post("/support/quickstart", h.SupportQuickstart.Start)
+				}
 				if h.SampleData != nil {
 					r.Get("/sample-data", h.SampleData.Get)
 					r.With(requirePerm(authorization.PermWorkspaceUpdate)).Post("/sample-data", h.SampleData.Load)
@@ -1264,6 +1288,7 @@ func New(h Handlers, jwtManager *auth.JWTManager, authz *authorization.AuthzServ
 				r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/messages/{id}/email", h.SupportInbox.GetMessageEmailDetail)
 				if h.Slack != nil {
 					r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/messages/{id}/slack-source", h.Slack.MessageSource)
+					r.With(requirePerm(authorization.PermSupportRead)).Get("/inbox/conversations/{id}/slack-thread", h.Slack.InboxThread)
 				}
 				r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/messages/{id}/attachments/{attachmentID}/retry", h.SupportInbox.RetryInboundAttachment)
 				r.With(requirePerm(authorization.PermSupportEdit)).Post("/inbox/messages/{id}/channel-retry", h.SupportInbox.RetryChannelDelivery)

@@ -11,7 +11,6 @@ import (
 	htmlstd "html"
 	"io"
 	"log/slog"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -207,6 +206,7 @@ func (s *SupportContentSyncService) RunSourceSync(ctx context.Context, workspace
 		keepURLs      []string
 		indexedPages  int
 		indexedChunks int
+		embedFailures int
 	)
 
 	if err := s.sourceRepo.UpdateSyncWarning(ctx, source.ID, nil); err != nil {
@@ -273,6 +273,7 @@ func (s *SupportContentSyncService) RunSourceSync(ctx context.Context, workspace
 		})
 		if err != nil {
 			slog.WarnContext(ctx, "skipping page: embedding failed", "page_id", savedPage.ID, "url", savedPage.URL, "error", err)
+			embedFailures++
 			keepPageIDs = append(keepPageIDs, savedPage.ID)
 			keepURLs = append(keepURLs, savedPage.URL)
 			return nil
@@ -362,6 +363,10 @@ func (s *SupportContentSyncService) RunSourceSync(ctx context.Context, workspace
 	crawledCount, err := s.crawler.Crawl(ctx, *source, onPage)
 	if err == nil && crawledCount == 0 && len(skippedURLs) == 0 {
 		err = errors.New("no pages could be retrieved; check the website URL and crawler access")
+	}
+	// A sync that read pages and indexed none is not ready: the AI has nothing to answer from.
+	if err == nil && indexedPages == 0 && embedFailures > 0 {
+		err = fmt.Errorf("%d pages were read but none could be indexed; check the embedding model connection, then sync again", embedFailures)
 	}
 	if len(skippedURLs) > 0 {
 		warning := fmt.Sprintf("%d URLs skipped because the site disallows crawling. Check robots.txt and the crawler access instructions before re-syncing.", len(skippedURLs))
@@ -833,33 +838,40 @@ func extractDOCXText(data []byte) (string, error) {
 }
 
 func extractPDFText(data []byte) (string, error) {
-	tmp, err := os.CreateTemp("", "helpin-knowledge-*.pdf")
-	if err != nil {
-		return "", fmt.Errorf("create temporary PDF: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("write temporary PDF: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close temporary PDF: %w", err)
-	}
-	file, reader, err := pdf.Open(tmpPath)
+	return extractPDFPages(context.Background(), data, 0, 0)
+}
+
+// Zero limits preserve the full extraction used by existing document importers.
+func extractPDFPages(ctx context.Context, data []byte, maxPages, maxBytes int) (content string, err error) {
+	// The PDF parser can panic while resolving a malformed document or page tree.
+	defer func() {
+		if recover() != nil {
+			content, err = "", fmt.Errorf("invalid PDF structure")
+		}
+	}()
+	reader, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("open PDF: %w", err)
 	}
-	defer func() { _ = file.Close() }()
-	textReader, err := reader.GetPlainText()
-	if err != nil {
-		return "", fmt.Errorf("extract PDF text: %w", err)
+	pages := reader.NumPage()
+	if maxPages > 0 && pages > maxPages {
+		return "", fmt.Errorf("PDF exceeds %d pages", maxPages)
 	}
-	payload, err := io.ReadAll(textReader)
-	if err != nil {
-		return "", fmt.Errorf("read PDF text: %w", err)
+	var text strings.Builder
+	for i := 1; i <= pages; i++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		page, err := reader.Page(i).GetPlainText(nil)
+		if err != nil {
+			return "", fmt.Errorf("extract PDF page %d: %w", i, err)
+		}
+		if maxBytes > 0 && len(page) > maxBytes-text.Len() {
+			return "", fmt.Errorf("PDF text exceeds %d bytes", maxBytes)
+		}
+		text.WriteString(page)
 	}
-	return string(payload), nil
+	return text.String(), nil
 }
 
 func mustMarshalJSON(value any) json.RawMessage {

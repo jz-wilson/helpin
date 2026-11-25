@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useWorkspaceStore } from '@/stores/workspaceStore'
 import { appendMessageToNewestPage, replaceMessageInPages, seedSupportMessagePages } from '@/lib/supportMessagePages'
 import { MessageThread } from '../MessageThread'
+import { SupportConversationLoadError } from '@/lib/supportConversationError'
 
 const supportHooks = vi.hoisted(() => ({
   useConversation: vi.fn(),
@@ -122,6 +123,30 @@ describe('MessageThread', () => {
     vi.useRealTimers()
     vi.clearAllMocks()
     document.body.innerHTML = ''
+  })
+
+  it('loads earlier pages for a linked report and scrolls to it', async () => {
+    const client = createTestQueryClient()
+    const host = document.createElement('div')
+    const root = createRoot(host)
+    const fetchNextPage = vi.fn()
+    const reportId = 'ed1267e8-70ae-44ea-a557-412d8bd5d926'
+    const reply = { id: 'latest', conversation_id: 'conv-1', sender_type: 'customer', content: 'Later', created_at: '2026-09-11T12:00:00Z' }
+    const report = { ...reply, id: reportId, sender_type: 'agent', is_internal: true, message_type: 'note', content: 'Code check', created_at: '2026-09-10T12:00:00Z' }
+    supportHooks.useConversation.mockReturnValue({ isFetched: true, data: { id: 'conv-1', workspace_id: 'ws-1', status: 'open' } })
+    const render = async (loaded: boolean) => {
+      supportHooks.useConversationMessages.mockReturnValue({ isLoading: false, data: seedSupportMessagePages((loaded ? [report, reply] : [reply]) as never), hasNextPage: !loaded, fetchNextPage })
+      await act(async () => root.render(<QueryClientProvider client={client}><MessageThread workspaceId="ws-1" conversationId="conv-1" linkedMessageId={reportId} /></QueryClientProvider>))
+    }
+    const offset = vi.spyOn(HTMLElement.prototype, 'offsetTop', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.dataset.supportMessageId === reportId ? 120 : 0
+    })
+    try {
+      await render(false)
+      expect(fetchNextPage).toHaveBeenCalledOnce()
+      await render(true)
+      expect(host.querySelector('[data-slot="scroll-area-viewport"]')?.scrollTop).toBe(96)
+    } finally { act(() => root.unmount()); client.clear(); offset.mockRestore() }
   })
 
   it('shows a temporary date while scrolling up and yields to the inline day separator', async () => {
@@ -788,4 +813,104 @@ describe('MessageThread', () => {
     } finally { act(() => root.unmount()); client.clear(); rect.mockRestore() }
   })
 
+
+  describe('unavailable and failed conversations', () => {
+    const renderThread = async (props: Partial<Parameters<typeof MessageThread>[0]> = {}) => {
+      const container = document.createElement('div')
+      document.body.appendChild(container)
+      const root = createRoot(container)
+      const client = createTestQueryClient()
+      await act(async () => root.render(<QueryClientProvider client={client}><MessageThread workspaceId="ws-1" conversationId="conv-1" {...props} /></QueryClientProvider>))
+      return { container, unmount: () => { act(() => root.unmount()); client.clear() } }
+    }
+    const buttonNamed = (container: HTMLElement, name: string) => [...container.querySelectorAll('button')].find((node) => node.textContent?.trim() === name)
+    const conversation = { id: 'conv-1', workspace_id: 'ws-1', status: 'open', source: 'widget', subject: 'Secret subject', display_id: 7 }
+
+    it.each([
+      ['missing (404)', 404],
+      ['denied (403)', 403],
+    ])('shows the same unavailable state for a %s conversation and hides cached content', async (_label, status) => {
+      const onBackToInbox = vi.fn()
+      // A refetch after denial keeps stale data in the query; it must not render.
+      supportHooks.useConversation.mockReturnValue({ data: conversation, isFetched: true, error: new SupportConversationLoadError('conversation not found', status), refetch: vi.fn() })
+      supportHooks.useConversationMessages.mockReturnValue({ data: seedSupportMessagePages([{ id: 'm1', conversation_id: 'conv-1', sender_type: 'customer', content: 'Cached secret', is_internal: false, created_at: '2026-09-10T12:00:00Z' }] as never), isLoading: false })
+      const { container, unmount } = await renderThread({ onBackToInbox })
+      try {
+        expect(container.textContent).toContain('Conversation unavailable')
+        expect(container.textContent).toContain('You may not have access to this conversation, or it may no longer exist')
+        expect(container.textContent).not.toContain('Secret subject')
+        expect(container.textContent).not.toContain('Cached secret')
+        expect(container.textContent).not.toContain('No messages yet')
+        expect(container.textContent).not.toContain('Select a conversation')
+        expect(container.querySelector('[data-support-reply-composer]')).toBeNull()
+        expect(buttonNamed(container, 'Retry')).toBeUndefined()
+        act(() => buttonNamed(container, 'Back to inbox')!.click())
+        expect(onBackToInbox).toHaveBeenCalledOnce()
+      } finally { unmount() }
+    })
+
+    it('shows the unavailable state in the mobile sheet with a back action', async () => {
+      supportHooks.useConversation.mockReturnValue({ data: undefined, isFetched: true, error: new SupportConversationLoadError('conversation not found', 404), refetch: vi.fn() })
+      const { container, unmount } = await renderThread({ presentation: 'mobile-sheet', onBackToInbox: vi.fn() })
+      try {
+        expect(container.querySelector('[aria-label="Return to Inbox"]')).toBeTruthy()
+        expect(buttonNamed(container, 'Back to inbox')).toBeTruthy()
+        expect(container.textContent).toContain('Conversation unavailable')
+      } finally { unmount() }
+    })
+
+    it('shows a retryable load error for a server or network failure, never raw error text', async () => {
+      const refetch = vi.fn()
+      supportHooks.useConversation.mockReturnValue({ data: undefined, isFetched: true, error: new SupportConversationLoadError('pq: connection refused', 500), refetch })
+      const { container, unmount } = await renderThread({ onBackToInbox: vi.fn() })
+      try {
+        expect(container.textContent).toContain("Couldn't load this conversation")
+        expect(container.textContent).not.toContain('pq:')
+        expect(container.textContent).not.toContain('Conversation unavailable')
+        expect(buttonNamed(container, 'Back to inbox')).toBeTruthy()
+        act(() => buttonNamed(container, 'Retry')!.click())
+        expect(refetch).toHaveBeenCalledOnce()
+      } finally { unmount() }
+    })
+
+    it('keeps the initial loading state distinct from errors', async () => {
+      supportHooks.useConversation.mockReturnValue({ data: undefined, isFetched: false, isFetching: true })
+      const { container, unmount } = await renderThread()
+      try {
+        expect(container.querySelector('[data-testid="support-thread-header-skeleton"]')).toBeTruthy()
+        expect(container.textContent).not.toContain('Conversation unavailable')
+        expect(container.textContent).not.toContain("Couldn't load")
+      } finally { unmount() }
+    })
+
+    it('shows a history load error instead of an empty history when messages fail', async () => {
+      const refetch = vi.fn()
+      supportHooks.useConversation.mockReturnValue({ data: conversation, isFetched: true })
+      supportHooks.useConversationMessages.mockReturnValue({ data: undefined, isLoading: false, isError: true, refetch })
+      const { container, unmount } = await renderThread()
+      try {
+        expect(container.textContent).toContain("Couldn't load messages")
+        expect(container.textContent).not.toContain('No messages yet')
+        act(() => buttonNamed(container, 'Retry')!.click())
+        expect(refetch).toHaveBeenCalledOnce()
+      } finally { unmount() }
+    })
+
+    it('keeps the normal empty history for a loaded thread with no messages', async () => {
+      supportHooks.useConversation.mockReturnValue({ data: conversation, isFetched: true })
+      supportHooks.useConversationMessages.mockReturnValue({ data: seedSupportMessagePages([]), isLoading: false, isError: false })
+      const { container, unmount } = await renderThread()
+      try {
+        expect(container.textContent).toContain('No messages yet')
+        expect(container.textContent).not.toContain("Couldn't load")
+      } finally { unmount() }
+    })
+
+    it('reserves the select-a-conversation prompt for no conversation ID', async () => {
+      const { container, unmount } = await renderThread({ conversationId: null })
+      try {
+        expect(container.textContent).toContain('Select a conversation')
+      } finally { unmount() }
+    })
+  })
 })

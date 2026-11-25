@@ -5,6 +5,7 @@ import { SupportSLABadge } from './SupportSLABadge';
 import { MergedConversationContinuation } from './ConversationMergeHistory';
 import { DaySeparator } from './SupportDaySeparator';
 import { useConversationMerges } from '@/hooks/queries/useSupportMerge';
+import { isConversationUnavailableError } from '@/lib/supportConversationError';
 import { usePendingSupportSends } from '@/hooks/queries/usePendingSupportSends';
 import { LiveTranslateBar } from './LiveTranslateBar';
 import { SupportCreateTaskModal } from './SupportCreateTaskModal';
@@ -68,6 +69,7 @@ import type { UpgradeRequiredReason } from '@edition';
 interface MessageThreadProps {
   workspaceId: string;
   conversationId: string | null;
+  linkedMessageId?: string;
   presentation?: 'panel' | 'mobile-sheet';
   onBackToInbox?: () => void;
   onOpenDetails?: () => void;
@@ -266,9 +268,68 @@ const ThreadHeaderSkeleton = memo(function ThreadHeaderSkeleton({
   );
 });
 
+function ThreadLoadProblem({
+  unavailable,
+  isMobileSheet,
+  onBackToInbox,
+  onRetry,
+  retrying,
+}: {
+  unavailable: boolean;
+  isMobileSheet: boolean;
+  onBackToInbox?: () => void;
+  onRetry?: () => void;
+  retrying: boolean;
+}) {
+  // Fixed copy: never reveal whether the conversation exists, moved, or was archived.
+  const title = unavailable ? 'Conversation unavailable' : "Couldn't load this conversation";
+  return (
+    <div data-support-message-thread role="alert" className="flex min-h-0 min-w-0 flex-1 flex-col bg-background dark:bg-sidebar">
+      {isMobileSheet ? (
+        <SupportInboxPanelHeader className="gap-1 px-1.5">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-11 w-11 shrink-0"
+            onClick={onBackToInbox}
+            aria-label="Return to Inbox"
+          >
+            <ArrowLeft02Icon className="h-4 w-4" />
+          </Button>
+          <span className="min-w-0 flex-1 truncate text-sm font-medium text-muted-foreground">{title}</span>
+        </SupportInboxPanelHeader>
+      ) : null}
+      <EmptyState
+        icon={Message01Icon}
+        title={title}
+        subtitle={unavailable
+          ? 'You may not have access to this conversation, or it may no longer exist.'
+          : 'Something went wrong while loading it. Try again.'}
+        background="muted"
+        actions={(
+          <>
+            {onRetry ? (
+              <Button type="button" size="sm" variant="outline" disabled={retrying} onClick={onRetry}>
+                Retry
+              </Button>
+            ) : null}
+            {onBackToInbox ? (
+              <Button type="button" size="sm" variant={onRetry ? 'ghost' : 'outline'} onClick={onBackToInbox}>
+                Back to inbox
+              </Button>
+            ) : null}
+          </>
+        )}
+      />
+    </div>
+  );
+}
+
 export function MessageThread({
   workspaceId,
   conversationId,
+  linkedMessageId,
   presentation = 'panel',
   onBackToInbox,
   onOpenDetails,
@@ -287,16 +348,33 @@ export function MessageThread({
   const isNearBottomRef = useRef(true);
   const [upgradeDialogReason, setUpgradeDialogReason] = useState<UpgradeRequiredReason | null>(null);
   const pendingInitialScrollRef = useRef(false);
+  const openedMessageLink = useRef<string | undefined>(undefined);
   const olderPageScrollRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const threadScrollStateRef = useRef<{ conversationId: string | null; messageCount: number; lastMessageId: string | null }>({
     conversationId: null,
     messageCount: 0,
     lastMessageId: null,
   });
-  const { data: conversation, isFetched: conversationFetched } = useConversation(workspaceId, conversationId);
+  const {
+    data: conversationData,
+    isFetched: conversationFetched,
+    error: conversationError,
+    isFetching: conversationFetching,
+    refetch: refetchConversation,
+  } = useConversation(workspaceId, conversationId);
+  // A rejected lookup hides any cached detail for this ID.
+  const conversationUnavailable = !!conversationId && (
+    isConversationUnavailableError(conversationError) ||
+    (conversationFetched && !conversationData && !conversationError && !conversationFetching)
+  );
+  const conversationLoadFailed = !!conversationId && !conversationUnavailable && !!conversationError && !conversationData;
+  const conversation = conversationUnavailable ? undefined : conversationData;
   const {
     data: messagePages,
     isLoading,
+    isError: messagesError,
+    isFetching: messagesFetching,
+    refetch: refetchMessages,
     hasNextPage,
     fetchNextPage,
     isFetchingNextPage,
@@ -566,6 +644,7 @@ export function MessageThread({
     }
     return null;
   }, [messages]);
+  const linkedMessageLoaded = !!linkedMessageId && messages.some(message => message.id === linkedMessageId);
   const initialScrollTargetMessageId = useMemo(
     () => getInitialThreadScrollTarget(messages, conversation?.team_last_seen_at),
     [conversation?.team_last_seen_at, messages],
@@ -573,9 +652,18 @@ export function MessageThread({
 
   useLayoutEffect(() => {
     if (!conversationId) {
+      openedMessageLink.current = undefined;
       pendingInitialScrollRef.current = false;
       isNearBottomRef.current = true;
       threadScrollStateRef.current = { conversationId: null, messageCount: 0, lastMessageId: null };
+      return;
+    }
+
+    if (!linkedMessageId) openedMessageLink.current = undefined;
+    const openingLink = !!linkedMessageId && linkedMessageId !== openedMessageLink.current && !isFetchNextPageError;
+    if (openingLink && (conversation?.id !== conversationId || isThreadLoading)) return;
+    if (openingLink && !linkedMessageLoaded && hasNextPage) {
+      if (!isFetchingNextPage) void fetchNextPage();
       return;
     }
 
@@ -591,7 +679,8 @@ export function MessageThread({
     const initialLoad = previous.conversationId === conversationId && previous.messageCount === 0;
     const messageCountIncreased = previous.conversationId === conversationId && messages.length > previous.messageCount;
 
-    if (conversationChanged || initialLoad) {
+    if (openingLink) openedMessageLink.current = linkedMessageId;
+    if (conversationChanged || initialLoad || openingLink) {
       pendingInitialScrollRef.current = true;
       isNearBottomRef.current = true;
     }
@@ -611,7 +700,9 @@ export function MessageThread({
     let cancelled = false;
     const frames: number[] = [];
     const timeouts: number[] = [];
-    const shouldUseInitialTarget = pendingInitialScrollRef.current && initialScrollTargetMessageId && initialScrollTargetMessageId !== lastMessageId;
+    const linkTarget = openingLink && linkedMessageLoaded ? linkedMessageId : undefined;
+    const scrollTarget = linkTarget ?? initialScrollTargetMessageId;
+    const shouldUseInitialTarget = pendingInitialScrollRef.current && scrollTarget && (linkTarget || scrollTarget !== lastMessageId);
 
     const scrollToTarget = () => {
       if (cancelled) return;
@@ -619,7 +710,7 @@ export function MessageThread({
       const viewport = scrollAreaRef.current?.querySelector('[data-slot="scroll-area-viewport"]') as HTMLDivElement | null;
       if (viewport) {
         if (shouldUseInitialTarget) {
-          const target = viewport.querySelector(`[data-support-message-id="${initialScrollTargetMessageId}"]`) as HTMLDivElement | null;
+          const target = viewport.querySelector(`[data-support-message-id="${scrollTarget}"]`) as HTMLDivElement | null;
           if (target) {
             viewport.scrollTop = Math.max(0, target.offsetTop - 24);
             isNearBottomRef.current = isNearThreadBottom(viewport);
@@ -632,7 +723,7 @@ export function MessageThread({
       }
 
       if (shouldUseInitialTarget) {
-        document.querySelector(`[data-support-message-id="${initialScrollTargetMessageId}"]`)?.scrollIntoView({ block: 'start' });
+        document.querySelector(`[data-support-message-id="${scrollTarget}"]`)?.scrollIntoView({ block: 'start' });
         isNearBottomRef.current = false;
         return;
       }
@@ -660,7 +751,7 @@ export function MessageThread({
       frames.forEach((frame) => window.cancelAnimationFrame(frame));
       timeouts.forEach((timeout) => window.clearTimeout(timeout));
     };
-  }, [conversationId, initialScrollTargetMessageId, lastMessageId, messages.length, mergeHistory?.length]);
+  }, [conversation?.id, conversationId, fetchNextPage, hasNextPage, initialScrollTargetMessageId, isFetchNextPageError, isFetchingNextPage, isThreadLoading, lastMessageId, linkedMessageId, linkedMessageLoaded, messages.length, mergeHistory?.length]);
 
   useLayoutEffect(() => {
     // A new schedule can arrive without a new message. Keep it visible only
@@ -754,11 +845,19 @@ export function MessageThread({
     };
   }, [conversationId, fetchNextPage, hasNextPage, isFetchNextPageError, isFetchingNextPage, messages, mergeHistory]);
 
-  // Treat a stale conversation id (e.g., previous selection that no longer
-  // matches the active filter, or a deleted conversation) the same as no
-  // selection. Wait until the fetch settled so we don't flash during load.
-  const noSelection = !conversationId || (conversationFetched && !conversation);
-  if (noSelection) {
+  if (conversationId && (conversationUnavailable || conversationLoadFailed)) {
+    return (
+      <ThreadLoadProblem
+        unavailable={conversationUnavailable}
+        isMobileSheet={isMobileSheet}
+        onBackToInbox={onBackToInbox}
+        onRetry={conversationUnavailable ? undefined : () => void refetchConversation()}
+        retrying={conversationFetching}
+      />
+    );
+  }
+
+  if (!conversationId) {
     if (celebration && celebration.scopeKey === clearScopeKey && !isMobileSheet) {
       return <InboxClearedCelebration celebration={celebration} />;
     }
@@ -780,34 +879,6 @@ export function MessageThread({
           subtitle="Nothing in the Inbox needs a reply right now. New conversations will show up here."
           background="muted"
         />
-      );
-    }
-
-    if (isMobileSheet) {
-      return (
-        <div data-support-message-thread className="flex min-h-0 min-w-0 flex-1 flex-col bg-background dark:bg-sidebar">
-          <SupportInboxPanelHeader className="gap-1 px-1.5">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-11 w-11 shrink-0"
-              onClick={onBackToInbox}
-              aria-label="Return to Inbox"
-            >
-              <ArrowLeft02Icon className="h-4 w-4" />
-            </Button>
-            <span className="min-w-0 flex-1 truncate text-sm font-medium text-muted-foreground">
-              Conversation unavailable
-            </span>
-          </SupportInboxPanelHeader>
-          <EmptyState
-            icon={Message01Icon}
-            title="Conversation unavailable"
-            subtitle="It may have been moved or deleted. Return to the Inbox to continue."
-            background="muted"
-          />
-        </div>
       );
     }
 
@@ -1091,7 +1162,21 @@ export function MessageThread({
               </Button>
             </div>
           )}
-          {!isThreadLoading && messages.length === 0 && (
+          {!isThreadLoading && messagesError && messages.length === 0 && (
+            <div role="alert">
+              <EmptyState
+                icon={Message01Icon}
+                title="Couldn't load messages"
+                subtitle="The message history didn't load. Try again."
+                actions={(
+                  <Button type="button" size="sm" variant="outline" disabled={messagesFetching} onClick={() => void refetchMessages()}>
+                    Retry
+                  </Button>
+                )}
+              />
+            </div>
+          )}
+          {!isThreadLoading && !messagesError && messages.length === 0 && (
             <EmptyState
               icon={Message01Icon}
               title="No messages yet"
@@ -1103,6 +1188,7 @@ export function MessageThread({
             conversationId={conversationId || ''}
             conversation={conversation}
             messages={messages}
+            linkedMessageId={linkedMessageId}
             merges={mergeHistory ?? EMPTY_MERGES}
             readOnly={!!conversation?.merged_into_id || !!conversation?.anonymized_at || !!editingNote}
             canUnmerge={!!access?.permissions.includes('support.merge')}

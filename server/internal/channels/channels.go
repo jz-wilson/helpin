@@ -36,11 +36,14 @@ type Event struct {
 	// ExternalUserID identifies the customer within the connected account.
 	ExternalUserID string
 	// ExternalChatID is where replies go.
-	ExternalChatID     string
-	ThreadKey          string
-	ChannelName        string
+	ExternalChatID string
+	ThreadKey      string
+	ChannelName    string
+	// DefaultCompanyID comes from the configured Helpin route.
+	DefaultCompanyID   *string `json:"-"`
 	ExistingThreadOnly bool
 	Teammate           bool
+	TeammateUserID     *string
 	// ExternalMessageKey identifies the message within the connected account.
 	ExternalMessageKey string
 	DisplayName        string
@@ -71,6 +74,7 @@ type AccountInfo struct {
 
 // OutgoingFile is an attachment to send.
 type OutgoingFile struct {
+	ID          string
 	Name        string
 	ContentType string
 	Data        []byte
