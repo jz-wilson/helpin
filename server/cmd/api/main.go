@@ -912,12 +912,17 @@ func main() {
 	}
 	githubAppClient := githubapp.NewClientWithSource(githubAppConfig)
 	var temporalClient tclient.Client
-	temporalClient, err = tclient.Dial(temporalapp.BuildClientOptions(cfg))
+	// Lazy client: it connects on first use, so the API starting before Temporal
+	// (for example after a node reboot) does not leave Temporal features dead
+	// until the next restart. An error here means invalid options, not an
+	// unreachable server.
+	temporalClient, err = tclient.NewLazyClient(temporalapp.BuildClientOptions(cfg))
 	if err != nil {
+		temporalClient = nil
 		slog.Warn("Temporal unavailable", "address", cfg.TemporalAddress, "namespace", cfg.TemporalNamespace, "error", err)
 	} else {
 		defer temporalClient.Close()
-		slog.Info("Temporal configured", "address", cfg.TemporalAddress, "namespace", cfg.TemporalNamespace)
+		slog.Info("Temporal configured (connects on first use)", "address", cfg.TemporalAddress, "namespace", cfg.TemporalNamespace)
 	}
 	runEngine := temporalapp.NewRunEngine(temporalClient, cfg.TemporalNamespace)
 
@@ -2221,36 +2226,33 @@ func main() {
 	// Set up router.
 	r := router.New(handlers, jwtManager, authzService, slugResolver, cfg.CORSOrigins)
 
-	if err := crmSummaryService.EnsureDailyReconciliation(context.Background()); err != nil {
-		slog.Error("failed to ensure crm summary daily reconciliation workflow", "error", err)
-	}
-	if err := ruleEngine.EnsureScheduledRules(context.Background()); err != nil {
-		slog.Error("failed to ensure automation rule schedules", "error", err)
-	}
-	if runEngine != nil {
-		scheduleCtx, scheduleCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := runEngine.EnsureScheduledEvents(scheduleCtx); err != nil {
-			slog.Error("failed to ensure shared scheduled event delivery", "error", err)
-		}
-		scheduleCancel()
-	}
-	if terminated, err := removeLegacyAgentScheduleWorkflows(context.Background(), temporalClient); err != nil {
-		slog.Error("failed to remove legacy agent schedule workflows", "error", err)
-	} else if terminated > 0 {
-		slog.Info("removed legacy agent schedule workflows", "count", terminated)
-	}
-	if err := supportCoverageService.EnsureDailyEnrichment(context.Background()); err != nil {
-		slog.Error("failed to ensure coverage gap daily enrichment workflow", "error", err)
-	}
-	if err := supportCoverageDailyAnalyzer.EnsureDailyAnalysis(context.Background()); err != nil {
-		slog.Error("failed to ensure coverage daily analysis workflow", "error", err)
-	}
-
-	// Start sprint automation cron workflow via Temporal (replaces local ticker).
+	// Ensure the Temporal-backed schedules in the background: they wait for
+	// Temporal to be reachable and never block or fail API startup.
+	temporalStartupCtx, temporalStartupCancel := context.WithCancel(context.Background())
 	if temporalClient != nil {
-		if err := ensureSprintCronWorkflow(temporalClient); err != nil {
-			slog.Error("failed to ensure sprint cron workflow", "error", err)
-		}
+		go runTemporalStartupSteps(temporalStartupCtx, temporalClient, []temporalStartupStep{
+			{"crm summary daily reconciliation workflow", crmSummaryService.EnsureDailyReconciliation},
+			{"automation rule schedules", ruleEngine.EnsureScheduledRules},
+			{"shared scheduled event delivery", func(ctx context.Context) error {
+				if runEngine == nil {
+					return nil
+				}
+				scheduleCtx, scheduleCancel := context.WithTimeout(ctx, 10*time.Second)
+				defer scheduleCancel()
+				return runEngine.EnsureScheduledEvents(scheduleCtx)
+			}},
+			{"legacy agent schedule workflow removal", func(ctx context.Context) error {
+				terminated, err := removeLegacyAgentScheduleWorkflows(ctx, temporalClient)
+				if err == nil && terminated > 0 {
+					slog.Info("removed legacy agent schedule workflows", "count", terminated)
+				}
+				return err
+			}},
+			{"coverage gap daily enrichment workflow", supportCoverageService.EnsureDailyEnrichment},
+			{"coverage daily analysis workflow", supportCoverageDailyAnalyzer.EnsureDailyAnalysis},
+			// Sprint automation cron workflow via Temporal (replaces local ticker).
+			{"sprint cron workflow", func(context.Context) error { return ensureSprintCronWorkflow(temporalClient) }},
+		}, 5*time.Second, time.Minute)
 	}
 
 	// Evaluate cross-module rules daily and behavioral rules every ten minutes.
@@ -2599,6 +2601,7 @@ func main() {
 	agentRuntimeProjectionCancel()
 	customerIOOutboxCancel()
 	productAnalyticsCancel()
+	temporalStartupCancel()
 	signalRuleCancel()
 	commercialStateCancel()
 	usageBaselineCancel()
